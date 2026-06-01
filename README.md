@@ -97,11 +97,13 @@ async def test_tool():
 
 Runnable example extensions live in `examples/`:
 
-- `examples/review/extension.py` ports the TypeScript review command extension.
-- `examples/workspace/extension.py` ports the TypeScript workspace helper/policy extension.
+- `examples/review/kodelet-extension-review` is a review command extension.
+- `examples/workspace/kodelet-extension-workspace` is a workspace helper/policy extension.
 
 From a checked-out SDK repository, run an example with:
 
 ```bash
-uv run -- python examples/review/extension.py
+uv run -s examples/review/kodelet-extension-review
 ```
+
+The `kodelet-extension-*` files are executable wrappers so Kodelet can discover and launch them directly.

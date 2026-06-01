@@ -399,6 +399,7 @@ async def test_runtime_serves_json_rpc_and_reverse_host_rpc() -> None:
 class MemoryReader:
     def __init__(self) -> None:
         self._queue: queue.Queue[bytes] = queue.Queue()
+        self._buffer = bytearray()
 
     def feed(self, chunk: bytes) -> None:
         self._queue.put(chunk)
@@ -407,8 +408,36 @@ class MemoryReader:
         self.feed(b"")
 
     def read(self, size: int = -1) -> bytes:
-        del size
-        return self._queue.get(timeout=5)
+        if size < 0:
+            chunk = self._queue.get(timeout=5)
+            return chunk
+        while len(self._buffer) < size:
+            chunk = self._queue.get(timeout=5)
+            if chunk == b"":
+                break
+            self._buffer.extend(chunk)
+        data = bytes(self._buffer[:size])
+        del self._buffer[:size]
+        return data
+
+    def readline(self, size: int = -1) -> bytes:
+        while True:
+            newline_index = self._buffer.find(b"\n")
+            if newline_index != -1:
+                end = newline_index + 1
+                if size >= 0:
+                    end = min(end, size)
+                data = bytes(self._buffer[:end])
+                del self._buffer[:end]
+                return data
+            chunk = self._queue.get(timeout=5)
+            if chunk == b"":
+                if not self._buffer:
+                    return b""
+                data = bytes(self._buffer)
+                self._buffer.clear()
+                return data
+            self._buffer.extend(chunk)
 
 
 class MemoryWriter:

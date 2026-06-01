@@ -15,6 +15,8 @@ class BinaryReader(Protocol):
 
     def read(self, size: int = -1, /) -> bytes: ...
 
+    def readline(self, size: int = -1, /) -> bytes: ...
+
 
 class BinaryWriter(Protocol):
     """Minimal binary writer protocol used by the stdio runtime."""
@@ -109,20 +111,16 @@ async def run_stdio_server(
     resolved_writer: BinaryWriter = writer or cast(BinaryWriter, sys.stdout.buffer)
     host_client = StdioHostRPCClient(resolved_writer)
     set_active_host_rpc_client(host_client)
-    buffer = b""
     pending_tasks: set[asyncio.Task[None]] = set()
     while True:
-        chunk = await asyncio.to_thread(resolved_reader.read, 4096)
-        if not chunk:
+        payload = await asyncio.to_thread(read_frame, resolved_reader)
+        if payload is None:
             if pending_tasks:
                 await asyncio.gather(*pending_tasks)
             return
-        buffer += chunk
-        while frame := _try_read_frame(buffer):
-            payload, buffer = frame
-            task = asyncio.create_task(_handle_message(host, host_client, resolved_writer, payload))
-            pending_tasks.add(task)
-            task.add_done_callback(pending_tasks.discard)
+        task = asyncio.create_task(_handle_message(host, host_client, resolved_writer, payload))
+        pending_tasks.add(task)
+        task.add_done_callback(pending_tasks.discard)
 
 
 async def _handle_message(
@@ -204,6 +202,30 @@ def _parse_content_length(header: str) -> int:
             if content_length >= 0:
                 return content_length
     raise ValueError("Missing Content-Length header")
+
+
+def read_frame(reader: BinaryReader) -> bytes | None:
+    """Read one LSP-style framed JSON-RPC payload from a blocking stream.
+
+    Unlike ``reader.read(4096)``, this returns as soon as one complete frame has
+    arrived and does not wait for EOF or for the pipe buffer to fill.
+    """
+
+    header_lines: list[bytes] = []
+    while True:
+        line = reader.readline()
+        if line == b"":
+            return None
+        if line in (b"\r\n", b"\n"):
+            break
+        header_lines.append(line)
+
+    header = b"".join(header_lines).decode("ascii", errors="replace")
+    content_length = _parse_content_length(header)
+    payload = reader.read(content_length)
+    if len(payload) != content_length:
+        return None
+    return payload
 
 
 async def write_message(writer: BinaryWriter, message: Mapping[str, Any]) -> None:

@@ -1,3 +1,10 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["kodelet-sdk"]
+# [tool.uv.sources]
+# kodelet-sdk = { path = "../..", editable = true }
+# ///
 from __future__ import annotations
 
 import json

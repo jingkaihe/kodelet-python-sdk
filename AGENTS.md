@@ -15,8 +15,8 @@ src/kodelet_sdk/      # SDK source
   template.py         # Jinja2 rendering helper
   test_harness.py     # In-process extension test harness
 examples/            # Runnable example extensions
-  review/             # Python port of the review extension
-  workspace/          # Python port of the workspace extension
+  review/             # Review command extension
+  workspace/          # Workspace helper/policy extension
 tests/               # pytest coverage
 .github/workflows/   # GitHub Actions CI
 ```
@@ -50,6 +50,7 @@ Generated build artifacts under `dist/`, virtualenvs, caches, and `__pycache__` 
 - Use Pydantic for schema validation and JSON Schema generation.
 - Use Jinja2 for template rendering.
 - Keep examples importable without side effects; guard runtime startup with `if __name__ == "__main__"`.
+- Example entrypoints should be executable `kodelet-extension-*` wrappers; keep importable implementation code in adjacent `*_extension.py` files.
 - Prefer SDK re-exports in examples (`from kodelet_sdk import BaseModel, Extension, Field, render_template`) so examples are self-contained.
 - When adding public functionality, add focused pytest coverage and keep type/lint checks green.
 
