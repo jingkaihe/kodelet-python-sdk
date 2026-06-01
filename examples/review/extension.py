@@ -1,0 +1,49 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+from kodelet_sdk import BaseModel, Extension, Field, render_template
+
+PROMPT_PATH = Path(__file__).with_name("reviewer-prompt.md")
+
+ext = Extension(name="review", version="0.1.0")
+
+
+class ReviewChangesInput(BaseModel):
+    target: str = Field(default="HEAD", description="Git ref or branch to compare against")
+    focus: str = Field(
+        default="correctness, tests, and maintainability",
+        description="What the review should emphasize",
+    )
+
+
+@ext.command(
+    "review",
+    aliases=["/review"],
+    description="Review local git changes against a target ref",
+    input_schema=ReviewChangesInput,
+    kind="recipe",
+)
+async def review_changes(input: ReviewChangesInput, ctx):
+    status = await ctx.process.exec("git", ["status", "--short"], {"timeoutMs": 2_000})
+    diff = await ctx.process.exec("git", ["diff", "--stat", input.target], {"timeoutMs": 5_000})
+    prompt_template = await ctx.fs.read_text(str(PROMPT_PATH))
+
+    return {
+        "action": "runAgent",
+        "recipeName": "review",
+        "prompt": render_template(
+            prompt_template,
+            {
+                "target": input.target,
+                "focus": input.focus,
+                "gitStatus": status.stdout.strip()
+                or "No changes reported by git status --short.",
+                "diffStat": diff.stdout.strip() or f"No diff stat against {input.target}.",
+            },
+        ),
+    }
+
+
+if __name__ == "__main__":
+    ext.run_sync()

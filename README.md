@@ -73,7 +73,7 @@ Handlers receive `ctx` with Kodelet call metadata and helper namespaces:
 - `ctx.log.debug/info/warn/error(...)` for JSON logs to stderr.
 - `ctx.ui.input/confirm/select/notify(...)` for host UI reverse-RPC calls.
 
-### Testing
+### Testing extensions
 
 Use `create_test_harness` to exercise registrations without spawning a subprocess:
 
@@ -93,14 +93,15 @@ async def test_tool():
     assert result == {"content": "hi"}
 ```
 
-## Development
+## Examples
 
-This project uses `uv` for dependency management.
+Runnable example extensions live in `examples/`:
+
+- `examples/review/extension.py` ports the TypeScript review command extension.
+- `examples/workspace/extension.py` ports the TypeScript workspace helper/policy extension.
+
+From a checked-out SDK repository, run an example with:
 
 ```bash
-uv sync
-uv run -- ruff check
-uv run -- ty check
-uv run -- pytest
-uv build
+uv run -- python examples/review/extension.py
 ```
