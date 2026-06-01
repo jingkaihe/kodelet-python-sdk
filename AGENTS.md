@@ -33,6 +33,7 @@ uv run -- ruff check
 uv run -- ty check
 uv run -- pytest -q
 uv build
+make check
 ```
 
 Run all gates before considering a change complete:
@@ -42,6 +43,18 @@ uv run -- ruff check && uv run -- ty check && uv run -- pytest -q && uv build
 ```
 
 Generated build artifacts under `dist/`, virtualenvs, caches, and `__pycache__` should not be committed.
+
+## Releases
+
+Package versions are sourced from `VERSION.txt` via Hatchling dynamic version metadata. Edit `VERSION.txt` manually, commit it, then use the Makefile helper:
+
+```bash
+git add VERSION.txt pyproject.toml uv.lock
+git commit -m "chore: release v0.1.0"
+make release
+```
+
+`make release` runs `make check`, creates the `v$(cat VERSION.txt)` tag, and pushes the branch and tag. The tag push triggers `.github/workflows/release.yml`, which publishes to PyPI through trusted publishing/OIDC (`id-token: write`) and uploads artifacts to the GitHub release.
 
 ## Coding conventions
 

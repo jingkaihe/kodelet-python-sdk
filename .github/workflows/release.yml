@@ -1,0 +1,88 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  publish:
+    name: Publish to PyPI
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/kodelet-sdk
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v8.1.0
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: Verify tag matches VERSION.txt
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          FILE_VERSION="$(cat VERSION.txt)"
+          if [ "${TAG_VERSION}" != "${FILE_VERSION}" ]; then
+            echo "tag version ${TAG_VERSION} does not match VERSION.txt ${FILE_VERSION}" >&2
+            exit 1
+          fi
+          uv run -- python - <<'PY' "${FILE_VERSION}"
+          import sys
+          from packaging.version import Version
+          version = sys.argv[1]
+          parsed = Version(version)
+          if str(parsed) != version:
+              raise SystemExit(f"version must be normalized PEP 440; got {version!r}, expected {parsed!s}")
+          PY
+
+      - name: Lint
+        run: uv run -- ruff check
+
+      - name: Type check
+        run: uv run -- ty check
+
+      - name: Test
+        run: uv run -- pytest -q
+
+      - name: Build distributions
+        run: uv build
+
+      - name: Check built metadata version
+        run: |
+          uv run -- python - <<'PY'
+          import zipfile
+          from pathlib import Path
+
+          expected = Path("VERSION.txt").read_text(encoding="utf-8").strip()
+          wheels = sorted(Path("dist").glob("kodelet_sdk-*.whl"))
+          if len(wheels) != 1:
+              raise SystemExit(f"expected one wheel, found {wheels}")
+          with zipfile.ZipFile(wheels[0]) as wheel:
+              metadata_name = next(name for name in wheel.namelist() if name.endswith(".dist-info/METADATA"))
+              metadata = wheel.read(metadata_name).decode("utf-8")
+          if f"Version: {expected}\n" not in metadata:
+              raise SystemExit(f"wheel metadata does not contain Version: {expected}")
+          PY
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+      - name: Upload release artifacts
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*

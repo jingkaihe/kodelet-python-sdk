@@ -107,3 +107,15 @@ uv run -s examples/review/kodelet-extension-review
 ```
 
 The `kodelet-extension-*` files are executable wrappers so Kodelet can discover and launch them directly.
+
+## Releases
+
+Package versions are read from `VERSION.txt`. To publish a release, configure PyPI Trusted Publishing for the `Release` workflow, then update and commit `VERSION.txt` manually:
+
+```bash
+git add VERSION.txt pyproject.toml uv.lock
+git commit -m "chore: release v0.1.0"
+make release
+```
+
+Pushing the `vX.Y.Z` tag runs the GitHub Actions release workflow, builds the package, and publishes to PyPI using OIDC trusted publishing.

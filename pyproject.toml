@@ -1,6 +1,6 @@
 [project]
 name = "kodelet-sdk"
-version = "0.0.0"
+dynamic = ["version"]
 description = "Python SDK for authoring Kodelet extensions"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -15,13 +15,21 @@ dependencies = [
 Repository = "https://github.com/jingkaihe/kodelet"
 
 [build-system]
-requires = ["uv_build>=0.9.18,<0.10"]
-build-backend = "uv_build"
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "VERSION.txt"
+pattern = "^(?P<version>[^\\s]+)$"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kodelet_sdk"]
 
 [dependency-groups]
 dev = [
   "pytest>=8.0",
   "pytest-asyncio>=0.24",
+  "hatchling>=1.27",
   "ruff>=0.14.0",
   "ty>=0.0.1a21",
 ]
