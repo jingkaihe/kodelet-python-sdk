@@ -1,0 +1,43 @@
+[project]
+name = "kodelet-sdk"
+version = "0.0.0"
+description = "Python SDK for authoring Kodelet extensions"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "Kodelet" }]
+dependencies = [
+  "jinja2>=3.1,<4",
+  "pydantic>=2.0,<3",
+]
+
+[project.urls]
+Repository = "https://github.com/jingkaihe/kodelet"
+
+[build-system]
+requires = ["uv_build>=0.9.18,<0.10"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.0",
+  "pytest-asyncio>=0.24",
+  "ruff>=0.14.0",
+  "ty>=0.0.1a21",
+]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC", "RUF"]
+ignore = ["RUF001", "RUF002", "RUF003"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ty.environment]
+python-version = "3.11"
+root = ["src", "tests"]
