@@ -7,7 +7,8 @@ import queue
 import sys
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Any, assert_type
+from types import CoroutineType
+from typing import TYPE_CHECKING, Any, assert_type
 
 import pytest
 
@@ -64,6 +65,9 @@ def test_public_typing_surface() -> None:
 
     echo_handler: Callable[[EchoInput, ToolContext], Awaitable[ToolExecutionResult]] = echo
     assert echo_handler is echo
+    if TYPE_CHECKING:
+        echo_result = echo(EchoInput(text="hello"), ToolContext(None))
+        assert_type(echo_result, CoroutineType[Any, Any, ToolExecutionResult])
 
     @ext.command("ask", description="Ask", input_schema=EchoInput)
     async def ask(input: EchoInput, ctx: CommandContext) -> CommandResult:
@@ -79,6 +83,16 @@ def test_public_typing_surface() -> None:
 
     ask_handler: Callable[[EchoInput, CommandContext], Awaitable[CommandResult]] = ask
     assert ask_handler is ask
+    if TYPE_CHECKING:
+        ask_result = ask(
+            EchoInput(text="hello"),
+            CommandContext(
+                None,
+                None,
+                {"raw": "/ask", "commandName": "ask", "args": [], "flags": {}},
+            ),
+        )
+        assert_type(ask_result, CoroutineType[Any, Any, CommandResult])
 
     @ext.on("tool.call")
     def approve(event: ToolCallEvent, _ctx: EventContext) -> EventResult:
@@ -87,6 +101,18 @@ def test_public_typing_surface() -> None:
 
     approve_handler: Callable[[ToolCallEvent, EventContext], EventResult] = approve
     assert approve_handler is approve
+    if TYPE_CHECKING:
+        approve_result = approve(
+            ToolCallEvent(
+                {
+                    "id": "evt",
+                    "event": "tool.call",
+                    "tool": {"name": "bash", "callId": "call", "input": {}},
+                }
+            ),
+            EventContext(None),
+        )
+        assert_type(approve_result, EventResult)
 
 
 @pytest.mark.asyncio
@@ -371,6 +397,12 @@ async def test_context_helpers_cover_workspace_storage_process_env_and_ui(
         "kodelet.ui.confirm",
         "kodelet.ui.select",
         "kodelet.ui.notify",
+    ]
+    assert [params for _method, params in fake_rpc.requests] == [
+        {"title": "Pick one"},
+        {"title": "Allow?"},
+        {"title": "Food", "options": ["Pasta", "Pizza"]},
+        {"message": "Done"},
     ]
 
 
