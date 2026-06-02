@@ -7,7 +7,7 @@ The SDK speaks Kodelet's JSON-RPC extension protocol over stdio and provides an 
 ## Quick start
 
 ```python
-from kodelet_sdk import BaseModel, Extension
+from kodelet_sdk import BaseModel, Extension, ToolContext, ToolExecutionResult
 
 ext = Extension(name="weather", version="0.1.0")
 
@@ -17,7 +17,7 @@ class WeatherInput(BaseModel):
 
 
 @ext.tool("get_weather", description="Get weather", input_schema=WeatherInput)
-async def get_weather(input: WeatherInput, ctx):
+async def get_weather(input: WeatherInput, ctx: ToolContext) -> ToolExecutionResult:
     return {"content": f"Weather for {input.location}"}
 
 
@@ -41,6 +41,22 @@ if __name__ == "__main__":
 - `await ext.run()` starts the async stdio runtime; `ext.run_sync()` is a synchronous entrypoint convenience.
 
 Handlers may be synchronous or asynchronous. Tool handlers may return a string, which is converted to `{ "content": ... }`, or a protocol-shaped mapping. Command handlers return `{ "action": "pass" }`, `{ "action": "respond", "response": ... }`, or `{ "action": "runAgent", "prompt": ... }`.
+
+The decorators preserve concrete function signatures for type checkers, so handlers can annotate their inputs and contexts directly:
+
+```python
+from kodelet_sdk import CommandContext, CommandResult, EventContext, ToolCallEvent
+
+
+@ext.command("doctor", description="Check health", input_schema=WeatherInput)
+async def doctor(input: WeatherInput, ctx: CommandContext) -> CommandResult:
+    return {"action": "respond", "response": ctx.input["commandName"]}
+
+
+@ext.on("tool.call")
+def approve(event: ToolCallEvent, ctx: EventContext):
+    return {"message": event.tool.name}
+```
 
 ### Pydantic and Jinja2 bridge dependencies
 
@@ -72,6 +88,18 @@ Handlers receive `ctx` with Kodelet call metadata and helper namespaces:
 - `ctx.env.get(...)` for environment access.
 - `ctx.log.debug/info/warn/error(...)` for JSON logs to stderr.
 - `ctx.ui.input/confirm/select/notify(...)` for host UI reverse-RPC calls.
+
+UI helpers accept protocol-shaped typed requests: `UIInputRequest`, `UIConfirmRequest`, `UISelectRequest`, and `UINotifyRequest`.
+
+```python
+from kodelet_sdk import UIInputRequest, UISelectRequest
+
+input_request: UIInputRequest = {"title": "Branch name", "required": True}
+select_request: UISelectRequest = {"title": "Mode", "options": ["fast", "thorough"]}
+
+branch = await ctx.ui.input(input_request)
+mode = await ctx.ui.select(select_request)
+```
 
 ### Testing extensions
 

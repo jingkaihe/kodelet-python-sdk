@@ -5,17 +5,29 @@ import json
 import os
 import queue
 import sys
+from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, assert_type
 
 import pytest
 
 from kodelet_sdk import (
     BaseModel,
+    CommandContext,
+    CommandResult,
+    EventContext,
+    EventResult,
     Extension,
     Field,
     Jinja2,
     Pydantic,
+    ToolCallEvent,
+    ToolContext,
+    ToolExecutionResult,
+    UIConfirmRequest,
+    UIInputRequest,
+    UINotifyRequest,
+    UISelectRequest,
     create_test_harness,
     define_extension,
     pydantic,
@@ -35,6 +47,46 @@ def test_reexports_pydantic_and_jinja2() -> None:
     assert pydantic is Pydantic
     assert Model(name="kodelet").name == "kodelet"
     assert Jinja2.Template("Hello {{ name }}").render(name="Kodelet") == "Hello Kodelet"
+
+
+def test_public_typing_surface() -> None:
+    ext = Extension()
+
+    class EchoInput(BaseModel):
+        text: str
+
+    @ext.tool("echo", description="Echo", input_schema=EchoInput)
+    async def echo(input: EchoInput, ctx: ToolContext) -> ToolExecutionResult:
+        request: UIInputRequest = {"title": "Text", "required": True}
+        answer = await ctx.ui.input(request)
+        assert_type(answer, str | None)
+        return {"content": input.text}
+
+    echo_handler: Callable[[EchoInput, ToolContext], Awaitable[ToolExecutionResult]] = echo
+    assert echo_handler is echo
+
+    @ext.command("ask", description="Ask", input_schema=EchoInput)
+    async def ask(input: EchoInput, ctx: CommandContext) -> CommandResult:
+        confirm: UIConfirmRequest = {"title": "Continue?"}
+        select: UISelectRequest = {"title": "Pick", "options": ["A", "B"]}
+        notify: UINotifyRequest = {"message": "Done"}
+        confirmed = await ctx.ui.confirm(confirm)
+        selection = await ctx.ui.select(select)
+        await ctx.ui.notify(notify)
+        assert_type(confirmed, bool)
+        assert_type(selection, str | None)
+        return {"action": "respond", "response": f"{ctx.input['commandName']}: {input.text}"}
+
+    ask_handler: Callable[[EchoInput, CommandContext], Awaitable[CommandResult]] = ask
+    assert ask_handler is ask
+
+    @ext.on("tool.call")
+    def approve(event: ToolCallEvent, _ctx: EventContext) -> EventResult:
+        assert_type(event.tool.name, str)
+        return {"message": event.tool.name}
+
+    approve_handler: Callable[[ToolCallEvent, EventContext], EventResult] = approve
+    assert approve_handler is approve
 
 
 @pytest.mark.asyncio

@@ -10,7 +10,16 @@ from __future__ import annotations
 import json
 from typing import Any, Literal
 
-from kodelet_sdk import BaseModel, Extension, Field
+from kodelet_sdk import (
+    AgentStartEvent,
+    BaseModel,
+    EventContext,
+    EventResult,
+    Extension,
+    Field,
+    ToolCallEvent,
+    ToolContext,
+)
 
 BASH_POLICY_FILE = "bash-policy.json"
 ALLOW_ONCE = "Allow once"
@@ -50,7 +59,7 @@ class AskUserChoiceInput(BaseModel):
     ),
     input_schema=AskUserChoiceInput,
 )
-async def ask_user_choice(input: AskUserChoiceInput, ctx):
+async def ask_user_choice(input: AskUserChoiceInput, ctx: ToolContext) -> str:
     choice = await ctx.ui.select(
         {
             "title": input.question,
@@ -71,7 +80,7 @@ async def ask_user_choice(input: AskUserChoiceInput, ctx):
 
 
 @ext.on("agent.start")
-async def notify_ready(_event, ctx):
+async def notify_ready(_event: AgentStartEvent, ctx: EventContext) -> None:
     policy = await read_bash_policy(ctx)
     await ctx.ui.notify(
         {
@@ -85,7 +94,7 @@ async def notify_ready(_event, ctx):
 
 
 @ext.on("tool.call", priority=100, timeout_in_sec=300)
-async def approve_bash_command(event, ctx):
+async def approve_bash_command(event: ToolCallEvent, ctx: EventContext) -> EventResult | None:
     if event.tool.name != "bash":
         return None
 
@@ -175,7 +184,7 @@ def format_bash_prompt(details: BashCommandDetails, policy: BashPolicy) -> str:
     return "\n".join(lines)
 
 
-async def read_bash_policy(ctx) -> BashPolicy:
+async def read_bash_policy(ctx: EventContext | ToolContext) -> BashPolicy:
     try:
         return normalize_bash_policy(await ctx.storage.read_json(BASH_POLICY_FILE))
     except Exception as error:  # pragma: no cover - defensive logging path
@@ -184,7 +193,7 @@ async def read_bash_policy(ctx) -> BashPolicy:
 
 
 async def remember_bash_decision(
-    ctx,
+    ctx: EventContext | ToolContext,
     command: str,
     decision: Literal["allowed", "denied"],
     current_policy: BashPolicy,

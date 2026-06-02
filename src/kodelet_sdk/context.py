@@ -9,7 +9,73 @@ from builtins import list as list_type
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, NotRequired, Protocol, Required, TypeAlias, TypedDict, cast
+
+CommandFlagValue: TypeAlias = str | bool | list[str]
+
+
+class CommandInvocation(TypedDict):
+    """User prompt metadata that invoked an extension command."""
+
+    raw: str
+    commandName: str
+    args: list[str]
+    flags: Mapping[str, CommandFlagValue]
+
+
+UIInputStatus: TypeAlias = Literal["submitted", "dismissed", "timeout", "unavailable"]
+
+
+class UIInputRequest(TypedDict):
+    """User-input prompt request sent to the Kodelet host."""
+
+    title: str
+    id: NotRequired[str]
+    helpText: NotRequired[str]
+    message: NotRequired[str]
+    placeholder: NotRequired[str]
+    defaultValue: NotRequired[str]
+    submitButtonText: NotRequired[str]
+    cancelButtonText: NotRequired[str]
+    required: NotRequired[bool]
+    secret: NotRequired[bool]
+
+
+class UIConfirmRequest(TypedDict):
+    """Yes/no confirmation request sent to the Kodelet host."""
+
+    title: str
+    id: NotRequired[str]
+    message: NotRequired[str]
+    confirmButtonText: NotRequired[str]
+    cancelButtonText: NotRequired[str]
+
+
+class UISelectRequest(TypedDict):
+    """Single-choice selection request sent to the Kodelet host."""
+
+    title: str
+    options: Sequence[str]
+    id: NotRequired[str]
+    message: NotRequired[str]
+    submitButtonText: NotRequired[str]
+    cancelButtonText: NotRequired[str]
+
+
+class UINotifyRequest(TypedDict):
+    """Fire-and-forget notification request sent to the Kodelet host."""
+
+    message: str
+    title: NotRequired[str]
+
+
+class UIInputResponse(TypedDict, total=False):
+    """Host response for UI input, confirmation, selection, and notification calls."""
+
+    status: Required[UIInputStatus]
+    value: str
+    confirmed: bool
+    reason: str
 
 
 class HostRPCClient(Protocol):
@@ -193,7 +259,7 @@ class FileSystemContext:
         await asyncio.to_thread(resolved.parent.mkdir, parents=True, exist_ok=True)
         await asyncio.to_thread(resolved.write_text, content, encoding="utf-8")
 
-    async def list(self, path: str) -> list_type[dict[str, str]]:
+    async def list(self, path: str) -> list_type[FileInfo]:
         """List directory entries.
 
         Args:
@@ -216,6 +282,14 @@ class FileSystemContext:
         ]
 
 
+class FileInfo(TypedDict):
+    """File-system entry returned by :meth:`FileSystemContext.list`."""
+
+    name: str
+    path: str
+    type: Literal["file", "dir", "other"]
+
+
 class ProcessContext:
     """Async process helpers rooted at the active workspace directory."""
 
@@ -226,7 +300,7 @@ class ProcessContext:
         self,
         command: str,
         args: Sequence[str] | None = None,
-        opts: Mapping[str, Any] | None = None,
+        opts: ProcessExecOptions | None = None,
     ) -> ExecResult:
         """Run a process and capture output.
 
@@ -271,7 +345,7 @@ class ProcessContext:
         self,
         command: str,
         args: Sequence[str] | None = None,
-        opts: Mapping[str, Any] | None = None,
+        opts: ProcessSpawnOptions | None = None,
     ) -> None:
         """Spawn a process.
 
@@ -303,6 +377,20 @@ class ProcessContext:
         exit_code = await process.wait()
         if exit_code != 0:
             raise RuntimeError(f"{command} exited with status {exit_code}")
+
+
+class ProcessExecOptions(TypedDict, total=False):
+    """Options for :meth:`ProcessContext.exec`."""
+
+    cwd: str
+    timeoutMs: int | float
+
+
+class ProcessSpawnOptions(TypedDict, total=False):
+    """Options for :meth:`ProcessContext.spawn`."""
+
+    cwd: str
+    detach: bool
 
 
 class EnvContext:
@@ -350,12 +438,13 @@ class LogContext:
 class UIContext:
     """Host UI helpers backed by Kodelet reverse-RPC methods."""
 
-    async def input(self, request: Mapping[str, Any]) -> str | None:
+    async def input(self, request: UIInputRequest) -> str | None:
         """Ask the host for text input.
 
         Args:
-            request: UI input request with fields such as ``title``,
-                ``message``, ``placeholder``, ``required``, or ``secret``.
+            request: UI input request. ``title`` is required; optional fields
+                include ``message``, ``placeholder``, ``required``, and
+                ``secret``.
 
         Returns:
             Submitted text, or ``None`` if no host client is available or the
@@ -371,12 +460,11 @@ class UIContext:
                 return value
         return None
 
-    async def confirm(self, request: Mapping[str, Any]) -> bool:
+    async def confirm(self, request: UIConfirmRequest) -> bool:
         """Ask the host for confirmation.
 
         Args:
-            request: UI confirmation request with fields such as ``title`` and
-                ``message``.
+            request: UI confirmation request. ``title`` is required.
 
         Returns:
             ``True`` only when the host returns a submitted positive response.
@@ -391,11 +479,12 @@ class UIContext:
             and result.get("confirmed") is True
         )
 
-    async def select(self, request: Mapping[str, Any]) -> str | None:
+    async def select(self, request: UISelectRequest) -> str | None:
         """Ask the host to select one option.
 
         Args:
-            request: UI select request containing ``title`` and ``options``.
+            request: UI select request containing required ``title`` and
+                ``options``.
 
         Returns:
             Selected option value, or ``None`` if unavailable/cancelled.
@@ -410,7 +499,7 @@ class UIContext:
                 return value
         return None
 
-    async def notify(self, request: str | Mapping[str, Any]) -> None:
+    async def notify(self, request: str | UINotifyRequest) -> None:
         """Send a notification to the host UI.
 
         Args:
@@ -488,7 +577,7 @@ class CommandContext(SharedContext):
         invocation: Mapping[str, Any],
     ) -> None:
         super().__init__(init, context)
-        self.input = invocation
+        self.input = cast(CommandInvocation, invocation)
 
 
 def create_tool_context(

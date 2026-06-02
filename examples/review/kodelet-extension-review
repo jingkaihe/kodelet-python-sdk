@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from kodelet_sdk import BaseModel, Extension, Field, render_template
+from kodelet_sdk import BaseModel, CommandContext, CommandResult, Extension, Field, render_template
 
 PROMPT_PATH = Path(__file__).with_name("reviewer-prompt.md")
 
@@ -31,7 +31,7 @@ class ReviewChangesInput(BaseModel):
     input_schema=ReviewChangesInput,
     kind="recipe",
 )
-async def review_changes(input: ReviewChangesInput, ctx):
+async def review_changes(input: ReviewChangesInput, ctx: CommandContext) -> CommandResult:
     status = await ctx.process.exec("git", ["status", "--short"], {"timeoutMs": 2_000})
     diff = await ctx.process.exec("git", ["diff", "--stat", input.target], {"timeoutMs": 5_000})
     prompt_template = await ctx.fs.read_text(str(PROMPT_PATH))

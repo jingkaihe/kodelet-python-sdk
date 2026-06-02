@@ -3,7 +3,17 @@ from __future__ import annotations
 import inspect
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Literal, overload
+from typing import (
+    Any,
+    Literal,
+    NotRequired,
+    Required,
+    TypeAlias,
+    TypedDict,
+    TypeVar,
+    cast,
+    overload,
+)
 
 from pydantic import ValidationError
 
@@ -16,15 +26,203 @@ from ._utils import (
     optional_timeout,
     to_plain,
 )
-from .context import create_command_context, create_event_context, create_tool_context
+from .context import (
+    CommandContext,
+    EventContext,
+    ToolContext,
+    create_command_context,
+    create_event_context,
+    create_tool_context,
+)
 from .schemas import SchemaAdapter, SchemaLike, infer_schema_from_callable
+
+_MISSING = object()
 
 CommandAction = Literal["pass", "respond", "runAgent"]
 CommandKind = Literal["command", "recipe"]
-ToolHandler = Callable[[Any, Any], Awaitable[Any] | Any]
-CommandHandler = Callable[[Any, Any], Awaitable[Any] | Any]
-EventHandler = Callable[[AttrDict, Any], Awaitable[Any] | Any]
+EventName: TypeAlias = Literal[
+    "session.start",
+    "resources.discover",
+    "user.message",
+    "agent.init",
+    "agent.start",
+    "turn.start",
+    "tool.call",
+    "tool.result",
+    "turn.end",
+    "agent.end",
+    "session.end",
+]
+ToolHandler = Callable[[Any, ToolContext], Awaitable[Any] | Any]
+CommandHandler = Callable[[Any, CommandContext], Awaitable[Any] | Any]
+EventHandler = Callable[[Any, EventContext], Awaitable[Any] | Any]
 Entrypoint = Callable[["Extension"], Awaitable[None] | None]
+HandlerT = TypeVar("HandlerT", bound=Callable[..., Any])
+
+
+class ToolExecutionResult(TypedDict, total=False):
+    """Protocol-shaped result returned by extension tool handlers."""
+
+    content: Required[str]
+    data: Mapping[str, Any]
+    error: str
+
+
+class CommandPassResult(TypedDict):
+    """Command result that asks Kodelet to try the next matching route."""
+
+    action: Literal["pass"]
+
+
+class CommandRespondResult(TypedDict):
+    """Command result that responds directly to the user."""
+
+    action: Literal["respond"]
+    response: str
+
+
+class CommandRunAgentResult(TypedDict):
+    """Command result that starts an agent run with a prompt."""
+
+    action: Literal["runAgent"]
+    prompt: str
+    recipeName: NotRequired[str]
+
+
+CommandResult: TypeAlias = CommandPassResult | CommandRespondResult | CommandRunAgentResult
+
+
+class EventBlock(TypedDict):
+    """Event result requesting that Kodelet block a mutable/blocking event."""
+
+    reason: str
+
+
+class SystemPromptPatch(TypedDict, total=False):
+    """Patch for an ``agent.init`` system prompt."""
+
+    append: str
+    prepend: str
+    replace: str
+
+
+class ToolListPatch(TypedDict, total=False):
+    """Patch for an ``agent.init`` tool allowlist."""
+
+    disable: Sequence[str]
+    enable: Sequence[str]
+
+
+class EventResult(TypedDict, total=False):
+    """Protocol-shaped result returned by extension event handlers."""
+
+    input: Any
+    output: Any
+    block: EventBlock
+    message: str
+    followUpMessages: Sequence[str]
+    systemPrompt: SystemPromptPatch
+    tools: ToolListPatch
+    resources: Any
+
+
+class ToolCallDetails(AttrDict):
+    """Tool call details available on ``tool.call`` and ``tool.result`` events."""
+
+    name: str
+    callId: str
+    input: Any
+
+
+class ToolResultDetails(ToolCallDetails):
+    """Tool result details available on ``tool.result`` events."""
+
+    output: Any
+
+
+class ExtensionEvent(AttrDict):
+    """Base event object passed to event handlers."""
+
+    id: str
+    event: str
+
+
+class EmptyEvent(ExtensionEvent):
+    """Base type for lifecycle events with no additional payload fields."""
+
+
+class SessionStartEvent(EmptyEvent):
+    """Event payload passed to ``session.start`` handlers."""
+
+    event: Literal["session.start"]
+
+
+class ResourcesDiscoverEvent(EmptyEvent):
+    """Event payload passed to ``resources.discover`` handlers."""
+
+    event: Literal["resources.discover"]
+
+
+class AgentStartEvent(EmptyEvent):
+    """Event payload passed to ``agent.start`` handlers."""
+
+    event: Literal["agent.start"]
+
+
+class SessionEndEvent(EmptyEvent):
+    """Event payload passed to ``session.end`` handlers."""
+
+    event: Literal["session.end"]
+
+
+class ToolCallEvent(ExtensionEvent):
+    """Event payload passed to ``tool.call`` handlers."""
+
+    event: Literal["tool.call"]
+    tool: ToolCallDetails
+
+
+class ToolResultEvent(ExtensionEvent):
+    """Event payload passed to ``tool.result`` handlers."""
+
+    event: Literal["tool.result"]
+    tool: ToolResultDetails
+
+
+class UserMessageEvent(ExtensionEvent):
+    """Event payload passed to ``user.message`` handlers."""
+
+    event: Literal["user.message"]
+    message: str
+
+
+class AgentInitEvent(ExtensionEvent):
+    """Event payload passed to ``agent.init`` handlers."""
+
+    event: Literal["agent.init"]
+    systemPrompt: str | None
+
+
+class TurnStartEvent(ExtensionEvent):
+    """Event payload passed to ``turn.start`` handlers."""
+
+    event: Literal["turn.start"]
+    turnNumber: int | None
+
+
+class TurnEndEvent(ExtensionEvent):
+    """Event payload passed to ``turn.end`` handlers."""
+
+    event: Literal["turn.end"]
+    response: str
+    turnNumber: int | None
+
+
+class AgentEndEvent(ExtensionEvent):
+    """Event payload passed to ``agent.end`` handlers."""
+
+    event: Literal["agent.end"]
+    messages: Sequence[Any] | None
 
 
 @dataclass(frozen=True)
@@ -144,7 +342,7 @@ class Extension:
         description: str | None = None,
         input_schema: SchemaLike = None,
         timeout_in_sec: float | None = None,
-    ) -> Callable[[ToolHandler], ToolHandler]:
+    ) -> Callable[[HandlerT], HandlerT]:
         """Decorate a function as a Kodelet tool.
 
         Args:
@@ -161,7 +359,7 @@ class Extension:
             A decorator that returns the original function unchanged.
         """
 
-        def decorator(func: ToolHandler) -> ToolHandler:
+        def decorator(func: HandlerT) -> HandlerT:
             tool_name = name or _callable_name(func)
             tool_description = description or inspect.getdoc(func) or tool_name
             schema = input_schema if input_schema is not None else infer_schema_from_callable(func)
@@ -245,7 +443,7 @@ class Extension:
         aliases: Sequence[str] | None = None,
         kind: CommandKind | None = None,
         timeout_in_sec: float | None = None,
-    ) -> Callable[[CommandHandler], CommandHandler]:
+    ) -> Callable[[HandlerT], HandlerT]:
         """Decorate a function as a Kodelet command.
 
         Args:
@@ -264,7 +462,7 @@ class Extension:
             A decorator that returns the original function unchanged.
         """
 
-        def decorator(func: CommandHandler) -> CommandHandler:
+        def decorator(func: HandlerT) -> HandlerT:
             command_name = name or _callable_name(func)
             command_description = description or inspect.getdoc(func) or command_name
             schema = input_schema if input_schema is not None else infer_schema_from_callable(func)
@@ -282,7 +480,7 @@ class Extension:
         return decorator
 
     @overload
-    def on(self, event: str, handler: EventHandler, /) -> EventHandler: ...
+    def on(self, event: str, handler: HandlerT, /) -> HandlerT: ...
 
     @overload
     def on(
@@ -292,17 +490,17 @@ class Extension:
         *,
         priority: int = 0,
         timeout_in_sec: float | None = None,
-    ) -> Callable[[EventHandler], EventHandler]: ...
+    ) -> Callable[[HandlerT], HandlerT]: ...
 
     def on(
         self,
         event: str,
-        handler: EventHandler | None = None,
+        handler: HandlerT | object = _MISSING,
         /,
         *,
         priority: int = 0,
         timeout_in_sec: float | None = None,
-    ) -> EventHandler | Callable[[EventHandler], EventHandler]:
+    ) -> HandlerT | Callable[[HandlerT], HandlerT]:
         """Register an event handler.
 
         Can be used either as ``@ext.on("session.start")`` or as
@@ -324,7 +522,7 @@ class Extension:
             decorator.
         """
 
-        def decorator(func: EventHandler) -> EventHandler:
+        def decorator(func: HandlerT) -> HandlerT:
             self._handlers.append(
                 EventHandlerRegistration(
                     event=event,
@@ -337,8 +535,8 @@ class Extension:
             self._order += 1
             return func
 
-        if handler is not None:
-            return decorator(handler)
+        if handler is not _MISSING:
+            return decorator(cast(HandlerT, handler))
         return decorator
 
     def initialize(self, params: Mapping[str, Any]) -> dict[str, Any]:
@@ -592,12 +790,12 @@ async def create_extension_host(entrypoint: Extension | Entrypoint) -> Extension
 def on(
     extension: Extension,
     event: str,
-    handler: EventHandler | None = None,
+    handler: HandlerT | None = None,
     /,
     *,
     priority: int = 0,
     timeout_in_sec: float | None = None,
-) -> EventHandler | Callable[[EventHandler], EventHandler]:
+) -> HandlerT | Callable[[HandlerT], HandlerT]:
     """Functional wrapper around :meth:`Extension.on`.
 
     Args:
