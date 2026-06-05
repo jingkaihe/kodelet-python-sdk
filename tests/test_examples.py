@@ -36,6 +36,16 @@ def assert_executable(path: Path) -> None:
     assert os.access(path, os.X_OK)
 
 
+def assert_uv_script(path: Path) -> None:
+    mode = path.stat().st_mode
+    text = path.read_text(encoding="utf-8")
+    assert text.startswith("#!/usr/bin/env -S uv run --script")
+    assert 'dependencies = ["kodelet-sdk"]' in text
+    assert 'kodelet-sdk = { path = "../..", editable = true }' in text
+    assert mode & stat.S_IXUSR
+    assert os.access(path, os.X_OK)
+
+
 def read_subprocess_frame(stdout) -> dict[str, Any]:
     header_lines: list[bytes] = []
     while True:
@@ -60,6 +70,21 @@ def write_subprocess_frame(stdin, message: dict[str, Any]) -> None:
     payload = json.dumps(message, separators=(",", ":")).encode("utf-8")
     stdin.write(b"Content-Length: " + str(len(payload)).encode("ascii") + b"\r\n\r\n" + payload)
     stdin.flush()
+
+
+def test_sdk_agent_examples_are_import_safe_and_executable() -> None:
+    examples_dir = ROOT / "examples" / "sdk"
+    example_names = [
+        "basic-agent-session",
+        "streaming-agent-session",
+        "inline-extension-session",
+    ]
+
+    for example_name in example_names:
+        path = examples_dir / example_name
+        assert_uv_script(path)
+        module = load_module(f"sdk_example_{example_name.replace('-', '_')}", path)
+        assert callable(module.main)
 
 
 @pytest.mark.asyncio

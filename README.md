@@ -32,6 +32,83 @@ if __name__ == "__main__":
 
 ## Public API
 
+### Agent sessions
+
+Use `Client` to launch Kodelet and drive an agent session from Python. The
+client speaks to `kodelet acp` over stdio JSON-RPC, so normal profile
+resolution, conversation persistence, tools, skills, MCP, and extensions still
+come from the Kodelet executable.
+
+```python
+from kodelet_sdk import Client
+
+client = Client()
+session = await client.create_session()
+response = await session.run_and_wait(message="what is the meaning of life?")
+
+print(response.content)
+await client.close()
+```
+
+Pass a named or inline `Profile` when creating a session, and listen for typed
+stream events while a run is active:
+
+```python
+from kodelet_sdk import Client, Profile
+
+client = Client(command="kodelet")
+session = await client.create_session(
+    profile=Profile(
+        {
+            "provider": "openai",
+            "model": "gpt-5.5",
+            "openai": {"api_mode": "responses", "service_tier": "fast"},
+        }
+    ),
+    max_turns=4,
+    streaming=True,
+)
+
+session.on(
+    "assistant.message_delta",
+    lambda event: print(event.data.deltaContent, end="", flush=True),
+)
+
+response = await session.run_and_wait(message="help me choose an approach")
+print("\nfinal:", response.content)
+await client.close()
+```
+
+Agent sessions can expose in-process Python extensions for that session. Inline
+extensions are served through a temporary JSON-RPC bridge and are removed when
+the session closes.
+
+```python
+from kodelet_sdk import BaseModel, Client, Extension, define_extension
+
+
+def workspace(ext: Extension) -> None:
+    ext.set_metadata(name="workspace")
+
+    class AskInput(BaseModel):
+        question: str
+        options: list[str]
+
+    @ext.tool("ask_user_question", description="Ask the user", input_schema=AskInput)
+    async def ask_user_question(input: AskInput, ctx):
+        choice = await ctx.ui.select({"title": input.question, "options": input.options})
+        return choice or "dismissed"
+
+
+client = Client()
+session = await client.create_session(
+    extensions=[define_extension(workspace)],
+    ui={"select": lambda request: request["options"][0]},
+)
+response = await session.run_and_wait(message="ask me to choose")
+await client.close()
+```
+
 ### Extension registration
 
 - `Extension(name=None, version=None)` creates an extension host.

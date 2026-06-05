@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
+import inspect
 import json
 import os
 import subprocess
 import sys
 from builtins import list as list_type
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, NotRequired, Protocol, Required, TypeAlias, TypedDict, cast
@@ -85,6 +87,10 @@ class HostRPCClient(Protocol):
 
 
 _active_host_rpc_client: HostRPCClient | None = None
+_host_rpc_client_context: contextvars.ContextVar[HostRPCClient | None] = contextvars.ContextVar(
+    "kodelet_sdk_host_rpc_client",
+    default=None,
+)
 
 
 def set_active_host_rpc_client(client: HostRPCClient | None) -> None:
@@ -96,6 +102,31 @@ def set_active_host_rpc_client(client: HostRPCClient | None) -> None:
 
     global _active_host_rpc_client
     _active_host_rpc_client = client
+
+
+async def run_with_host_rpc_client(
+    client: HostRPCClient | None,
+    func: Callable[[], Awaitable[Any] | Any],
+) -> Any:
+    """Run ``func`` with a task-local reverse-RPC client.
+
+    The stdio runtime uses :func:`set_active_host_rpc_client` for the process-wide
+    extension client. The agent SDK can host multiple in-process extensions at
+    once, so it needs task-local routing while a handler is being dispatched.
+    """
+
+    token = _host_rpc_client_context.set(client)
+    try:
+        result = func()
+        if inspect.isawaitable(result):
+            return await result
+        return result
+    finally:
+        _host_rpc_client_context.reset(token)
+
+
+def _current_host_rpc_client() -> HostRPCClient | None:
+    return _host_rpc_client_context.get() or _active_host_rpc_client
 
 
 @dataclass(frozen=True)
@@ -451,9 +482,10 @@ class UIContext:
             request was cancelled.
         """
 
-        if _active_host_rpc_client is None:
+        client = _current_host_rpc_client()
+        if client is None:
             return None
-        result = await _active_host_rpc_client.request("kodelet.ui.input", dict(request))
+        result = await client.request("kodelet.ui.input", dict(request))
         if isinstance(result, Mapping) and result.get("status") == "submitted":
             value = result.get("value")
             if isinstance(value, str):
@@ -470,9 +502,10 @@ class UIContext:
             ``True`` only when the host returns a submitted positive response.
         """
 
-        if _active_host_rpc_client is None:
+        client = _current_host_rpc_client()
+        if client is None:
             return False
-        result = await _active_host_rpc_client.request("kodelet.ui.confirm", dict(request))
+        result = await client.request("kodelet.ui.confirm", dict(request))
         return (
             isinstance(result, Mapping)
             and result.get("status") == "submitted"
@@ -490,9 +523,10 @@ class UIContext:
             Selected option value, or ``None`` if unavailable/cancelled.
         """
 
-        if _active_host_rpc_client is None:
+        client = _current_host_rpc_client()
+        if client is None:
             return None
-        result = await _active_host_rpc_client.request("kodelet.ui.select", dict(request))
+        result = await client.request("kodelet.ui.select", dict(request))
         if isinstance(result, Mapping) and result.get("status") == "submitted":
             value = result.get("value")
             if isinstance(value, str):
@@ -506,10 +540,11 @@ class UIContext:
             request: Either a message string or notification request mapping.
         """
 
-        if _active_host_rpc_client is None:
+        client = _current_host_rpc_client()
+        if client is None:
             return
         payload = {"message": request} if isinstance(request, str) else dict(request)
-        await _active_host_rpc_client.request("kodelet.ui.notify", payload)
+        await client.request("kodelet.ui.notify", payload)
 
 
 class SharedContext:
