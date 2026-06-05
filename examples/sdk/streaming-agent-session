@@ -60,7 +60,8 @@ def install_stream_handlers(session: Session) -> Callable[[], None]:
 
     def write_json_event(event: AgentStreamEvent) -> None:
         finish_thinking()
-        print(json.dumps({"type": event.type, **event.data}), file=sys.stderr, flush=True)
+        payload = json.dumps({"type": event.type, **event.data})
+        print(f"[tool] {payload}", file=sys.stderr, flush=True)
 
     session.on("assistant.thinking_start", start_thinking)
     session.on("assistant.thinking_delta", write_thinking)
