@@ -151,12 +151,49 @@ def test_review_executable_initializes_while_stdin_stays_open(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
-async def test_workspace_example_tool_and_bash_policy(tmp_path: Path) -> None:
+async def test_workspace_example_registers_choice_tool(tmp_path: Path) -> None:
     entrypoint = ROOT / "examples" / "workspace" / "kodelet-extension-workspace"
     assert_executable(entrypoint)
     module = load_module(
         "workspace_example",
         entrypoint,
+    )
+
+    class FakeRPC:
+        def __init__(self) -> None:
+            self.requests: list[tuple[str, Any]] = []
+
+        async def request(self, method: str, params: Any | None = None) -> Any:
+            self.requests.append((method, params))
+            if method == "kodelet.ui.select":
+                return {"status": "submitted", "value": "Deny and remember this exact command"}
+            return {"status": "submitted"}
+
+    fake_rpc = FakeRPC()
+    harness = await create_test_harness(module.ext, fake_rpc)
+    init = harness.initialize(
+        {"extension": {"id": "workspace", "cwd": str(tmp_path), "dataDir": str(tmp_path / "data")}}
+    )
+
+    assert init["name"] == "workspace"
+    assert init["tools"][0]["name"] == "ask_user_choice"
+    assert {subscription["event"] for subscription in init["subscriptions"]} == {"agent.start"}
+
+    result = await harness.execute_tool(
+        {
+            "name": "ask_user_choice",
+            "input": {"question": "Pick", "options": ["A", "B"]},
+            "context": {"cwd": str(tmp_path)},
+        }
+    )
+    assert result == {"content": "User responded with: Deny and remember this exact command"}
+
+
+@pytest.mark.asyncio
+async def test_workspace_policy_fixture_tool_and_bash_policy(tmp_path: Path) -> None:
+    module = load_module(
+        "workspace_policy_fixture",
+        ROOT / "tests" / "fixtures" / "workspace_policy_extension.py",
     )
 
     class FakeRPC:

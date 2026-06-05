@@ -8,8 +8,9 @@ from typing import Any
 
 import pytest
 
+import kodelet_sdk
 from kodelet_sdk import BaseModel, Client, Extension, Profile, define_extension
-from kodelet_sdk.agent import SpawnedProcess, SpawnOptions
+from kodelet_sdk.agent import BridgeTransport, SpawnedProcess, SpawnOptions
 
 
 class FakeACPProcess(SpawnedProcess):
@@ -141,6 +142,16 @@ class _QueueLineReader:
 
     def feed_eof(self) -> None:
         self._queue.put_nowait(b"")
+
+
+def test_agent_package_preserves_public_reexports() -> None:
+    import kodelet_sdk.agent as agent
+    from kodelet_sdk.agent import client as client_module
+
+    assert agent.Client is Client
+    assert agent.Profile is Profile
+    assert kodelet_sdk.Client is Client
+    assert client_module.Client is Client
 
 
 def test_profile_maps_early_profiler_spelling_and_nested_config() -> None:
@@ -431,7 +442,7 @@ async def test_session_exposes_in_process_extensions_through_temporary_json_rpc_
 @pytest.mark.parametrize("extension_transport", ["unix", "tcp"])
 async def test_extension_bridge_routes_local_ui_handlers(
     tmp_path: Path,
-    extension_transport: str,
+    extension_transport: BridgeTransport,
 ) -> None:
     selected_values: list[str] = []
     extension_root_holder: dict[str, Path] = {}
