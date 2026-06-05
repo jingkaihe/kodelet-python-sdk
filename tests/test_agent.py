@@ -327,7 +327,7 @@ async def test_session_runs_kodelet_acp_json_rpc_and_emits_stream_events() -> No
         return process
 
     client = Client({"command": "kodelet-test", "cwd": "/workspace", "spawn": spawn})
-    session = await client.create_session(streaming=True, profile="work", maxTurns=2)
+    session = await client.create_session(streaming=True, profile="work", max_turns=2)
     deltas: list[str] = []
     thoughts: list[str] = []
     tool_names: list[str] = []
@@ -337,7 +337,7 @@ async def test_session_runs_kodelet_acp_json_rpc_and_emits_stream_events() -> No
     session.on("tool.call", lambda event: tool_names.append(event.data.toolName))
     session.on("tool.result", lambda event: tool_results.append(event.data.result))
 
-    response = await session.run_and_wait(message="meaning?", images=["diagram.png"], maxTurns=2)
+    response = await session.run_and_wait(message="meaning?", images=["diagram.png"], max_turns=2)
 
     assert response.content == "forty two"
     assert response.conversationId == "conv-1"
@@ -428,7 +428,11 @@ async def test_session_exposes_in_process_extensions_through_temporary_json_rpc_
 
 
 @pytest.mark.asyncio
-async def test_extension_bridge_routes_local_ui_handlers(tmp_path: Path) -> None:
+@pytest.mark.parametrize("extension_transport", ["unix", "tcp"])
+async def test_extension_bridge_routes_local_ui_handlers(
+    tmp_path: Path,
+    extension_transport: str,
+) -> None:
     selected_values: list[str] = []
     extension_root_holder: dict[str, Path] = {}
 
@@ -454,10 +458,12 @@ async def test_extension_bridge_routes_local_ui_handlers(tmp_path: Path) -> None
     client = Client(cwd=tmp_path, spawn=spawn)
     session = await client.create_session(
         extensions=[define_extension(extension_entrypoint)],
+        extension_transport=extension_transport,
         ui={"select": lambda request: request["options"][1]},
     )
 
     executable = next(extension_root_holder["path"].glob("kodelet-extension-*"))
+    assert f"'transport': '{extension_transport}'" in await _read_text(executable)
     process = await asyncio.create_subprocess_exec(
         str(executable),
         stdin=asyncio.subprocess.PIPE,

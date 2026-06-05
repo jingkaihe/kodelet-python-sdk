@@ -10,7 +10,7 @@ import tempfile
 import uuid
 from collections.abc import Awaitable, Callable, Coroutine, Mapping, Sequence
 from pathlib import Path
-from typing import Any, Protocol, TypeAlias, TypedDict, cast
+from typing import Any, Protocol, TypeAlias, TypedDict, Unpack, cast
 
 from ._utils import AttrDict, maybe_await
 from .api import Entrypoint, Extension, create_extension_host
@@ -26,6 +26,7 @@ from .context import (
 ACP_PROTOCOL_VERSION = 1
 
 ProfileInput: TypeAlias = Mapping[str, Any]
+BridgeTransport: TypeAlias = str
 
 
 class AgentUIHandlers(TypedDict, total=False):
@@ -46,7 +47,7 @@ class CreateSessionOptions(TypedDict, total=False):
     cwd: str
     resume: str
     max_turns: int
-    maxTurns: int
+    extension_transport: BridgeTransport
     ui: AgentUIHandlers
 
 
@@ -56,7 +57,6 @@ class RunOptions(TypedDict, total=False):
     message: str
     images: Sequence[str]
     max_turns: int
-    maxTurns: int
 
 
 class AssistantMessageDeltaData(TypedDict):
@@ -257,7 +257,7 @@ class Client:
     async def create_session(
         self,
         options: CreateSessionOptions | None = None,
-        **kwargs: Any,
+        **kwargs: Unpack[CreateSessionOptions],
     ) -> Session:
         """Create a new Kodelet ACP session.
 
@@ -266,14 +266,21 @@ class Client:
         """
 
         merged_options: dict[str, Any] = {**dict(options or {}), **kwargs}
-        _normalize_aliases(merged_options, {"maxTurns": "max_turns"})
         extensions = cast(
             Sequence[Entrypoint | Extension] | None,
             merged_options.get("extensions"),
         )
         ui = cast(AgentUIHandlers | None, merged_options.get("ui"))
+        extension_transport = _normalize_bridge_transport(
+            merged_options.get("extension_transport")
+        )
         bridge = (
-            await InMemoryExtensionBridge.create(extensions, {"ui": ui}) if extensions else None
+            await InMemoryExtensionBridge.create(
+                extensions,
+                {"ui": ui, "transport": extension_transport},
+            )
+            if extensions
+            else None
         )
         cwd = _resolve_path(str(merged_options.get("cwd") or self._cwd))
         profile = _normalize_profile(merged_options.get("profile"))
@@ -428,7 +435,7 @@ class Session:
     async def run_and_wait(
         self,
         options: RunOptions | str | None = None,
-        **kwargs: Any,
+        **kwargs: Unpack[RunOptions],
     ) -> AgentResponse:
         """Run a prompt and wait for the final ACP response."""
 
@@ -820,6 +827,14 @@ class ACPRPCClient:
         self._pending.clear()
 
 
+class BridgeEndpoint:
+    def __init__(self, transport: BridgeTransport, *, path: str | None = None) -> None:
+        self.transport = transport
+        self.path = path
+        self.host: str | None = None
+        self.port: int | None = None
+
+
 class InMemoryExtensionBridge:
     def __init__(self, root_dir: str, servers: Sequence[ExtensionSocketServer]) -> None:
         self._root_dir = root_dir
@@ -835,12 +850,13 @@ class InMemoryExtensionBridge:
         bridge_id = uuid.uuid4().hex[:16]
         servers: list[ExtensionSocketServer] = []
         ui = cast(AgentUIHandlers | None, (options or {}).get("ui"))
+        transport = _normalize_bridge_transport((options or {}).get("transport"))
         try:
             for index, entrypoint in enumerate(entrypoints, start=1):
                 extension_id = f"sdk-{bridge_id}-{index}"
-                socket_path = _extension_socket_path(root_dir, extension_id)
+                endpoint = _extension_bridge_endpoint(root_dir, extension_id, transport)
                 host = await create_extension_host(entrypoint)
-                server = ExtensionSocketServer(host, socket_path, ui)
+                server = ExtensionSocketServer(host, endpoint, ui)
                 await server.listen()
                 servers.append(server)
 
@@ -848,7 +864,7 @@ class InMemoryExtensionBridge:
                 await asyncio.to_thread(
                     _write_executable,
                     executable_path,
-                    _extension_bridge_executable(socket_path),
+                    _extension_bridge_executable(server.endpoint),
                 )
         except Exception:
             await asyncio.gather(*(server.close() for server in servers), return_exceptions=True)
@@ -888,11 +904,11 @@ class ExtensionSocketServer(HostRPCClient):
     def __init__(
         self,
         host: Extension,
-        socket_path: str,
+        endpoint: BridgeEndpoint,
         ui: AgentUIHandlers | None = None,
     ) -> None:
         self._host = host
-        self._socket_path = socket_path
+        self.endpoint = endpoint
         self._ui = ui or {}
         self._server: asyncio.AbstractServer | None = None
         self._writer: asyncio.StreamWriter | None = None
@@ -901,8 +917,23 @@ class ExtensionSocketServer(HostRPCClient):
         self._tasks: set[asyncio.Task[None]] = set()
 
     async def listen(self) -> None:
-        await asyncio.to_thread(_unlink_missing, self._socket_path)
-        self._server = await asyncio.start_unix_server(self._handle_client, path=self._socket_path)
+        if self.endpoint.transport == "unix":
+            if self.endpoint.path is None:
+                raise RuntimeError("Unix extension bridge endpoint is missing a socket path")
+            await asyncio.to_thread(_unlink_missing, self.endpoint.path)
+            self._server = await asyncio.start_unix_server(
+                self._handle_client,
+                path=self.endpoint.path,
+            )
+            return
+
+        self._server = await asyncio.start_server(self._handle_client, host="127.0.0.1", port=0)
+        sock = self._server.sockets[0] if self._server.sockets else None
+        if sock is None:
+            raise RuntimeError("TCP extension bridge server did not expose a listening socket")
+        host, port = sock.getsockname()[:2]
+        self.endpoint.host = str(host)
+        self.endpoint.port = int(port)
 
     async def close(self) -> None:
         for pending in self._pending.values():
@@ -918,7 +949,8 @@ class ExtensionSocketServer(HostRPCClient):
             self._server.close()
             await self._server.wait_closed()
             self._server = None
-        await asyncio.to_thread(_unlink_missing, self._socket_path)
+        if self.endpoint.transport == "unix" and self.endpoint.path is not None:
+            await asyncio.to_thread(_unlink_missing, self.endpoint.path)
 
     async def request(self, method: str, params: Any | None = None) -> Any:
         local = await self._try_handle_local_ui_request(method, params)
@@ -1089,6 +1121,14 @@ def _normalize_profile(profile: Any) -> Profile | None:
     raise TypeError("profile must be a profile name, Profile, or mapping")
 
 
+def _normalize_bridge_transport(value: Any) -> BridgeTransport:
+    if value is None:
+        return "unix"
+    if value in {"unix", "tcp"}:
+        return cast(BridgeTransport, value)
+    raise ValueError("extension_transport must be 'unix' or 'tcp'")
+
+
 def _normalize_run_options(
     options: RunOptions | str | None,
     kwargs: Mapping[str, Any],
@@ -1098,17 +1138,10 @@ def _normalize_run_options(
     else:
         run_options = dict(options or {})
     run_options.update(kwargs)
-    _normalize_aliases(run_options, {"maxTurns": "max_turns"})
     message = run_options.get("message")
     if not isinstance(message, str) or not message:
         raise ValueError("run_and_wait requires a non-empty message")
     return run_options
-
-
-def _normalize_aliases(options: dict[str, Any], aliases: Mapping[str, str]) -> None:
-    for alias, canonical in aliases.items():
-        if alias in options and canonical not in options:
-            options[canonical] = options[alias]
 
 
 def _option_int(options: Mapping[str, Any], key: str) -> int | None:
@@ -1285,21 +1318,35 @@ async def _write_frame(writer: asyncio.StreamWriter, payload: bytes) -> None:
     await writer.drain()
 
 
-def _extension_socket_path(root_dir: str, extension_id: str) -> str:
-    return str(Path(root_dir) / f"{extension_id}.sock")
+def _extension_bridge_endpoint(
+    root_dir: str,
+    extension_id: str,
+    transport: BridgeTransport,
+) -> BridgeEndpoint:
+    if transport == "unix":
+        return BridgeEndpoint(transport, path=str(Path(root_dir) / f"{extension_id}.sock"))
+    return BridgeEndpoint(transport)
 
 
-def _extension_bridge_executable(socket_path: str) -> str:
+def _extension_bridge_executable(endpoint: BridgeEndpoint) -> str:
+    if endpoint.transport == "unix":
+        if endpoint.path is None:
+            raise RuntimeError("Unix extension bridge endpoint is missing a socket path")
+        endpoint_config: dict[str, Any] = {"transport": "unix", "path": endpoint.path}
+    else:
+        if endpoint.host is None or endpoint.port is None:
+            raise RuntimeError("TCP extension bridge endpoint is missing host/port")
+        endpoint_config = {"transport": "tcp", "host": endpoint.host, "port": endpoint.port}
+
     return f'''#!/usr/bin/env python3
 from __future__ import annotations
 
 import json
-import os
 import socket
 import sys
 import threading
 
-SOCKET_PATH = {socket_path!r}
+ENDPOINT = {endpoint_config!r}
 
 
 def read_frame(stream):
@@ -1359,9 +1406,14 @@ def socket_to_stdout(sock_file):
 
 
 def main():
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    if ENDPOINT["transport"] == "unix":
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        address = ENDPOINT["path"]
+    else:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        address = (ENDPOINT["host"], ENDPOINT["port"])
     try:
-        sock.connect(SOCKET_PATH)
+        sock.connect(address)
         sock_file = sock.makefile("rb")
         thread = threading.Thread(target=stdin_to_socket, args=(sock,), daemon=True)
         thread.start()
@@ -1404,6 +1456,7 @@ __all__ = [
     "AssistantMessageData",
     "AssistantMessageDeltaData",
     "AssistantThinkingDeltaData",
+    "BridgeTransport",
     "Client",
     "ClientOptions",
     "CreateSessionOptions",

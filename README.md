@@ -109,6 +109,16 @@ response = await session.run_and_wait(message="ask me to choose")
 await client.close()
 ```
 
+Inline extension bridges use Unix domain sockets by default. If your environment
+blocks Unix sockets, use a loopback TCP bridge instead:
+
+```python
+session = await client.create_session(
+    extensions=[define_extension(workspace)],
+    extension_transport="tcp",  # binds an ephemeral 127.0.0.1 port
+)
+```
+
 ### Extension registration
 
 - `Extension(name=None, version=None)` creates an extension host.
