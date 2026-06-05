@@ -1,0 +1,35 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["kodelet-sdk"]
+# [tool.uv.sources]
+# kodelet-sdk = { path = "../..", editable = true }
+# ///
+from __future__ import annotations
+
+import asyncio
+import os
+import sys
+
+from kodelet_sdk import Client
+
+DEFAULT_MESSAGE = "What is the meaning of life? Answer in one short paragraph."
+
+
+async def main() -> None:
+    message = " ".join(sys.argv[1:]).strip() or DEFAULT_MESSAGE
+    command = os.environ.get("KODELET_BIN", "kodelet")
+    profile = os.environ.get("KODELET_PROFILE") or None
+    client = Client(command=command, cwd=os.getcwd())
+
+    try:
+        session = await client.create_session(profile=profile)
+        response = await session.run_and_wait(message=message)
+        print(response.content)
+        print(f"\nConversation: {response.conversation_id or session.id}", file=sys.stderr)
+    finally:
+        await client.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

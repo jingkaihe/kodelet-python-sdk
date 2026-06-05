@@ -1,0 +1,94 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["kodelet-sdk"]
+# [tool.uv.sources]
+# kodelet-sdk = { path = "../..", editable = true }
+# ///
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import sys
+from collections.abc import Callable
+
+from kodelet_sdk import AgentStreamEvent, Client, Session
+
+DEFAULT_MESSAGE = "Explain how to use the Kodelet Python SDK in two bullet points."
+
+
+def finish_response(response_content: str) -> None:
+    if not response_content:
+        print("(no assistant content)")
+        return
+    if not response_content.endswith("\n"):
+        print()
+
+
+def install_stream_handlers(session: Session) -> Callable[[], None]:
+    thinking_open = False
+    thinking_ends_with_newline = True
+
+    def finish_thinking(_event: AgentStreamEvent | None = None) -> None:
+        nonlocal thinking_open, thinking_ends_with_newline
+        if not thinking_open:
+            return
+        if not thinking_ends_with_newline:
+            print(file=sys.stderr, flush=True)
+        print(file=sys.stderr, flush=True)
+        thinking_open = False
+        thinking_ends_with_newline = True
+
+    def start_thinking(_event: AgentStreamEvent | None = None) -> None:
+        nonlocal thinking_open
+        finish_thinking()
+        print("[thinking]", file=sys.stderr, flush=True)
+        thinking_open = True
+
+    def write_thinking(event: AgentStreamEvent) -> None:
+        nonlocal thinking_ends_with_newline
+        if not thinking_open:
+            start_thinking()
+        text = event.data.deltaContent
+        print(text, end="", file=sys.stderr, flush=True)
+        thinking_ends_with_newline = text.endswith("\n")
+
+    def write_answer(event: AgentStreamEvent) -> None:
+        finish_thinking()
+        print(event.data.deltaContent, end="", flush=True)
+
+    def write_json_event(event: AgentStreamEvent) -> None:
+        finish_thinking()
+        payload = json.dumps({"type": event.type, **event.data})
+        print(f"[tool] {payload}", file=sys.stderr, flush=True)
+
+    session.on("assistant.thinking_start", start_thinking)
+    session.on("assistant.thinking_delta", write_thinking)
+    session.on("assistant.thinking_end", finish_thinking)
+    session.on("assistant.message_delta", write_answer)
+    session.on("tool.call", write_json_event)
+    session.on("tool.result", write_json_event)
+    return finish_thinking
+
+
+async def main() -> None:
+    message = " ".join(sys.argv[1:]).strip() or DEFAULT_MESSAGE
+    command = os.environ.get("KODELET_BIN", "kodelet")
+    profile = os.environ.get("KODELET_PROFILE") or None
+    client = Client(command=command, cwd=os.getcwd())
+
+    try:
+        session = await client.create_session(profile=profile, streaming=True)
+        finish_thinking = install_stream_handlers(session)
+
+        response = await session.run_and_wait(message=message)
+        finish_thinking()
+        finish_response(response.content)
+        print(f"Conversation: {response.conversation_id or session.id}")
+    finally:
+        await client.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

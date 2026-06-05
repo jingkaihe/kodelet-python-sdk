@@ -1,0 +1,72 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["kodelet-sdk"]
+# [tool.uv.sources]
+# kodelet-sdk = { path = "../..", editable = true }
+# ///
+from __future__ import annotations
+
+import asyncio
+import os
+import sys
+from collections.abc import Mapping
+from typing import Any
+
+from kodelet_sdk import BaseModel, Client, Extension, ToolContext, define_extension
+
+DEFAULT_MESSAGE = (
+    "Use the sdk_echo tool with text 'hello from the Python SDK example', "
+    "then summarize the tool result in one sentence."
+)
+
+
+class EchoInput(BaseModel):
+    text: str
+
+
+def echo_extension(ext: Extension) -> None:
+    ext.set_metadata(name="sdk-agent-example", version="0.1.0")
+
+    @ext.tool(
+        "sdk_echo",
+        description="Echo input text back to test the Python Agent SDK inline extension bridge.",
+        input_schema=EchoInput,
+    )
+    async def sdk_echo(input: EchoInput, ctx: ToolContext) -> str:
+        await ctx.ui.notify({"title": "sdk_echo called", "message": input.text})
+        return f"sdk_echo received: {input.text}"
+
+
+async def notify(request: Mapping[str, Any]) -> None:
+    title = request.get("title") or "notification"
+    message = request.get("message") or ""
+    print(f"[{title}] {message}", file=sys.stderr)
+
+
+async def main() -> None:
+    message = " ".join(sys.argv[1:]).strip() or DEFAULT_MESSAGE
+    command = os.environ.get("KODELET_BIN", "kodelet")
+    client = Client(command=command, cwd=os.getcwd())
+
+    try:
+        session = await client.create_session(
+            extensions=[define_extension(echo_extension)],
+            streaming=True,
+            ui={"notify": notify},
+        )
+        session.on(
+            "assistant.message_delta",
+            lambda event: print(event.data.deltaContent, end="", flush=True),
+        )
+
+        response = await session.run_and_wait(message=message)
+        if not response.content:
+            print("(no assistant content)")
+        print(f"\n\nConversation: {response.conversation_id or session.id}")
+    finally:
+        await client.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
