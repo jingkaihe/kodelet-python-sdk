@@ -84,37 +84,43 @@ extensions are served through a temporary JSON-RPC bridge and are removed when
 the session closes.
 
 ```python
-from kodelet_sdk import BaseModel, Client, Extension, define_extension
+from kodelet_sdk import BaseModel, Client, Extension
 
 
-def workspace(ext: Extension) -> None:
-    ext.set_metadata(name="workspace")
+ext = Extension(name="workspace", version="0.1.0")
 
-    class AskInput(BaseModel):
-        question: str
-        options: list[str]
 
-    @ext.tool("ask_user_question", description="Ask the user", input_schema=AskInput)
-    async def ask_user_question(input: AskInput, ctx):
-        choice = await ctx.ui.select({"title": input.question, "options": input.options})
-        return choice or "dismissed"
+class AskInput(BaseModel):
+    question: str
+    options: list[str]
+
+
+@ext.tool("ask_user_question", description="Ask the user", input_schema=AskInput)
+async def ask_user_question(input: AskInput, ctx):
+    choice = await ctx.ui.select({"title": input.question, "options": input.options})
+    return choice or "dismissed"
 
 
 client = Client()
 session = await client.create_session(
-    extensions=[define_extension(workspace)],
+    extensions=[ext],
     ui={"select": lambda request: request["options"][0]},
 )
 response = await session.run_and_wait(message="ask me to choose")
 await client.close()
 ```
 
+`create_session` accepts either ready-to-use `Extension` instances or entrypoint
+callables that receive a fresh `Extension`. Prefer passing an `Extension`
+directly for simple scripts and examples; use an entrypoint callable when each
+session should build an isolated extension host.
+
 Inline extension bridges use Unix domain sockets by default. If your environment
 blocks Unix sockets, use a loopback TCP bridge instead:
 
 ```python
 session = await client.create_session(
-    extensions=[define_extension(workspace)],
+    extensions=[ext],
     extension_transport="tcp",  # binds an ephemeral 127.0.0.1 port
 )
 ```

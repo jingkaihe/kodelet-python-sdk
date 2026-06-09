@@ -398,21 +398,20 @@ async def test_session_exposes_in_process_extensions_through_temporary_json_rpc_
             ),
         )
 
-    def extension_entrypoint(ext: Extension) -> None:
-        ext.set_metadata(name="workspace")
+    ext = Extension(name="workspace")
 
-        class AskInput(BaseModel):
-            question: str
-            options: list[str]
+    class AskInput(BaseModel):
+        question: str
+        options: list[str]
 
-        @ext.tool("ask_user_question", description="Ask a question", input_schema=AskInput)
-        async def ask_user_question(input: AskInput, ctx: Any) -> str:
-            selected = await ctx.ui.select({"title": input.question, "options": input.options})
-            return selected or "dismissed"
+    @ext.tool("ask_user_question", description="Ask a question", input_schema=AskInput)
+    async def ask_user_question(input: AskInput, ctx: Any) -> str:
+        selected = await ctx.ui.select({"title": input.question, "options": input.options})
+        return selected or "dismissed"
 
     client = Client(cwd=tmp_path, spawn=spawn)
     session = await client.create_session(
-        extensions=[define_extension(extension_entrypoint)],
+        extensions=[ext],
         ui={"select": lambda request: request["options"][0]},
     )
     await session.run_and_wait(message="hello")
