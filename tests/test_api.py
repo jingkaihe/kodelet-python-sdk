@@ -21,10 +21,12 @@ from kodelet_sdk import (
     Extension,
     Field,
     Jinja2,
+    JSONSchema,
     Pydantic,
     ToolCallEvent,
     ToolContext,
     ToolExecutionResult,
+    ToolInputSchema,
     UIConfirmRequest,
     UIInputRequest,
     UINotifyRequest,
@@ -209,6 +211,45 @@ async def test_registers_tools_commands_events_and_executes_handlers() -> None:
         }
     )
     assert agent_end_result == {"followUpMessages": ["inspect tests"]}
+
+
+@pytest.mark.asyncio
+async def test_raw_json_schema_is_preserved_and_input_is_passed_through() -> None:
+    ext = Extension()
+    raw_schema: JSONSchema = {
+        "type": "object",
+        "description": "Raw JSON Schema",
+        "properties": {
+            "mode": {"type": "string", "enum": ["fast", "safe"]},
+            "target": {"type": ["string", "null"]},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 10},
+        },
+        "required": ["mode"],
+        "additionalProperties": False,
+        "oneOf": [
+            {"properties": {"mode": {"const": "fast"}}},
+            {"properties": {"mode": {"const": "safe"}}},
+        ],
+        "x-kodelet-test": {"preserved": True},
+    }
+    tool_schema: ToolInputSchema = raw_schema
+    received: list[Any] = []
+
+    @ext.tool("raw_schema", description="Raw schema", input_schema=tool_schema)
+    async def raw_schema_tool(input: Any, _ctx: ToolContext) -> str:
+        received.append(input)
+        return json.dumps(input, sort_keys=True)
+
+    harness = await create_test_harness(ext)
+    init = harness.initialize()
+    assert init["tools"][0]["inputSchema"] == raw_schema
+
+    unconstrained = {"mode": "not-an-enum-value", "extra": True}
+    result = await harness.execute_tool({"name": "raw_schema", "input": unconstrained})
+    assert result == {"content": json.dumps(unconstrained, sort_keys=True)}
+    null_result = await harness.execute_tool({"name": "raw_schema", "input": None})
+    assert null_result == {"content": "null"}
+    assert received == [unconstrained, None]
 
 
 @pytest.mark.asyncio
@@ -475,6 +516,80 @@ async def test_runtime_serves_json_rpc_and_reverse_host_rpc() -> None:
     )
     assert result == {"content": "HELLO:from-host"}
     assert [request["method"] for request in client.host_requests] == ["kodelet.ui.input"]
+    assert [request["parentId"] for request in client.host_requests] == [2]
+
+    server_reader.close()
+    await asyncio.wait_for(task, timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_runtime_correlates_concurrent_reverse_rpc_requests() -> None:
+    ext = Extension(name="concurrent-rpc")
+    both_started = asyncio.Event()
+    started = 0
+
+    @ext.tool("ask", description="Ask concurrently", input_schema={"type": "object"})
+    async def ask(input: Any, ctx: ToolContext) -> str:
+        nonlocal started
+        started += 1
+        if started == 2:
+            both_started.set()
+        await asyncio.wait_for(both_started.wait(), timeout=1)
+        answer = await ctx.ui.input({"title": input["label"]})
+        return f"{input['label']}:{answer}"
+
+    server_reader = MemoryReader()
+    server_writer = MemoryWriter()
+    task = asyncio.create_task(run_stdio_server(ext, server_reader, server_writer))
+    client = RpcTestClient(server_reader, server_writer)
+
+    await client.call(
+        "extension.initialize",
+        {
+            "protocolVersion": "2026-05-30",
+            "extension": {"id": "concurrent-rpc", "cwd": os.getcwd(), "dataDir": ""},
+        },
+    )
+
+    for request_id, label in ((2, "first"), (3, "second")):
+        server_reader.feed(
+            _frame(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": "extension.tool.execute",
+                    "params": {"name": "ask", "input": {"label": label}},
+                }
+            )
+        )
+
+    reverse_requests = [
+        await asyncio.wait_for(server_writer.read_frame(), timeout=1),
+        await asyncio.wait_for(server_writer.read_frame(), timeout=1),
+    ]
+    reverse_by_title = {request["params"]["title"]: request for request in reverse_requests}
+    assert reverse_by_title["first"]["parentId"] == 2
+    assert reverse_by_title["second"]["parentId"] == 3
+
+    for label in ("second", "first"):
+        request = reverse_by_title[label]
+        server_reader.feed(
+            _frame(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request["id"],
+                    "result": {"status": "submitted", "value": f"{label}-answer"},
+                }
+            )
+        )
+
+    responses = [
+        await asyncio.wait_for(server_writer.read_frame(), timeout=1),
+        await asyncio.wait_for(server_writer.read_frame(), timeout=1),
+    ]
+    response_by_id = {response["id"]: response for response in responses}
+    assert response_by_id[2]["result"] == {"content": "first:first-answer"}
+    assert response_by_id[3]["result"] == {"content": "second:second-answer"}
 
     server_reader.close()
     await asyncio.wait_for(task, timeout=1)

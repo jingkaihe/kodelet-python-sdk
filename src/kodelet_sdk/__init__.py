@@ -87,6 +87,7 @@ from .context import (
     set_active_host_rpc_client,
 )
 from .runtime import run_extension
+from .schemas import JSONSchema, ToolInputSchema
 from .template import render_template
 from .test_harness import ExtensionTestHarness, create_test_harness
 
@@ -133,6 +134,7 @@ __all__ = [
     "FileInfo",
     "FileSystemContext",
     "HostRPCClient",
+    "JSONSchema",
     "Jinja2",
     "LogContext",
     "PathContext",
@@ -159,6 +161,7 @@ __all__ = [
     "ToolCallEvent",
     "ToolContext",
     "ToolExecutionResult",
+    "ToolInputSchema",
     "ToolListPatch",
     "ToolResultData",
     "ToolResultDetails",

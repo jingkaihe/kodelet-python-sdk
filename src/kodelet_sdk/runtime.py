@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import sys
-from collections.abc import Mapping
-from typing import Any, Protocol, cast
+from collections.abc import Awaitable, Callable, Mapping
+from typing import Any, Protocol, TypeVar, cast
 
 from .api import Entrypoint, Extension, create_extension_host
 from .context import HostRPCClient, set_active_host_rpc_client
+
+ResultT = TypeVar("ResultT")
 
 
 class BinaryReader(Protocol):
@@ -31,8 +34,31 @@ class StdioHostRPCClient(HostRPCClient):
 
     def __init__(self, writer: BinaryWriter) -> None:
         self._writer = writer
+        self._write_lock = asyncio.Lock()
         self._next_id = 0
         self._pending: dict[int, asyncio.Future[Any]] = {}
+        self._parent_request_id: contextvars.ContextVar[int | str | None] = (
+            contextvars.ContextVar("kodelet_sdk_parent_request_id", default=None)
+        )
+
+    async def run_for_request(
+        self,
+        request_id: int | str,
+        func: Callable[[], Awaitable[ResultT]],
+    ) -> ResultT:
+        """Run a host request with task-local reverse-RPC correlation."""
+
+        token = self._parent_request_id.set(request_id)
+        try:
+            return await func()
+        finally:
+            self._parent_request_id.reset(token)
+
+    async def send(self, message: Mapping[str, Any]) -> None:
+        """Write one framed message without interleaving concurrent writes."""
+
+        async with self._write_lock:
+            await write_message(self._writer, message)
 
     async def request(self, method: str, params: Any | None = None) -> Any:
         """Send a JSON-RPC request to the Kodelet host and await the response.
@@ -50,10 +76,15 @@ class StdioHostRPCClient(HostRPCClient):
         loop = asyncio.get_running_loop()
         future: asyncio.Future[Any] = loop.create_future()
         self._pending[request_id] = future
-        await write_message(
-            self._writer,
-            {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params},
-        )
+        message: dict[str, Any] = {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": method,
+            "params": params,
+        }
+        if (parent_id := self._parent_request_id.get()) is not None:
+            message["parentId"] = parent_id
+        await self.send(message)
         return await future
 
     def handle_response(self, response: Mapping[str, Any]) -> bool:
@@ -118,7 +149,7 @@ async def run_stdio_server(
             if pending_tasks:
                 await asyncio.gather(*pending_tasks)
             return
-        task = asyncio.create_task(_handle_message(host, host_client, resolved_writer, payload))
+        task = asyncio.create_task(_handle_message(host, host_client, payload))
         pending_tasks.add(task)
         task.add_done_callback(pending_tasks.discard)
 
@@ -126,14 +157,12 @@ async def run_stdio_server(
 async def _handle_message(
     host: Extension,
     host_client: StdioHostRPCClient,
-    writer: BinaryWriter,
     payload: bytes,
 ) -> None:
     try:
         message = json.loads(payload.decode("utf-8"))
     except Exception as exc:
-        await write_message(
-            writer,
+        await host_client.send(
             {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": str(exc)}},
         )
         return
@@ -147,14 +176,13 @@ async def _handle_message(
     if not isinstance(message, Mapping):
         return
     request_id = message.get("id")
-    if request_id is None:
+    if not isinstance(request_id, int | str):
         return
     try:
-        result = await _dispatch(host, message)
-        await write_message(writer, {"jsonrpc": "2.0", "id": request_id, "result": result})
+        result = await host_client.run_for_request(request_id, lambda: _dispatch(host, message))
+        await host_client.send({"jsonrpc": "2.0", "id": request_id, "result": result})
     except Exception as exc:
-        await write_message(
-            writer,
+        await host_client.send(
             {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32000, "message": str(exc)}},
         )
 

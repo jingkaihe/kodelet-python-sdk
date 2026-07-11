@@ -170,6 +170,8 @@ assert Pydantic.TypeAdapter(int).validate_python("1") == 1
 
 Pydantic input schemas are converted to JSON Schema during initialization and validate incoming tool/command inputs before handlers run. Commands with validation failures return `{"action": "pass"}` so another command route can handle the invocation.
 
+Tools also accept arbitrary raw `JSONSchema` mappings. Raw schemas are forwarded unchanged to Kodelet and inputs are passed directly to the handler; use a Pydantic schema when the Python extension should perform local validation.
+
 ### Context helpers
 
 Handlers receive `ctx` with Kodelet call metadata and helper namespaces:
@@ -183,6 +185,7 @@ Handlers receive `ctx` with Kodelet call metadata and helper namespaces:
 - `ctx.ui.input/confirm/select/notify(...)` for host UI reverse-RPC calls.
 
 UI helpers accept protocol-shaped typed requests: `UIInputRequest`, `UIConfirmRequest`, `UISelectRequest`, and `UINotifyRequest`.
+The stdio runtime dispatches independent extension requests concurrently and includes the originating request's `parentId` on reverse-RPC calls so Kodelet can route UI interactions to the correct call context.
 
 ```python
 from kodelet_sdk import UIInputRequest, UISelectRequest

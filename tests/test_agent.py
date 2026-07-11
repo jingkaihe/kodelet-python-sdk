@@ -163,7 +163,7 @@ def test_profile_maps_early_profiler_spelling_and_nested_config() -> None:
             "max_tokens": 128000,
             "reasoning_effort": "xhigh",
             "weak_model": "gpt-5.4-mini",
-            "disable_fs_search_tools": True,
+            "enable_fs_search_tools": True,
             "openai": {
                 "api_mode": "responses",
                 "platform": "codex",
@@ -181,7 +181,7 @@ def test_profile_maps_early_profiler_spelling_and_nested_config() -> None:
             "max_tokens": 128000,
             "reasoning_effort": "xhigh",
             "weak_model": "gpt-5.4-mini",
-            "disable_fs_search_tools": True,
+            "enable_fs_search_tools": True,
             "openai": {
                 "api_mode": "responses",
                 "platform": "codex",

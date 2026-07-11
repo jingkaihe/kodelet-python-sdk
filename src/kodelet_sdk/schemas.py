@@ -6,7 +6,9 @@ from typing import Any, TypeAlias
 
 from pydantic import BaseModel, TypeAdapter
 
-SchemaLike: TypeAlias = type[BaseModel] | TypeAdapter[Any] | Mapping[str, Any] | None
+JSONSchema: TypeAlias = Mapping[str, Any]
+ToolInputSchema: TypeAlias = type[BaseModel] | TypeAdapter[Any] | JSONSchema | None
+SchemaLike: TypeAlias = ToolInputSchema
 
 _DEFAULT_JSON_SCHEMA: dict[str, Any] = {"type": "object", "additionalProperties": True}
 
@@ -35,6 +37,8 @@ class SchemaAdapter:
 
     def validate(self, value: Any) -> Any:
         if self._adapter is None:
+            if isinstance(self._schema, Mapping):
+                return value
             return {} if value is None else value
         return self._adapter.validate_python({} if value is None else value)
 
