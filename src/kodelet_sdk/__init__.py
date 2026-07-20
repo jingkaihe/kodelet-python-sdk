@@ -26,6 +26,7 @@ from .agent import (
     SpawnOptions,
     ToolCallData,
     ToolResultData,
+    ToolUpdateData,
 )
 from .api import (
     AgentEndEvent,
@@ -51,6 +52,7 @@ from .api import (
     ToolListPatch,
     ToolResultDetails,
     ToolResultEvent,
+    ToolUpdateEvent,
     TurnEndEvent,
     TurnStartEvent,
     UserMessageEvent,
@@ -166,6 +168,8 @@ __all__ = [
     "ToolResultData",
     "ToolResultDetails",
     "ToolResultEvent",
+    "ToolUpdateData",
+    "ToolUpdateEvent",
     "TurnEndEvent",
     "TurnStartEvent",
     "TypeAdapter",

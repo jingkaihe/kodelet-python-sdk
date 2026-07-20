@@ -225,18 +225,24 @@ class Session:
             return
         if session_update == "tool_call_update":
             status_value = _string_field(update, "status")
-            if status_value not in {"completed", "failed"}:
-                return
             tool_call_id = _string_field(update, "toolCallId")
+            data = {
+                "toolName": (tool_names.get(tool_call_id or "") if tool_call_id else None)
+                or _tool_name_from_update(update),
+                "result": _tool_content_to_text(update.get("content")),
+                **({"toolCallId": tool_call_id} if tool_call_id else {}),
+                **({"status": status_value} if status_value else {}),
+            }
+            if status_value == "in_progress":
+                if "content" in update:
+                    self._emit_tool_update_event(data, events, update)
+                return
+            if status_value not in {"completed", "failed"}:
+                self._emit_sdk_event("event", dict(update), events, update)
+                return
             self._emit_sdk_event(
                 "tool.result",
-                {
-                    "toolName": (tool_names.get(tool_call_id or "") if tool_call_id else None)
-                    or _tool_name_from_update(update),
-                    "result": _tool_content_to_text(update.get("content")),
-                    **({"toolCallId": tool_call_id} if tool_call_id else {}),
-                    "status": status_value,
-                },
+                data,
                 events,
                 update,
             )
@@ -264,6 +270,25 @@ class Session:
         if event_type != "event":
             self._emit("event", event)
         return event
+
+    def _emit_tool_update_event(
+        self,
+        data: Mapping[str, Any],
+        events: list[AgentStreamEvent],
+        raw: Any | None = None,
+    ) -> AgentStreamEvent:
+        tool_call_id = _string_field(data, "toolCallId")
+        if tool_call_id is not None:
+            for index, candidate in enumerate(events):
+                candidate_data = candidate.get("data")
+                if (
+                    candidate.get("type") == "tool.update"
+                    and isinstance(candidate_data, Mapping)
+                    and candidate_data.get("toolCallId") == tool_call_id
+                ):
+                    events.pop(index)
+                    break
+        return self._emit_sdk_event("tool.update", data, events, raw)
 
     def _emit(self, event_name: str, event: AgentStreamEvent) -> None:
         for listener in list(self._listeners.get(event_name, [])):

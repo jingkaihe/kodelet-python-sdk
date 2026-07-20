@@ -38,6 +38,7 @@ from .types import (
     SpawnOptions,
     ToolCallData,
     ToolResultData,
+    ToolUpdateData,
 )
 
 __all__ = [
@@ -61,4 +62,5 @@ __all__ = [
     "SpawnedProcess",
     "ToolCallData",
     "ToolResultData",
+    "ToolUpdateData",
 ]

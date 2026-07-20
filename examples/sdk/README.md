@@ -20,6 +20,7 @@ Useful environment variables:
 ## Examples
 
 - `basic-agent-session` runs one prompt and prints the final response.
-- `streaming-agent-session` streams assistant deltas as they arrive.
+- `streaming-agent-session` streams assistant deltas and accumulated tool-output
+  snapshots as they arrive.
 - `inline-extension-session` exposes an in-process Python `Extension` instance
   with an `sdk_echo` tool for the session.

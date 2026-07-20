@@ -17,6 +17,7 @@ from kodelet_sdk import (
     CommandContext,
     CommandResult,
     EventContext,
+    EventName,
     EventResult,
     Extension,
     Field,
@@ -27,6 +28,7 @@ from kodelet_sdk import (
     ToolContext,
     ToolExecutionResult,
     ToolInputSchema,
+    ToolUpdateEvent,
     UIConfirmRequest,
     UIInputRequest,
     UINotifyRequest,
@@ -54,6 +56,8 @@ def test_reexports_pydantic_and_jinja2() -> None:
 
 def test_public_typing_surface() -> None:
     ext = Extension()
+    update_event_name: EventName = "tool.update"
+    assert update_event_name == "tool.update"
 
     class EchoInput(BaseModel):
         text: str
@@ -115,6 +119,32 @@ def test_public_typing_surface() -> None:
             EventContext(None),
         )
         assert_type(approve_result, EventResult)
+
+    @ext.on("tool.update")
+    def sanitize_update(event: ToolUpdateEvent, _ctx: EventContext) -> EventResult:
+        assert_type(event.tool.name, str)
+        assert_type(event.tool.output, Any)
+        return {"output": event.tool.output}
+
+    update_handler: Callable[[ToolUpdateEvent, EventContext], EventResult] = sanitize_update
+    assert update_handler is sanitize_update
+    if TYPE_CHECKING:
+        update_result = sanitize_update(
+            ToolUpdateEvent(
+                {
+                    "id": "evt",
+                    "event": "tool.update",
+                    "tool": {
+                        "name": "bash",
+                        "callId": "call",
+                        "input": {},
+                        "output": {"content": "partial"},
+                    },
+                }
+            ),
+            EventContext(None),
+        )
+        assert_type(update_result, EventResult)
 
 
 @pytest.mark.asyncio
@@ -294,6 +324,10 @@ async def test_timeout_merging_preserves_zero() -> None:
     async def second(_event: Any, _ctx: Any) -> None:
         return None
 
+    @ext.on("tool.update", priority=2, timeout_in_sec=1)
+    async def update(_event: Any, _ctx: Any) -> None:
+        return None
+
     @ext.on("agent.end", timeout_in_sec=4)
     async def third(_event: Any, _ctx: Any) -> None:
         return None
@@ -310,7 +344,39 @@ async def test_timeout_merging_preserves_zero() -> None:
     assert sorted(init["subscriptions"], key=lambda item: item["event"]) == [
         {"event": "agent.end", "priority": 0, "timeoutInSec": 6},
         {"event": "tool.result", "priority": 3, "timeoutInSec": 0},
+        {"event": "tool.update", "priority": 2, "timeoutInSec": 1},
     ]
+
+
+@pytest.mark.asyncio
+async def test_tool_update_handler_can_replace_accumulated_snapshot() -> None:
+    ext = Extension()
+
+    @ext.on("tool.update")
+    async def sanitize(event: ToolUpdateEvent, _ctx: EventContext) -> EventResult:
+        assert event.tool.name == "bash"
+        assert event.tool.output == {"content": "secret output"}
+        return {"output": {"content": "[redacted]"}}
+
+    harness = await create_test_harness(ext)
+    assert harness.initialize()["subscriptions"] == [
+        {"event": "tool.update", "priority": 0}
+    ]
+    result = await harness.handle_event(
+        {
+            "id": "evt",
+            "event": "tool.update",
+            "payload": {
+                "tool": {
+                    "name": "bash",
+                    "callId": "call-1",
+                    "input": {"command": "echo secret"},
+                    "output": {"content": "secret output"},
+                }
+            },
+        }
+    )
+    assert result == {"output": {"content": "[redacted]"}}
 
 
 @pytest.mark.asyncio

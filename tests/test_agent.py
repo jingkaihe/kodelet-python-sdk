@@ -9,7 +9,14 @@ from typing import Any
 import pytest
 
 import kodelet_sdk
-from kodelet_sdk import BaseModel, Client, Extension, Profile, define_extension
+from kodelet_sdk import (
+    BaseModel,
+    Client,
+    Extension,
+    Profile,
+    ToolUpdateData,
+    define_extension,
+)
 from kodelet_sdk.agent import BridgeTransport, SpawnedProcess, SpawnOptions
 
 
@@ -306,6 +313,54 @@ async def test_session_runs_kodelet_acp_json_rpc_and_emits_stream_events() -> No
                 "update": {
                     "sessionUpdate": "tool_call_update",
                     "toolCallId": "call-1",
+                    "status": "in_progress",
+                },
+            },
+        )
+        child.notify(
+            "session/update",
+            {
+                "sessionId": "conv-1",
+                "update": {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "call-1",
+                    "status": "in_progress",
+                    "content": [
+                        {
+                            "type": "content",
+                            "content": {"type": "text", "text": "partial file contents"},
+                        }
+                    ],
+                },
+            },
+        )
+        child.notify(
+            "session/update",
+            {
+                "sessionId": "conv-1",
+                "update": {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "call-1",
+                    "status": "in_progress",
+                    "content": [
+                        {
+                            "type": "content",
+                            "content": {
+                                "type": "text",
+                                "text": "complete partial file contents",
+                            },
+                        }
+                    ],
+                },
+            },
+        )
+        child.notify(
+            "session/update",
+            {
+                "sessionId": "conv-1",
+                "update": {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "call-1",
                     "status": "completed",
                     "content": [
                         {
@@ -342,10 +397,12 @@ async def test_session_runs_kodelet_acp_json_rpc_and_emits_stream_events() -> No
     deltas: list[str] = []
     thoughts: list[str] = []
     tool_names: list[str] = []
+    tool_updates: list[str] = []
     tool_results: list[str] = []
     session.on("assistant.message_delta", lambda event: deltas.append(event.data.deltaContent))
     session.on("assistant.thinking_delta", lambda event: thoughts.append(event.data.deltaContent))
     session.on("tool.call", lambda event: tool_names.append(event.data.toolName))
+    session.on("tool.update", lambda event: tool_updates.append(event.data.result))
     session.on("tool.result", lambda event: tool_results.append(event.data.result))
 
     response = await session.run_and_wait(message="meaning?", images=["diagram.png"], max_turns=2)
@@ -355,7 +412,14 @@ async def test_session_runs_kodelet_acp_json_rpc_and_emits_stream_events() -> No
     assert deltas == ["forty", " two"]
     assert thoughts == ["checking"]
     assert tool_names == ["file_read"]
+    assert tool_updates == ["partial file contents", "complete partial file contents"]
     assert tool_results == ["1 | hello"]
+    recorded_tool_updates = [event for event in response.events if event.type == "tool.update"]
+    assert len(recorded_tool_updates) == 1
+    update_data: ToolUpdateData = recorded_tool_updates[0].data
+    assert update_data["result"] == "complete partial file contents"
+    assert update_data["toolCallId"] == "call-1"
+    assert update_data["status"] == "in_progress"
     assert response.stopReason == "end_turn"
     assert session.id == "conv-1"
     assert calls[0]["command"] == "kodelet-test"

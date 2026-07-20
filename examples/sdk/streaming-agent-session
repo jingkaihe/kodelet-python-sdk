@@ -68,6 +68,7 @@ def install_stream_handlers(session: Session) -> Callable[[], None]:
     session.on("assistant.thinking_end", finish_thinking)
     session.on("assistant.message_delta", write_answer)
     session.on("tool.call", write_json_event)
+    session.on("tool.update", write_json_event)
     session.on("tool.result", write_json_event)
     return finish_thinking
 

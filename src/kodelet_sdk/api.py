@@ -48,6 +48,7 @@ EventName: TypeAlias = Literal[
     "agent.start",
     "turn.start",
     "tool.call",
+    "tool.update",
     "tool.result",
     "turn.end",
     "agent.end",
@@ -127,7 +128,7 @@ class EventResult(TypedDict, total=False):
 
 
 class ToolCallDetails(AttrDict):
-    """Tool call details available on ``tool.call`` and ``tool.result`` events."""
+    """Tool call details available on tool lifecycle events."""
 
     name: str
     callId: str
@@ -135,7 +136,7 @@ class ToolCallDetails(AttrDict):
 
 
 class ToolResultDetails(ToolCallDetails):
-    """Tool result details available on ``tool.result`` events."""
+    """Tool result details available on ``tool.update`` and ``tool.result`` events."""
 
     output: Any
 
@@ -180,6 +181,13 @@ class ToolCallEvent(ExtensionEvent):
 
     event: Literal["tool.call"]
     tool: ToolCallDetails
+
+
+class ToolUpdateEvent(ExtensionEvent):
+    """Event payload passed to ``tool.update`` handlers."""
+
+    event: Literal["tool.update"]
+    tool: ToolResultDetails
 
 
 class ToolResultEvent(ExtensionEvent):
@@ -509,7 +517,7 @@ class Extension:
 
         Args:
             event: Dot-separated Kodelet event name, for example
-                ``"session.start"`` or ``"tool.call"``.
+                ``"session.start"``, ``"tool.call"``, or ``"tool.update"``.
             handler: Optional handler callable. If omitted, this method returns
                 a decorator.
             priority: Higher-priority handlers run before lower-priority

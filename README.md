@@ -73,11 +73,24 @@ session.on(
     "assistant.message_delta",
     lambda event: print(event.data.deltaContent, end="", flush=True),
 )
+session.on(
+    "tool.update",
+    lambda event: print(f"partial {event.data.toolCallId}: {event.data.result}"),
+)
+session.on(
+    "tool.result",
+    lambda event: print(f"final {event.data.toolCallId}: {event.data.result}"),
+)
 
 response = await session.run_and_wait(message="help me choose an approach")
 print("\nfinal:", response.content)
 await client.close()
 ```
+
+Each `tool.update` contains the latest accumulated output snapshot, not a new
+delta. Listeners receive every snapshot. To keep completed responses bounded,
+`response.events` retains only the latest `tool.update` for each `toolCallId`,
+followed by the authoritative `tool.result`.
 
 Agent sessions can expose in-process Python extensions for that session. Inline
 extensions are served through a temporary JSON-RPC bridge and are removed when
@@ -130,7 +143,7 @@ session = await client.create_session(
 - `Extension(name=None, version=None)` creates an extension host.
 - `@ext.tool(name=None, description=None, input_schema=None, timeout_in_sec=None)` registers a tool.
 - `@ext.command(name=None, description=None, input_schema=None, aliases=None, kind=None, timeout_in_sec=None)` registers a command.
-- `@ext.on(event, priority=0, timeout_in_sec=None)` registers an event handler such as `session.start`, `tool.call`, or `agent.end`.
+- `@ext.on(event, priority=0, timeout_in_sec=None)` registers an event handler such as `session.start`, `tool.call`, `tool.update`, or `agent.end`.
 - `await ext.run()` starts the async stdio runtime; `ext.run_sync()` is a synchronous entrypoint convenience.
 
 Handlers may be synchronous or asynchronous. Tool handlers may return a string, which is converted to `{ "content": ... }`, or a protocol-shaped mapping. Command handlers return `{ "action": "pass" }`, `{ "action": "respond", "response": ... }`, or `{ "action": "runAgent", "prompt": ... }`.
@@ -138,7 +151,13 @@ Handlers may be synchronous or asynchronous. Tool handlers may return a string, 
 The decorators preserve concrete function signatures for type checkers, so handlers can annotate their inputs and contexts directly:
 
 ```python
-from kodelet_sdk import CommandContext, CommandResult, EventContext, ToolCallEvent
+from kodelet_sdk import (
+    CommandContext,
+    CommandResult,
+    EventContext,
+    ToolCallEvent,
+    ToolUpdateEvent,
+)
 
 
 @ext.command("doctor", description="Check health", input_schema=WeatherInput)
@@ -149,7 +168,18 @@ async def doctor(input: WeatherInput, ctx: CommandContext) -> CommandResult:
 @ext.on("tool.call")
 def approve(event: ToolCallEvent, ctx: EventContext):
     return {"message": event.tool.name}
+
+
+@ext.on("tool.update")
+def sanitize_partial_output(event: ToolUpdateEvent, ctx: EventContext):
+    return {"output": event.tool.output}
 ```
+
+`tool.update` handlers receive transient accumulated structured-result
+snapshots and may replace the snapshot by returning `{"output": ...}`. An
+extension that sanitizes `tool.result` should apply the same policy in
+`tool.update`; Kodelet suppresses partial snapshots when a result-subscribing
+extension does not also subscribe to updates.
 
 ### Pydantic and Jinja2 bridge dependencies
 

@@ -111,6 +111,9 @@ class ToolResultData(TypedDict, total=False):
     status: str
 
 
+ToolUpdateData: TypeAlias = ToolResultData
+
+
 class SpawnOptions(TypedDict, total=False):
     cwd: str
     env: Mapping[str, str]
@@ -168,7 +171,11 @@ class AgentStreamEvent(AttrDict):
 
 
 class AgentResponse(AttrDict):
-    """Final response returned by :meth:`Session.run_and_wait`."""
+    """Final response returned by :meth:`Session.run_and_wait`.
+
+    Transient ``tool.update`` snapshots in ``events`` are coalesced by tool
+    call id, retaining only the latest snapshot for each tool call.
+    """
 
     @property
     def conversation_id(self) -> str | None:
@@ -222,4 +229,5 @@ __all__ = [
     "SpawnedProcess",
     "ToolCallData",
     "ToolResultData",
+    "ToolUpdateData",
 ]
