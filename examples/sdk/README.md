@@ -1,7 +1,6 @@
 # Python Agent SDK examples
 
-These examples show how to use `kodelet_sdk.Client` to launch and drive Kodelet
-agent sessions from Python.
+These examples show how to use `kodelet_sdk.Client` to launch and drive Kodelet agent sessions from Python.
 
 They are executable `uv` scripts that use the local SDK checkout:
 
@@ -13,14 +12,11 @@ examples/sdk/inline-extension-session
 
 Useful environment variables:
 
-- `KODELET_BIN` — Kodelet executable to launch. Defaults to `kodelet` from
-  `PATH`.
+- `KODELET_BIN` — Kodelet executable to launch. Defaults to `kodelet` from `PATH`.
 - `KODELET_PROFILE` — optional named Kodelet profile to use for the session.
 
 ## Examples
 
 - `basic-agent-session` runs one prompt and prints the final response.
-- `streaming-agent-session` streams assistant deltas and accumulated tool-output
-  snapshots as they arrive.
-- `inline-extension-session` exposes an in-process Python `Extension` instance
-  with an `sdk_echo` tool for the session.
+- `streaming-agent-session` streams assistant deltas and accumulated tool-output snapshots as they arrive.
+- `inline-extension-session` exposes an in-process Python `Extension` instance with an `sdk_echo` tool for the session.

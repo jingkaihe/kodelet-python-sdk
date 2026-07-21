@@ -34,10 +34,7 @@ if __name__ == "__main__":
 
 ### Agent sessions
 
-Use `Client` to launch Kodelet and drive an agent session from Python. The
-client speaks to `kodelet acp` over stdio JSON-RPC, so normal profile
-resolution, conversation persistence, tools, skills, MCP, and extensions still
-come from the Kodelet executable.
+Use `Client` to launch Kodelet and drive an agent session from Python. The client speaks to `kodelet acp` over stdio JSON-RPC, so normal profile resolution, conversation persistence, tools, skills, MCP, and extensions still come from the Kodelet executable.
 
 ```python
 from kodelet_sdk import Client
@@ -50,8 +47,7 @@ print(response.content)
 await client.close()
 ```
 
-Pass a named or inline `Profile` when creating a session, and listen for typed
-stream events while a run is active:
+Pass a named or inline `Profile` when creating a session, and listen for typed stream events while a run is active:
 
 ```python
 from kodelet_sdk import Client, Profile
@@ -87,14 +83,9 @@ print("\nfinal:", response.content)
 await client.close()
 ```
 
-Each `tool.update` contains the latest accumulated output snapshot, not a new
-delta. Listeners receive every snapshot. To keep completed responses bounded,
-`response.events` retains only the latest `tool.update` for each `toolCallId`,
-followed by the authoritative `tool.result`.
+Each `tool.update` contains the latest accumulated output snapshot, not a new delta. Listeners receive every snapshot. To keep completed responses bounded, `response.events` retains only the latest `tool.update` for each `toolCallId`, followed by the authoritative `tool.result`.
 
-Agent sessions can expose in-process Python extensions for that session. Inline
-extensions are served through a temporary JSON-RPC bridge and are removed when
-the session closes.
+Agent sessions can expose in-process Python extensions for that session. Inline extensions are served through a temporary JSON-RPC bridge and are removed when the session closes.
 
 ```python
 from kodelet_sdk import BaseModel, Client, Extension
@@ -123,13 +114,9 @@ response = await session.run_and_wait(message="ask me to choose")
 await client.close()
 ```
 
-`create_session` accepts either ready-to-use `Extension` instances or entrypoint
-callables that receive a fresh `Extension`. Prefer passing an `Extension`
-directly for simple scripts and examples; use an entrypoint callable when each
-session should build an isolated extension host.
+`create_session` accepts either ready-to-use `Extension` instances or entrypoint callables that receive a fresh `Extension`. Prefer passing an `Extension` directly for simple scripts and examples; use an entrypoint callable when each session should build an isolated extension host.
 
-Inline extension bridges use Unix domain sockets by default. If your environment
-blocks Unix sockets, use a loopback TCP bridge instead:
+Inline extension bridges use Unix domain sockets by default. If your environment blocks Unix sockets, use a loopback TCP bridge instead:
 
 ```python
 session = await client.create_session(
@@ -148,9 +135,7 @@ session = await client.create_session(
 
 Handlers may be synchronous or asynchronous. Tool handlers may return a string, which is converted to `{ "content": ... }`, or a protocol-shaped mapping. Command handlers return `{ "action": "pass" }`, `{ "action": "respond", "response": ... }`, or `{ "action": "runAgent", "prompt": ... }`.
 
-Long-running tool handlers can publish transient accumulated snapshots through
-their context. Each update replaces the previous snapshot for that tool call;
-only the handler's return value is persisted or sent back to the model:
+Long-running tool handlers can publish transient accumulated snapshots through their context. Each update replaces the previous snapshot for that tool call; only the handler's return value is persisted or sent back to the model:
 
 ```python
 @ext.tool("search", description="Search a project", input_schema=SearchInput)
@@ -162,16 +147,11 @@ async def search(input: SearchInput, ctx: ToolContext) -> ToolExecutionResult:
     return {"content": "Search complete"}
 ```
 
-`ctx.update(...)` is capability-gated and is a no-op when the connected Kodelet
-host does not support live extension-tool updates.
+`ctx.update(...)` is capability-gated and is a no-op when the connected Kodelet host does not support live extension-tool updates.
 
-When the host cancels an active request or disconnects, async handlers receive
-`asyncio.CancelledError`. Any late `ctx.update(...)` or UI reverse-RPC call from
-that cancelled request is rejected rather than being routed to a later call.
+When the host cancels an active request or disconnects, async handlers receive `asyncio.CancelledError`. Any late `ctx.update(...)` or UI reverse-RPC call from that cancelled request is rejected rather than being routed to a later call.
 
-For long-running tasks with multiple activities, `TaskProgress` publishes a
-bounded `taskRun` snapshot and can either be updated directly or attached to a
-child Kodelet session:
+For long-running tasks with multiple activities, `TaskProgress` publishes a bounded `taskRun` snapshot and can either be updated directly or attached to a child Kodelet session:
 
 ```python
 progress = TaskProgress(
@@ -188,8 +168,7 @@ await progress.start()
 progress.attach(session)
 ```
 
-Calling `await progress.finish(...)` returns the terminal snapshot and detaches
-the child-session listeners automatically.
+Calling `await progress.finish(...)` returns the terminal snapshot and detaches the child-session listeners automatically.
 
 The decorators preserve concrete function signatures for type checkers, so handlers can annotate their inputs and contexts directly:
 
@@ -218,11 +197,7 @@ def sanitize_partial_output(event: ToolUpdateEvent, ctx: EventContext):
     return {"output": event.tool.output}
 ```
 
-`tool.update` handlers receive transient accumulated structured-result
-snapshots and may replace the snapshot by returning `{"output": ...}`. An
-extension that sanitizes `tool.result` should apply the same policy in
-`tool.update`; Kodelet suppresses partial snapshots when a result-subscribing
-extension does not also subscribe to updates.
+`tool.update` handlers receive transient accumulated structured-result snapshots and may replace the snapshot by returning `{"output": ...}`. An extension that sanitizes `tool.result` should apply the same policy in `tool.update`; Kodelet suppresses partial snapshots when a result-subscribing extension does not also subscribe to updates.
 
 ### Pydantic and Jinja2 bridge dependencies
 
@@ -257,8 +232,7 @@ Handlers receive `ctx` with Kodelet call metadata and helper namespaces:
 - `ctx.log.debug/info/warn/error(...)` for JSON logs to stderr.
 - `ctx.ui.input/confirm/select/notify(...)` for host UI reverse-RPC calls.
 
-UI helpers accept protocol-shaped typed requests: `UIInputRequest`, `UIConfirmRequest`, `UISelectRequest`, and `UINotifyRequest`.
-The stdio runtime dispatches independent extension requests concurrently and includes the originating request's `parentId` on reverse-RPC calls so Kodelet can route UI interactions to the correct call context.
+UI helpers accept protocol-shaped typed requests: `UIInputRequest`, `UIConfirmRequest`, `UISelectRequest`, and `UINotifyRequest`. The stdio runtime dispatches independent extension requests concurrently and includes the originating request's `parentId` on reverse-RPC calls so Kodelet can route UI interactions to the correct call context.
 
 ```python
 from kodelet_sdk import UIInputRequest, UISelectRequest

@@ -66,6 +66,7 @@ make release
 - Example entrypoints should be executable `kodelet-extension-*` wrappers; keep importable implementation code in adjacent `*_extension.py` files.
 - Prefer SDK re-exports in examples (`from kodelet_sdk import BaseModel, Extension, Field, render_template`) so examples are self-contained.
 - When adding public functionality, add focused pytest coverage and keep type/lint checks green.
+- Keep each Markdown prose paragraph on one source line; do not hard-wrap prose.
 
 ## README guidance
 
