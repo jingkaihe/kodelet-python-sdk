@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import shutil
 import tempfile
 import uuid
@@ -27,7 +28,6 @@ from .transport import (
     _read_frame,
     _unlink_missing,
     _write_executable,
-    _write_frame,
     _write_json_frame,
 )
 from .types import AgentUIHandlers
@@ -44,7 +44,10 @@ class InMemoryExtensionBridge:
         entrypoints: Sequence[Entrypoint | Extension],
         options: Mapping[str, Any] | None = None,
     ) -> InMemoryExtensionBridge:
-        root_dir = tempfile.mkdtemp(prefix="kodelet-sdk-extensions-")
+        root_dir = tempfile.mkdtemp(
+            prefix="kodelet-sdk-extensions-",
+            dir=None if os.name == "nt" else "/tmp",
+        )
         bridge_id = uuid.uuid4().hex[:16]
         servers: list[ExtensionSocketServer] = []
         ui = cast(AgentUIHandlers | None, (options or {}).get("ui"))
@@ -98,7 +101,129 @@ class TempConfig:
         await asyncio.to_thread(shutil.rmtree, self._root_dir, True)
 
 
-class ExtensionSocketServer(HostRPCClient):
+class _BridgeRequestState:
+    def __init__(self, request_id: int | str) -> None:
+        self.request_id = request_id
+        self.task: asyncio.Task[None] | None = None
+        self.active = True
+        self.terminal_valid = True
+        self.cancelled = False
+        self.terminal = asyncio.Event()
+
+    def cancel(self) -> None:
+        self.active = False
+        self.terminal_valid = False
+        self.cancelled = True
+        self.terminal.set()
+        if self.task is not None and not self.task.done():
+            self.task.cancel()
+
+    def finish(self) -> None:
+        self.active = False
+        self.terminal.set()
+
+    def finish_terminal(self) -> None:
+        self.terminal_valid = False
+
+
+class _BridgeConnection:
+    def __init__(self, writer: asyncio.StreamWriter) -> None:
+        self.writer = writer
+        self.write_lock = asyncio.Lock()
+        self.next_id = 0
+        self.pending: dict[int, tuple[_BridgeRequestState, asyncio.Future[Any]]] = {}
+        self.requests: dict[int | str, _BridgeRequestState] = {}
+        self.closed = False
+
+    async def send(
+        self,
+        message: Mapping[str, Any],
+        state: _BridgeRequestState | None = None,
+        *,
+        terminal: bool = False,
+    ) -> None:
+        if self.closed:
+            raise RuntimeError("Extension bridge connection is closed")
+        async with self.write_lock:
+            if self.closed:
+                raise RuntimeError("Extension bridge connection is closed")
+            if state is not None:
+                valid = state.terminal_valid if terminal else state.active
+                if not valid or self.requests.get(state.request_id) is not state:
+                    raise asyncio.CancelledError
+            await _write_json_frame(self.writer, message)
+
+    def cancel_request(self, request_id: int | str) -> None:
+        state = self.requests.get(request_id)
+        if state is not None:
+            state.cancel()
+        for reverse_id, (pending_state, future) in list(self.pending.items()):
+            if pending_state is not state:
+                continue
+            self.pending.pop(reverse_id, None)
+            if not future.done():
+                future.set_exception(asyncio.CancelledError())
+
+    def finish_request(self, state: _BridgeRequestState) -> None:
+        state.finish()
+        for reverse_id, (pending_state, future) in list(self.pending.items()):
+            if pending_state is not state:
+                continue
+            self.pending.pop(reverse_id, None)
+            if not future.done():
+                future.set_exception(RuntimeError("Extension request completed"))
+
+    def finish_terminal(self, state: _BridgeRequestState) -> None:
+        state.finish_terminal()
+        if self.requests.get(state.request_id) is state:
+            self.requests.pop(state.request_id, None)
+
+    async def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        for _, future in self.pending.values():
+            if not future.done():
+                future.set_exception(RuntimeError("Extension bridge connection closed"))
+        self.pending.clear()
+        states = list(self.requests.values())
+        for state in states:
+            state.cancel()
+        tasks = [state.task for state in states if state.task is not None]
+        if tasks:
+            await asyncio.wait(tasks, timeout=1)
+        self.requests.clear()
+        self.writer.close()
+        try:
+            await self.writer.wait_closed()
+        except (ConnectionError, RuntimeError):
+            pass
+
+
+class _ConnectionHostRPCClient(HostRPCClient):
+    def __init__(
+        self,
+        server: ExtensionSocketServer,
+        connection: _BridgeConnection,
+        parent_id: int | str,
+        state: _BridgeRequestState,
+    ) -> None:
+        self._server = server
+        self._connection = connection
+        self._parent_id = parent_id
+        self._state = state
+
+    async def request(self, method: str, params: Any | None = None) -> Any:
+        return await self._server._request(
+            self._connection,
+            self._parent_id,
+            self._state,
+            method,
+            params,
+        )
+
+
+class ExtensionSocketServer:
     def __init__(
         self,
         host: Extension,
@@ -109,10 +234,7 @@ class ExtensionSocketServer(HostRPCClient):
         self.endpoint = endpoint
         self._ui = ui or {}
         self._server: asyncio.AbstractServer | None = None
-        self._writer: asyncio.StreamWriter | None = None
-        self._next_id = 0
-        self._pending: dict[int, asyncio.Future[Any]] = {}
-        self._tasks: set[asyncio.Task[None]] = set()
+        self._connections: set[_BridgeConnection] = set()
 
     async def listen(self) -> None:
         if self.endpoint.transport == "unix":
@@ -134,68 +256,110 @@ class ExtensionSocketServer(HostRPCClient):
         self.endpoint.port = int(port)
 
     async def close(self) -> None:
-        for pending in self._pending.values():
-            pending.set_exception(RuntimeError("Extension bridge closed"))
-        self._pending.clear()
-        for task in list(self._tasks):
-            task.cancel()
-        if self._writer is not None:
-            self._writer.close()
-            await self._writer.wait_closed()
-            self._writer = None
         if self._server is not None:
             self._server.close()
             await self._server.wait_closed()
             self._server = None
+        await asyncio.gather(
+            *(connection.close() for connection in list(self._connections)),
+            return_exceptions=True,
+        )
+        self._connections.clear()
         if self.endpoint.transport == "unix" and self.endpoint.path is not None:
             await asyncio.to_thread(_unlink_missing, self.endpoint.path)
 
-    async def request(self, method: str, params: Any | None = None) -> Any:
-        local = await self._try_handle_local_ui_request(method, params)
+    async def _request(
+        self,
+        connection: _BridgeConnection,
+        parent_id: int | str,
+        state: _BridgeRequestState,
+        method: str,
+        params: Any | None = None,
+    ) -> Any:
+        self._ensure_active(connection, state)
+        local = await self._try_handle_active_local_request(state, method, params)
         if local.get("handled"):
+            self._ensure_active(connection, state)
             return local.get("result")
 
-        if self._writer is None:
-            raise RuntimeError("Extension bridge is not connected")
-        self._next_id += 1
-        request_id = self._next_id
+        self._ensure_active(connection, state)
+        connection.next_id += 1
+        request_id = connection.next_id
         future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
-        self._pending[request_id] = future
-        await _write_frame(
-            self._writer,
-            json.dumps(
-                {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params},
-                separators=(",", ":"),
-            ).encode("utf-8"),
-        )
-        return await future
+        connection.pending[request_id] = (state, future)
+        message: dict[str, Any] = {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "parentId": parent_id,
+            "method": method,
+            "params": params,
+        }
+        try:
+            await connection.send(message, state)
+            return await future
+        finally:
+            connection.pending.pop(request_id, None)
+
+    @staticmethod
+    def _ensure_active(
+        connection: _BridgeConnection,
+        state: _BridgeRequestState,
+    ) -> None:
+        if state.cancelled:
+            raise asyncio.CancelledError
+        if (
+            connection.closed
+            or not state.active
+            or connection.requests.get(state.request_id) is not state
+        ):
+            raise RuntimeError("Extension request is no longer active")
+
+    async def _try_handle_active_local_request(
+        self,
+        state: _BridgeRequestState,
+        method: str,
+        params: Any,
+    ) -> dict[str, Any]:
+        local_task = asyncio.create_task(self._try_handle_local_ui_request(method, params))
+        terminal_task = asyncio.create_task(state.terminal.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {local_task, terminal_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if terminal_task in done:
+                if state.cancelled:
+                    raise asyncio.CancelledError
+                raise RuntimeError("Extension request is no longer active")
+            return await local_task
+        finally:
+            for task in (local_task, terminal_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(local_task, terminal_task, return_exceptions=True)
 
     async def _handle_client(
         self,
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
     ) -> None:
-        self._writer = writer
+        connection = _BridgeConnection(writer)
+        self._connections.add(connection)
         try:
             while True:
                 payload = await _read_frame(reader)
                 if payload is None:
                     return
-                task = asyncio.create_task(self._handle_payload(payload, writer))
-                self._tasks.add(task)
-                task.add_done_callback(self._tasks.discard)
+                await self._route_payload(payload, connection)
         finally:
-            if self._writer is writer:
-                self._writer = None
-            writer.close()
-            await writer.wait_closed()
+            await connection.close()
+            self._connections.discard(connection)
 
-    async def _handle_payload(self, payload: bytes, writer: asyncio.StreamWriter) -> None:
+    async def _route_payload(self, payload: bytes, connection: _BridgeConnection) -> None:
         try:
             message = json.loads(payload.decode("utf-8"))
         except Exception as exc:
-            await _write_json_frame(
-                writer,
+            await connection.send(
                 {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": str(exc)}},
             )
             return
@@ -203,35 +367,96 @@ class ExtensionSocketServer(HostRPCClient):
             return
 
         if not message.get("method") and message.get("id") is not None:
-            self._handle_response(message)
+            self._handle_response(connection, message)
             return
 
         method = message.get("method")
         message_id = message.get("id")
-        if not isinstance(method, str) or message_id is None:
+        if method == "$/cancelRequest" and message_id is None:
+            params = message.get("params")
+            if isinstance(params, Mapping) and isinstance(params.get("id"), int | str):
+                connection.cancel_request(params["id"])
             return
+        if not isinstance(method, str) or not isinstance(message_id, int | str):
+            return
+
+        previous = connection.requests.get(message_id)
+        if previous is not None:
+            previous.cancel()
+        state = _BridgeRequestState(message_id)
+        task = asyncio.create_task(
+            self._dispatch_request(
+                connection,
+                message_id,
+                state,
+                method,
+                message.get("params"),
+            )
+        )
+        state.task = task
+        connection.requests[message_id] = state
+
+        def remove_request(completed: asyncio.Task[None]) -> None:
+            current = connection.requests.get(message_id)
+            if current is state and current.task is completed:
+                connection.requests.pop(message_id, None)
+
+        task.add_done_callback(remove_request)
+
+    async def _dispatch_request(
+        self,
+        connection: _BridgeConnection,
+        message_id: int | str,
+        state: _BridgeRequestState,
+        method: str,
+        params: Any,
+    ) -> None:
+        client = _ConnectionHostRPCClient(self, connection, message_id, state)
         try:
             result = await run_with_host_rpc_client(
-                self,
-                lambda: self._dispatch(method, message.get("params")),
+                client,
+                lambda: self._dispatch(method, params),
             )
-            await _write_json_frame(writer, {"jsonrpc": "2.0", "id": message_id, "result": result})
+            should_respond = not connection.closed and state.active
+            connection.finish_request(state)
+            if should_respond:
+                await connection.send(
+                    {"jsonrpc": "2.0", "id": message_id, "result": result},
+                    state,
+                    terminal=True,
+                )
+        except asyncio.CancelledError:
+            return
         except Exception as exc:
-            await _write_json_frame(
-                writer,
-                {
-                    "jsonrpc": "2.0",
-                    "id": message_id,
-                    "error": {"code": -32000, "message": str(exc)},
-                },
-            )
+            should_respond = not connection.closed and state.active
+            connection.finish_request(state)
+            if should_respond:
+                await connection.send(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": message_id,
+                        "error": {"code": -32000, "message": str(exc)},
+                    },
+                    state,
+                    terminal=True,
+                )
+        finally:
+            connection.finish_request(state)
+            connection.finish_terminal(state)
 
-    def _handle_response(self, response: Mapping[str, Any]) -> None:
+    def _handle_response(
+        self,
+        connection: _BridgeConnection,
+        response: Mapping[str, Any],
+    ) -> None:
         response_id = response.get("id")
         if not isinstance(response_id, int):
             return
-        pending = self._pending.pop(response_id, None)
-        if pending is None:
+        pending_entry = connection.pending.pop(response_id, None)
+        if pending_entry is None:
+            return
+        _, pending = pending_entry
+        if pending.done():
             return
         error = response.get("error")
         if isinstance(error, Mapping):
@@ -249,8 +474,6 @@ class ExtensionSocketServer(HostRPCClient):
             return await self._host.execute_command(request_params)
         if method == "extension.event.handle":
             return await self._host.handle_event(request_params)
-        if method == "$/cancelRequest":
-            return None
         raise RuntimeError(f"Unknown JSON-RPC method: {method}")
 
     async def _try_handle_local_ui_request(self, method: str, params: Any) -> dict[str, Any]:

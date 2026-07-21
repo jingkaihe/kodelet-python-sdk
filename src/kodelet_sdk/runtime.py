@@ -4,6 +4,7 @@ import asyncio
 import contextvars
 import json
 import sys
+import threading
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Any, Protocol, TypeVar, cast
 
@@ -11,6 +12,39 @@ from .api import Entrypoint, Extension, create_extension_host
 from .context import HostRPCClient, set_active_host_rpc_client
 
 ResultT = TypeVar("ResultT")
+
+
+class _StdioRequestState:
+    def __init__(self, request_id: int | str) -> None:
+        self.request_id = request_id
+        self.task: asyncio.Task[None] | None = None
+        self.active = True
+        self.terminal_valid = True
+        self._write_guard = threading.Lock()
+
+    async def cancel(self) -> None:
+        await asyncio.to_thread(self._mark_cancelled)
+        if self.task is not None:
+            self.task.cancel()
+
+    def _mark_cancelled(self) -> None:
+        with self._write_guard:
+            self.active = False
+            self.terminal_valid = False
+
+    async def finish(self) -> None:
+        await asyncio.to_thread(self._mark_finished)
+
+    def _mark_finished(self) -> None:
+        with self._write_guard:
+            self.active = False
+
+    async def finish_terminal(self) -> None:
+        await asyncio.to_thread(self._mark_terminal_finished)
+
+    def _mark_terminal_finished(self) -> None:
+        with self._write_guard:
+            self.terminal_valid = False
 
 
 class BinaryReader(Protocol):
@@ -36,29 +70,35 @@ class StdioHostRPCClient(HostRPCClient):
         self._writer = writer
         self._write_lock = asyncio.Lock()
         self._next_id = 0
-        self._pending: dict[int, asyncio.Future[Any]] = {}
-        self._parent_request_id: contextvars.ContextVar[int | str | None] = (
-            contextvars.ContextVar("kodelet_sdk_parent_request_id", default=None)
+        self._pending: dict[int, tuple[_StdioRequestState | None, asyncio.Future[Any]]] = {}
+        self._request_context: contextvars.ContextVar[_StdioRequestState | None] = (
+            contextvars.ContextVar("kodelet_sdk_request_state", default=None)
         )
 
     async def run_for_request(
         self,
-        request_id: int | str,
+        state: _StdioRequestState,
         func: Callable[[], Awaitable[ResultT]],
     ) -> ResultT:
         """Run a host request with task-local reverse-RPC correlation."""
 
-        token = self._parent_request_id.set(request_id)
+        token = self._request_context.set(state)
         try:
             return await func()
         finally:
-            self._parent_request_id.reset(token)
+            self._request_context.reset(token)
 
-    async def send(self, message: Mapping[str, Any]) -> None:
+    async def send(
+        self,
+        message: Mapping[str, Any],
+        state: _StdioRequestState | None = None,
+        *,
+        terminal: bool = False,
+    ) -> None:
         """Write one framed message without interleaving concurrent writes."""
 
         async with self._write_lock:
-            await write_message(self._writer, message)
+            await write_message(self._writer, message, state, terminal=terminal)
 
     async def request(self, method: str, params: Any | None = None) -> Any:
         """Send a JSON-RPC request to the Kodelet host and await the response.
@@ -71,21 +111,43 @@ class StdioHostRPCClient(HostRPCClient):
             The host response ``result`` value.
         """
 
+        state = self._request_context.get()
+        if state is not None and not state.active:
+            raise asyncio.CancelledError
         self._next_id += 1
         request_id = self._next_id
         loop = asyncio.get_running_loop()
         future: asyncio.Future[Any] = loop.create_future()
-        self._pending[request_id] = future
+        self._pending[request_id] = (state, future)
         message: dict[str, Any] = {
             "jsonrpc": "2.0",
             "id": request_id,
             "method": method,
             "params": params,
         }
-        if (parent_id := self._parent_request_id.get()) is not None:
-            message["parentId"] = parent_id
-        await self.send(message)
-        return await future
+        if state is not None:
+            message["parentId"] = state.request_id
+        try:
+            await self.send(message, state)
+            return await future
+        finally:
+            self._pending.pop(request_id, None)
+
+    async def finish_request(
+        self,
+        state: _StdioRequestState,
+        error: BaseException | None = None,
+    ) -> None:
+        """Invalidate one request generation and reject its outstanding reverse RPC."""
+
+        await state.finish()
+        terminal_error = error or RuntimeError("Extension request completed")
+        for reverse_id, (pending_state, future) in list(self._pending.items()):
+            if pending_state is not state:
+                continue
+            self._pending.pop(reverse_id, None)
+            if not future.done():
+                future.set_exception(terminal_error)
 
     def handle_response(self, response: Mapping[str, Any]) -> bool:
         """Resolve a pending reverse-RPC request from a host response.
@@ -100,9 +162,12 @@ class StdioHostRPCClient(HostRPCClient):
         response_id = response.get("id")
         if not isinstance(response_id, int):
             return False
-        future = self._pending.pop(response_id, None)
-        if future is None:
+        pending = self._pending.pop(response_id, None)
+        if pending is None:
             return False
+        _, future = pending
+        if future.done():
+            return True
         if error := response.get("error"):
             if isinstance(error, Mapping):
                 future.set_exception(RuntimeError(str(error.get("message") or "JSON-RPC error")))
@@ -143,48 +208,104 @@ async def run_stdio_server(
     host_client = StdioHostRPCClient(resolved_writer)
     set_active_host_rpc_client(host_client)
     pending_tasks: set[asyncio.Task[None]] = set()
+    request_states: dict[int | str, _StdioRequestState] = {}
     while True:
         payload = await asyncio.to_thread(read_frame, resolved_reader)
         if payload is None:
+            for state in list(request_states.values()):
+                await state.cancel()
+                await host_client.finish_request(state, asyncio.CancelledError())
             if pending_tasks:
-                await asyncio.gather(*pending_tasks)
+                await asyncio.gather(*pending_tasks, return_exceptions=True)
             return
-        task = asyncio.create_task(_handle_message(host, host_client, payload))
+
+        try:
+            message = json.loads(payload.decode("utf-8"))
+        except Exception as exc:
+            await host_client.send(
+                {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": str(exc)}},
+            )
+            continue
+        if not isinstance(message, Mapping):
+            continue
+        if not message.get("method") and host_client.handle_response(message):
+            continue
+
+        method = message.get("method")
+        request_id = message.get("id")
+        if method == "$/cancelRequest" and request_id is None:
+            params = message.get("params")
+            if isinstance(params, Mapping) and isinstance(params.get("id"), int | str):
+                cancelled_id = params["id"]
+                state = request_states.get(cancelled_id)
+                if state is not None:
+                    await state.cancel()
+                    await host_client.finish_request(state, asyncio.CancelledError())
+            continue
+        if not isinstance(request_id, int | str):
+            continue
+
+        previous = request_states.get(request_id)
+        if previous is not None:
+            await previous.cancel()
+            await host_client.finish_request(
+                previous,
+                RuntimeError("Extension request id was reused"),
+            )
+        state = _StdioRequestState(request_id)
+        task = asyncio.create_task(_dispatch_request(host, host_client, message, state))
+        state.task = task
+        request_states[request_id] = state
         pending_tasks.add(task)
         task.add_done_callback(pending_tasks.discard)
 
+        def remove_request(
+            completed: asyncio.Task[None],
+            *,
+            active_id: int | str = request_id,
+            active_state: _StdioRequestState = state,
+        ) -> None:
+            current = request_states.get(active_id)
+            if current is active_state and current.task is completed:
+                request_states.pop(active_id, None)
 
-async def _handle_message(
+        task.add_done_callback(remove_request)
+
+
+async def _dispatch_request(
     host: Extension,
     host_client: StdioHostRPCClient,
-    payload: bytes,
+    message: Mapping[str, Any],
+    state: _StdioRequestState,
 ) -> None:
     try:
-        message = json.loads(payload.decode("utf-8"))
+        result = await host_client.run_for_request(state, lambda: _dispatch(host, message))
+        should_respond = state.active
+        await host_client.finish_request(state)
+        if should_respond:
+            await host_client.send(
+                {"jsonrpc": "2.0", "id": state.request_id, "result": result},
+                state,
+                terminal=True,
+            )
+    except asyncio.CancelledError:
+        return
     except Exception as exc:
-        await host_client.send(
-            {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": str(exc)}},
-        )
-        return
-
-    if (
-        isinstance(message, Mapping)
-        and not message.get("method")
-        and host_client.handle_response(message)
-    ):
-        return
-    if not isinstance(message, Mapping):
-        return
-    request_id = message.get("id")
-    if not isinstance(request_id, int | str):
-        return
-    try:
-        result = await host_client.run_for_request(request_id, lambda: _dispatch(host, message))
-        await host_client.send({"jsonrpc": "2.0", "id": request_id, "result": result})
-    except Exception as exc:
-        await host_client.send(
-            {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32000, "message": str(exc)}},
-        )
+        should_respond = state.active
+        await host_client.finish_request(state)
+        if should_respond:
+            await host_client.send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": state.request_id,
+                    "error": {"code": -32000, "message": str(exc)},
+                },
+                state,
+                terminal=True,
+            )
+    finally:
+        await host_client.finish_request(state)
+        await state.finish_terminal()
 
 
 async def _dispatch(host: Extension, request: Mapping[str, Any]) -> Any:
@@ -200,8 +321,6 @@ async def _dispatch(host: Extension, request: Mapping[str, Any]) -> Any:
         return await host.execute_command(params)
     if method == "extension.event.handle":
         return await host.handle_event(params)
-    if method == "$/cancelRequest":
-        return None
     raise ValueError(f"Unknown JSON-RPC method: {method}")
 
 
@@ -256,7 +375,13 @@ def read_frame(reader: BinaryReader) -> bytes | None:
     return payload
 
 
-async def write_message(writer: BinaryWriter, message: Mapping[str, Any]) -> None:
+async def write_message(
+    writer: BinaryWriter,
+    message: Mapping[str, Any],
+    state: _StdioRequestState | None = None,
+    *,
+    terminal: bool = False,
+) -> None:
     """Write one LSP-style ``Content-Length`` framed JSON-RPC message.
 
     Args:
@@ -266,9 +391,26 @@ async def write_message(writer: BinaryWriter, message: Mapping[str, Any]) -> Non
 
     payload = json.dumps(message, separators=(",", ":")).encode("utf-8")
     frame = b"Content-Length: " + str(len(payload)).encode("ascii") + b"\r\n\r\n" + payload
-    await asyncio.to_thread(_write_and_flush, writer, frame)
+    if state is None:
+        await asyncio.to_thread(_write_and_flush, writer, frame)
+        return
+    await asyncio.to_thread(_write_and_flush_for_request, writer, frame, state, terminal)
 
 
 def _write_and_flush(writer: BinaryWriter, frame: bytes) -> None:
     writer.write(frame)
     writer.flush()
+
+
+def _write_and_flush_for_request(
+    writer: BinaryWriter,
+    frame: bytes,
+    state: _StdioRequestState,
+    terminal: bool,
+) -> None:
+    with state._write_guard:
+        valid = state.terminal_valid if terminal else state.active
+        if not valid:
+            raise asyncio.CancelledError
+        writer.write(frame)
+        writer.flush()

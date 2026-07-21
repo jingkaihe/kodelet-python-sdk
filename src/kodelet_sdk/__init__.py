@@ -78,6 +78,7 @@ from .context import (
     SharedContext,
     StorageContext,
     ToolContext,
+    ToolUpdateRequest,
     UIConfirmRequest,
     UIContext,
     UIInputRequest,
@@ -90,6 +91,20 @@ from .context import (
 )
 from .runtime import run_extension
 from .schemas import JSONSchema, ToolInputSchema
+from .task_progress import (
+    TaskActivity,
+    TaskActivityLabeler,
+    TaskActivityStatus,
+    TaskProgress,
+    TaskProgressContext,
+    TaskProgressLogger,
+    TaskProgressSession,
+    TaskRunCounts,
+    TaskRunPhase,
+    TaskRunSnapshot,
+    TaskRunStatus,
+    format_task_tool_activity,
+)
 from .template import render_template
 from .test_harness import ExtensionTestHarness, create_test_harness
 
@@ -157,6 +172,17 @@ __all__ = [
     "SpawnedProcess",
     "StorageContext",
     "SystemPromptPatch",
+    "TaskActivity",
+    "TaskActivityLabeler",
+    "TaskActivityStatus",
+    "TaskProgress",
+    "TaskProgressContext",
+    "TaskProgressLogger",
+    "TaskProgressSession",
+    "TaskRunCounts",
+    "TaskRunPhase",
+    "TaskRunSnapshot",
+    "TaskRunStatus",
     "Template",
     "ToolCallData",
     "ToolCallDetails",
@@ -170,6 +196,7 @@ __all__ = [
     "ToolResultEvent",
     "ToolUpdateData",
     "ToolUpdateEvent",
+    "ToolUpdateRequest",
     "TurnEndEvent",
     "TurnStartEvent",
     "TypeAdapter",
@@ -184,6 +211,7 @@ __all__ = [
     "create_extension_host",
     "create_test_harness",
     "define_extension",
+    "format_task_tool_activity",
     "jinja2",
     "on",
     "pydantic",

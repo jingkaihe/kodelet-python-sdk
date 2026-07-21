@@ -38,7 +38,7 @@ from kodelet_sdk import (
     pydantic,
     render_template,
 )
-from kodelet_sdk.runtime import run_stdio_server
+from kodelet_sdk.runtime import StdioHostRPCClient, _StdioRequestState, run_stdio_server
 
 
 class WeatherInput(BaseModel):
@@ -477,6 +477,11 @@ async def test_context_helpers_cover_workspace_storage_process_env_and_ui(
             ),
         }
 
+    @ext.tool("stream", description="Stream progress", input_schema={})
+    async def stream(_input: Any, ctx: ToolContext) -> str:
+        await ctx.update("Searching code", {"step": 1})
+        return "done"
+
     harness = await create_test_harness(ext, fake_rpc)
     harness.initialize(
         {"extension": {"id": "ctx", "cwd": str(workspace), "dataDir": str(data_dir)}}
@@ -511,6 +516,39 @@ async def test_context_helpers_cover_workspace_storage_process_env_and_ui(
         {"title": "Food", "options": ["Pasta", "Pizza"]},
         {"message": "Done"},
     ]
+
+    assert await harness.execute_tool({"name": "stream", "input": {}}) == {
+        "content": "done"
+    }
+    assert fake_rpc.requests[-1] == (
+        "kodelet.tool.update",
+        {"content": "Searching code", "data": {"step": 1}},
+    )
+
+
+@pytest.mark.asyncio
+async def test_tool_updates_are_ignored_without_host_capability() -> None:
+    requests: list[str] = []
+
+    class FakeRPC:
+        async def request(self, method: str, params: Any | None = None) -> Any:
+            del params
+            requests.append(method)
+            return {"accepted": True}
+
+    ext = Extension()
+
+    @ext.tool("stream", description="Stream progress", input_schema={})
+    async def stream(_input: Any, ctx: ToolContext) -> str:
+        await ctx.update("Working", {"step": 1})
+        return "done"
+
+    harness = await create_test_harness(ext, FakeRPC())
+    harness.initialize({"capabilities": {}})
+    assert await harness.execute_tool({"name": "stream", "input": {}}) == {
+        "content": "done"
+    }
+    assert requests == []
 
 
 @pytest.mark.asyncio
@@ -556,6 +594,7 @@ async def test_runtime_serves_json_rpc_and_reverse_host_rpc() -> None:
 
     @ext.tool("echo", description="Echo text", input_schema=EchoInput)
     async def echo(input: EchoInput, ctx: Any) -> dict[str, str]:
+        await ctx.update("Working", {"step": 1})
         answer = await ctx.ui.input({"title": "Choose"})
         return {"content": f"{input.text.upper()}:{answer}"}
 
@@ -570,7 +609,7 @@ async def test_runtime_serves_json_rpc_and_reverse_host_rpc() -> None:
             "protocolVersion": "2026-05-30",
             "kodelet": {"version": "test"},
             "extension": {"id": "rpc", "cwd": os.getcwd(), "dataDir": ""},
-            "capabilities": {"ui": {"input": True}},
+            "capabilities": {"toolUpdates": True, "ui": {"input": True}},
         },
     )
     assert init["name"] == "rpc"
@@ -581,8 +620,15 @@ async def test_runtime_serves_json_rpc_and_reverse_host_rpc() -> None:
         {"name": "echo", "input": {"text": "hello"}, "context": {"cwd": os.getcwd()}},
     )
     assert result == {"content": "HELLO:from-host"}
-    assert [request["method"] for request in client.host_requests] == ["kodelet.ui.input"]
-    assert [request["parentId"] for request in client.host_requests] == [2]
+    assert [request["method"] for request in client.host_requests] == [
+        "kodelet.tool.update",
+        "kodelet.ui.input",
+    ]
+    assert client.host_requests[0]["params"] == {
+        "content": "Working",
+        "data": {"step": 1},
+    }
+    assert [request["parentId"] for request in client.host_requests] == [2, 2]
 
     server_reader.close()
     await asyncio.wait_for(task, timeout=1)
@@ -659,6 +705,124 @@ async def test_runtime_correlates_concurrent_reverse_rpc_requests() -> None:
 
     server_reader.close()
     await asyncio.wait_for(task, timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_runtime_cancels_requests_and_blocks_late_reverse_rpc() -> None:
+    ext = Extension(name="cancellable-rpc")
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+    stale_blocked = asyncio.Event()
+
+    @ext.tool("wait", description="Wait for cancellation", input_schema={"type": "object"})
+    async def wait(input: Any, ctx: ToolContext) -> str:
+        if input.get("quick"):
+            return "quick result"
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            try:
+                await ctx.update("stale update")
+            except asyncio.CancelledError:
+                stale_blocked.set()
+            return "late result"
+        raise AssertionError("wait completed without cancellation")
+
+    server_reader = MemoryReader()
+    server_writer = MemoryWriter()
+    task = asyncio.create_task(run_stdio_server(ext, server_reader, server_writer))
+    client = RpcTestClient(server_reader, server_writer)
+    await client.call(
+        "extension.initialize",
+        {
+            "protocolVersion": "2026-05-30",
+            "extension": {"id": "cancellable-rpc", "cwd": os.getcwd(), "dataDir": ""},
+            "capabilities": {"toolUpdates": True},
+        },
+    )
+
+    server_reader.feed(
+        _frame(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "extension.tool.execute",
+                "params": {"name": "wait", "input": {}},
+            }
+        )
+    )
+    await asyncio.wait_for(started.wait(), timeout=1)
+    server_reader.feed(
+        _frame({"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 2}})
+    )
+    await asyncio.wait_for(cancelled.wait(), timeout=1)
+    await asyncio.wait_for(stale_blocked.wait(), timeout=1)
+
+    server_reader.feed(
+        _frame(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "extension.tool.execute",
+                "params": {"name": "wait", "input": {"quick": True}},
+            }
+        )
+    )
+    response = await asyncio.wait_for(server_writer.read_frame(), timeout=1)
+    assert response == {"jsonrpc": "2.0", "id": 2, "result": {"content": "quick result"}}
+
+    server_reader.close()
+    await asyncio.wait_for(task, timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_runtime_rechecks_request_generation_inside_write_lock() -> None:
+    writer = MemoryWriter()
+    client = StdioHostRPCClient(writer)
+    state = _StdioRequestState(7)
+    await client._write_lock.acquire()
+
+    async def send_update() -> Any:
+        return await client.run_for_request(
+            state,
+            lambda: client.request("kodelet.tool.update", {"content": "stale"}),
+        )
+
+    task = asyncio.create_task(send_update())
+    await asyncio.sleep(0)
+    await state.cancel()
+    await client.finish_request(state, asyncio.CancelledError())
+    client._write_lock.release()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert writer._buffer == bytearray()
+
+
+@pytest.mark.asyncio
+async def test_runtime_rechecks_terminal_generation_inside_write_lock() -> None:
+    writer = MemoryWriter()
+    client = StdioHostRPCClient(writer)
+    state = _StdioRequestState(7)
+    await state.finish()
+    await client._write_lock.acquire()
+
+    task = asyncio.create_task(
+        client.send(
+            {"jsonrpc": "2.0", "id": 7, "result": {"content": "old"}},
+            state,
+            terminal=True,
+        )
+    )
+    await asyncio.sleep(0)
+    await state.cancel()
+    client._write_lock.release()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert writer._buffer == bytearray()
 
 
 class MemoryReader:

@@ -148,6 +148,49 @@ session = await client.create_session(
 
 Handlers may be synchronous or asynchronous. Tool handlers may return a string, which is converted to `{ "content": ... }`, or a protocol-shaped mapping. Command handlers return `{ "action": "pass" }`, `{ "action": "respond", "response": ... }`, or `{ "action": "runAgent", "prompt": ... }`.
 
+Long-running tool handlers can publish transient accumulated snapshots through
+their context. Each update replaces the previous snapshot for that tool call;
+only the handler's return value is persisted or sent back to the model:
+
+```python
+@ext.tool("search", description="Search a project", input_schema=SearchInput)
+async def search(input: SearchInput, ctx: ToolContext) -> ToolExecutionResult:
+    await ctx.update(
+        "Searching code",
+        {"filesScanned": 12},
+    )
+    return {"content": "Search complete"}
+```
+
+`ctx.update(...)` is capability-gated and is a no-op when the connected Kodelet
+host does not support live extension-tool updates.
+
+When the host cancels an active request or disconnects, async handlers receive
+`asyncio.CancelledError`. Any late `ctx.update(...)` or UI reverse-RPC call from
+that cancelled request is rejected rather than being routed to a later call.
+
+For long-running tasks with multiple activities, `TaskProgress` publishes a
+bounded `taskRun` snapshot and can either be updated directly or attached to a
+child Kodelet session:
+
+```python
+progress = TaskProgress(
+    ctx,
+    kind="code_search",
+    task=input.query,
+    cwd=ctx.cwd,
+    running_title="Searching code",
+    completed_title="Searched code",
+    failed_title="Code search failed",
+    responding_detail="writing summary",
+)
+await progress.start()
+progress.attach(session)
+```
+
+Calling `await progress.finish(...)` returns the terminal snapshot and detaches
+the child-session listeners automatically.
+
 The decorators preserve concrete function signatures for type checkers, so handlers can annotate their inputs and contexts directly:
 
 ```python

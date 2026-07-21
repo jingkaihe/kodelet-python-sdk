@@ -4,7 +4,7 @@ import asyncio
 import json
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, cast
 
 import pytest
 
@@ -18,6 +18,7 @@ from kodelet_sdk import (
     define_extension,
 )
 from kodelet_sdk.agent import BridgeTransport, SpawnedProcess, SpawnOptions
+from kodelet_sdk.agent.bridge import _BridgeConnection, _BridgeRequestState
 
 
 class FakeACPProcess(SpawnedProcess):
@@ -525,6 +526,7 @@ async def test_extension_bridge_routes_local_ui_handlers(
 
         @ext.tool("ask_user_question", description="Ask a question", input_schema=AskInput)
         async def ask_user_question(input: AskInput, ctx: Any) -> str:
+            await ctx.update("Waiting for selection", {"step": 1})
             selected = await ctx.ui.select({"title": input.question, "options": input.options})
             selected_values.append(selected or "")
             return selected or "dismissed"
@@ -552,7 +554,10 @@ async def test_extension_bridge_routes_local_ui_handlers(
             "jsonrpc": "2.0",
             "id": 1,
             "method": "extension.initialize",
-            "params": {"extension": {"id": "workspace", "cwd": str(tmp_path)}},
+            "params": {
+                "extension": {"id": "workspace", "cwd": str(tmp_path)},
+                "capabilities": {"toolUpdates": True},
+            },
         },
     )
     init_response = await _read_frame(process.stdout)
@@ -570,6 +575,18 @@ async def test_extension_bridge_routes_local_ui_handlers(
             },
         },
     )
+    update_request = await _read_frame(process.stdout)
+    assert update_request == {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "parentId": 2,
+        "method": "kodelet.tool.update",
+        "params": {"content": "Waiting for selection", "data": {"step": 1}},
+    }
+    await _write_frame(
+        process.stdin,
+        {"jsonrpc": "2.0", "id": update_request["id"], "result": {"accepted": True}},
+    )
     tool_response = await _read_frame(process.stdout)
     assert tool_response["result"] == {"content": "B"}
     assert selected_values == ["B"]
@@ -579,10 +596,259 @@ async def test_extension_bridge_routes_local_ui_handlers(
     await session.close()
 
 
+@pytest.mark.asyncio
+async def test_extension_bridge_cancellation_is_connection_scoped(tmp_path: Path) -> None:
+    extension_root_holder: dict[str, Path] = {}
+
+    def spawn(_command: str, _args: Sequence[str], options: SpawnOptions) -> FakeACPProcess:
+        env = options.get("env") or {}
+        config = json.loads(Path(env["KODELET_CONFIG_FILE"]).read_text(encoding="utf-8"))
+        extension_root_holder["path"] = Path(config["extensions"]["local_dir"])
+        return FakeACPProcess(session_id="conv-cancel")
+
+    started = {"cancel": asyncio.Event(), "disconnect": asyncio.Event()}
+    aborted = {"cancel": asyncio.Event(), "disconnect": asyncio.Event()}
+    stale_blocked = {"cancel": asyncio.Event(), "disconnect": asyncio.Event()}
+    ui_started = asyncio.Event()
+    ui_cancelled = asyncio.Event()
+    notifications: list[str] = []
+    detached_tasks: set[asyncio.Task[None]] = set()
+
+    class WaitInput(BaseModel):
+        mode: Literal["cancel", "detached", "disconnect", "quick", "ui"]
+
+    def extension_entrypoint(ext: Extension) -> None:
+        @ext.tool("wait_for_cancel", description="Wait for cancellation", input_schema=WaitInput)
+        async def wait_for_cancel(input: WaitInput, ctx: Any) -> str:
+            if input.mode == "quick":
+                return "quick result"
+            if input.mode == "detached":
+                async def notify_later() -> None:
+                    await asyncio.sleep(0.02)
+                    try:
+                        await ctx.ui.notify({"message": "late notification"})
+                    except (asyncio.CancelledError, RuntimeError):
+                        pass
+
+                task = asyncio.create_task(notify_later())
+                detached_tasks.add(task)
+                task.add_done_callback(detached_tasks.discard)
+                return "detached result"
+            if input.mode == "ui":
+                await ctx.ui.notify({"message": "blocking notification"})
+                return "ui result"
+            started[input.mode].set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                aborted[input.mode].set()
+                try:
+                    await ctx.update(f"stale {input.mode}")
+                except (asyncio.CancelledError, RuntimeError):
+                    stale_blocked[input.mode].set()
+                return f"late {input.mode}"
+            raise AssertionError("wait completed without cancellation")
+
+    async def notify(request: Mapping[str, Any]) -> None:
+        if request["message"] != "blocking notification":
+            notifications.append(str(request["message"]))
+            return
+        ui_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            ui_cancelled.set()
+            raise
+
+    client = Client(cwd=tmp_path, spawn=spawn)
+    session = await client.create_session(
+        extensions=[define_extension(extension_entrypoint)],
+        extension_transport="tcp",
+        ui={"notify": notify},
+    )
+    executable = next(extension_root_holder["path"].glob("kodelet-extension-*"))
+
+    process = await asyncio.create_subprocess_exec(
+        str(executable),
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    assert process.stdin is not None
+    assert process.stdout is not None
+    await _write_frame(
+        process.stdin,
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "extension.initialize",
+            "params": {
+                "extension": {"id": "cancellable", "cwd": str(tmp_path)},
+                "capabilities": {"toolUpdates": True},
+            },
+        },
+    )
+    await _read_frame(process.stdout)
+
+    await _write_frame(
+        process.stdin,
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "extension.tool.execute",
+            "params": {"name": "wait_for_cancel", "input": {"mode": "detached"}},
+        },
+    )
+    detached_response = await _read_frame(process.stdout)
+    assert detached_response["result"] == {"content": "detached result"}
+    await asyncio.sleep(0.05)
+    assert notifications == []
+
+    await _write_frame(
+        process.stdin,
+        {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "extension.tool.execute",
+            "params": {"name": "wait_for_cancel", "input": {"mode": "ui"}},
+        },
+    )
+    await asyncio.wait_for(ui_started.wait(), timeout=2)
+    await _write_frame(
+        process.stdin,
+        {"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 3}},
+    )
+    await asyncio.wait_for(ui_cancelled.wait(), timeout=2)
+
+    await _write_frame(
+        process.stdin,
+        {
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "extension.tool.execute",
+            "params": {"name": "wait_for_cancel", "input": {"mode": "cancel"}},
+        },
+    )
+    await asyncio.wait_for(started["cancel"].wait(), timeout=2)
+    await _write_frame(
+        process.stdin,
+        {"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 4}},
+    )
+    await asyncio.wait_for(aborted["cancel"].wait(), timeout=2)
+    await asyncio.wait_for(stale_blocked["cancel"].wait(), timeout=2)
+
+    await _write_frame(
+        process.stdin,
+        {
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "extension.tool.execute",
+            "params": {"name": "wait_for_cancel", "input": {"mode": "quick"}},
+        },
+    )
+    reused_response = await _read_frame(process.stdout)
+    assert reused_response["result"] == {"content": "quick result"}
+
+    await _write_frame(
+        process.stdin,
+        {
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "extension.tool.execute",
+            "params": {"name": "wait_for_cancel", "input": {"mode": "disconnect"}},
+        },
+    )
+    await asyncio.wait_for(started["disconnect"].wait(), timeout=2)
+    process.terminate()
+    await process.wait()
+    await asyncio.wait_for(aborted["disconnect"].wait(), timeout=2)
+    await asyncio.wait_for(stale_blocked["disconnect"].wait(), timeout=2)
+
+    replacement = await asyncio.create_subprocess_exec(
+        str(executable),
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    assert replacement.stdin is not None
+    assert replacement.stdout is not None
+    await _write_frame(
+        replacement.stdin,
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "extension.initialize",
+            "params": {
+                "extension": {"id": "cancellable", "cwd": str(tmp_path)},
+                "capabilities": {"toolUpdates": True},
+            },
+        },
+    )
+    await _read_frame(replacement.stdout)
+    await _write_frame(
+        replacement.stdin,
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "extension.tool.execute",
+            "params": {"name": "wait_for_cancel", "input": {"mode": "quick"}},
+        },
+    )
+    response = await _read_frame(replacement.stdout)
+    assert response["result"] == {"content": "quick result"}
+
+    replacement.terminate()
+    await replacement.wait()
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_extension_bridge_rechecks_terminal_generation_inside_write_lock() -> None:
+    writer = _MemoryStreamWriter()
+    connection = _BridgeConnection(cast(asyncio.StreamWriter, writer))
+    state = _BridgeRequestState(7)
+    state.finish()
+    connection.requests[7] = state
+    await connection.write_lock.acquire()
+
+    task = asyncio.create_task(
+        connection.send(
+            {"jsonrpc": "2.0", "id": 7, "result": {"content": "old"}},
+            state,
+            terminal=True,
+        )
+    )
+    await asyncio.sleep(0)
+    state.cancel()
+    connection.requests[7] = _BridgeRequestState(7)
+    connection.write_lock.release()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert writer.buffer == bytearray()
+
+
 async def _write_frame(writer: asyncio.StreamWriter, message: Mapping[str, Any]) -> None:
     payload = json.dumps(message, separators=(",", ":")).encode("utf-8")
     writer.write(b"Content-Length: " + str(len(payload)).encode("ascii") + b"\r\n\r\n" + payload)
     await writer.drain()
+
+
+class _MemoryStreamWriter:
+    def __init__(self) -> None:
+        self.buffer = bytearray()
+
+    def write(self, data: bytes) -> None:
+        self.buffer.extend(data)
+
+    async def drain(self) -> None:
+        await asyncio.sleep(0)
+
+    def close(self) -> None:
+        return None
+
+    async def wait_closed(self) -> None:
+        await asyncio.sleep(0)
 
 
 async def _read_frame(reader: asyncio.StreamReader) -> dict[str, Any]:

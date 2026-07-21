@@ -71,6 +71,13 @@ class UINotifyRequest(TypedDict):
     title: NotRequired[str]
 
 
+class ToolUpdateRequest(TypedDict):
+    """Accumulated tool-result snapshot sent to the Kodelet host."""
+
+    content: str
+    data: NotRequired[Mapping[str, Any]]
+
+
 class UIInputResponse(TypedDict, total=False):
     """Host response for UI input, confirmation, selection, and notification calls."""
 
@@ -588,7 +595,40 @@ class SharedContext:
 class ToolContext(SharedContext):
     """Context passed to tool handlers."""
 
-    pass
+    def __init__(
+        self,
+        init: Mapping[str, Any] | None,
+        context: Mapping[str, Any] | None = None,
+    ) -> None:
+        super().__init__(init, context)
+        self._tool_updates_enabled = _tool_updates_supported(init)
+
+    async def update(
+        self,
+        content: str,
+        data: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Publish the latest accumulated result snapshot for this tool call.
+
+        Updates are transient and replace the previous snapshot for the active
+        tool call. They are sent only when the Kodelet host advertises tool
+        update support; on older hosts this method is a no-op.
+
+        Args:
+            content: Concise textual fallback for clients without structured
+                update rendering.
+            data: Optional JSON-serializable structured snapshot data.
+        """
+
+        if not self._tool_updates_enabled:
+            return
+        client = _current_host_rpc_client()
+        if client is None:
+            return
+        payload: ToolUpdateRequest = {"content": content}
+        if data is not None:
+            payload["data"] = data
+        await client.request("kodelet.tool.update", payload)
 
 
 class EventContext(SharedContext):
@@ -642,6 +682,18 @@ def _extension_info(init: Mapping[str, Any] | None) -> Mapping[str, Any]:
         return {}
     extension = init.get("extension")
     return extension if isinstance(extension, Mapping) else {}
+
+
+def _tool_updates_supported(init: Mapping[str, Any] | None) -> bool:
+    if not init:
+        return False
+    capabilities = init.get("capabilities")
+    if not isinstance(capabilities, Mapping):
+        return False
+    if capabilities.get("toolUpdates") is True:
+        return True
+    tools = capabilities.get("tools")
+    return isinstance(tools, Mapping) and tools.get("updates") is True
 
 
 def _default_data_dir(extension_id: str) -> str:

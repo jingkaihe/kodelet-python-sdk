@@ -23,7 +23,7 @@ class ExtensionTestHarness:
                 "dataDir": "",
                 "config": {},
             },
-            "capabilities": {},
+            "capabilities": {"toolUpdates": True},
         }
 
     def initialize(self, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
@@ -83,7 +83,7 @@ async def create_test_harness(
     Args:
         entrypoint: Existing extension or registration callable.
         host_rpc_client: Optional fake reverse-RPC client for testing
-            ``ctx.ui`` interactions.
+            ``ctx.ui`` and ``ctx.update`` interactions.
 
     Returns:
         An :class:`ExtensionTestHarness` ready for initialize/execute/event
