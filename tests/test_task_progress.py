@@ -112,7 +112,7 @@ class TaskProgressTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot["omittedSucceeded"], 2)
         self.assertEqual(snapshot["detail"], "searching pkg")
         self.assertEqual(len(snapshot["activities"]), 4)
-        self.assertIn("Searching code", ctx.updates[-1][0])
+        self.assertEqual(ctx.updates[-1][0], "Searching code - searching pkg")
         self.assertIn("taskRun", ctx.updates[-1][1])
 
         final = await progress.finish(success=True)
@@ -143,6 +143,71 @@ class TaskProgressTest(unittest.IsolatedAsyncioTestCase):
         await progress.flush()
 
         self.assertEqual(progress.snapshot()["counts"]["succeeded"], 1)
+
+    async def test_uses_bounded_task_detail_between_activities(self) -> None:
+        ctx = _Context()
+        instruction = "Investigate the task progress renderer " + ("carefully " * 30)
+        progress = TaskProgress(
+            ctx,
+            kind="subagent",
+            task=instruction,
+            cwd="/workspace",
+            running_title="Delegated task",
+            completed_title="Delegated task",
+            failed_title="Delegated task failed",
+            responding_detail="writing response",
+        )
+        await progress.start()
+
+        detail = progress.snapshot()["detail"]
+        self.assertLessEqual(len(detail), 160)
+        self.assertTrue(detail.endswith("…"))
+        self.assertEqual(ctx.updates[-1][0], f"Delegated task - {detail}")
+
+        progress.start_activity("read-1", kind="file_read", label="Read renderer")
+        progress.finish_activity("read-1", success=True)
+        await progress.flush()
+        self.assertEqual(progress.snapshot()["detail"], detail)
+
+        await progress.finish(success=True)
+
+    async def test_failed_activity_preview_skips_markdown_fences(self) -> None:
+        ctx = _Context()
+        progress = TaskProgress(
+            ctx,
+            kind="build",
+            task="Run tests",
+            cwd="/workspace",
+            running_title="Running tests",
+            completed_title="Ran tests",
+            failed_title="Tests failed",
+            responding_detail="writing summary",
+        )
+        await progress.start()
+        progress.start_activity("test-1", kind="bash", label="Run tests")
+        progress.finish_activity(
+            "test-1",
+            success=False,
+            result="```text\nTypeScript tests failed\n```",
+        )
+        progress.start_activity("test-2", kind="bash", label="Run more tests")
+        progress.finish_activity("test-2", success=False, result="```")
+        await progress.flush()
+
+        failed = [
+            activity
+            for activity in progress.snapshot()["activities"]
+            if activity["status"] == "failed"
+        ]
+        self.assertEqual(failed[0]["preview"], "TypeScript tests failed")
+        self.assertNotIn("preview", failed[1])
+
+        progress.start_activity("test-3", kind="bash", label="Run final tests")
+        final = await progress.finish(success=False, error="Final tests failed\n```")
+        terminal = next(
+            activity for activity in final["activities"] if activity["id"] == "test-3"
+        )
+        self.assertEqual(terminal["preview"], "Final tests failed")
 
     def test_formats_tool_labels_relative_to_workspace(self) -> None:
         label, detail = format_task_tool_activity(

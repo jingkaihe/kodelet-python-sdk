@@ -146,7 +146,13 @@ def _display_path(value: str, cwd: str) -> str:
 def _last_line(value: Any) -> str | None:
     if not isinstance(value, str):
         return None
-    lines = [line.strip() for line in value.splitlines() if line.strip()]
+    lines = [
+        line.strip()
+        for line in value.splitlines()
+        if line.strip()
+        and not line.strip().startswith("```")
+        and not line.strip().startswith("~~~")
+    ]
     if not lines:
         return None
     return _single_line(lines[-1], _MAX_PREVIEW_LENGTH)
@@ -376,7 +382,8 @@ class TaskProgress:
         for activity in terminal_activities:
             activity["status"] = terminal_status
             if error and not success:
-                activity["preview"] = _single_line(error, _MAX_PREVIEW_LENGTH)
+                if preview := _last_line(error):
+                    activity["preview"] = preview
         if success:
             self._succeeded_count += len(terminal_activities)
             self._recent_succeeded.extend(terminal_activities)
@@ -509,14 +516,14 @@ class TaskProgress:
         if self._status == "completed":
             return ""
         if self._phase == "starting":
-            return "starting task"
+            return self._task or "starting task"
         if self._phase == "responding":
             return self._responding_detail
         if len(running) == 1:
             return _text(running[0].get("detail")) or "1 action running"
         if len(running) > 1:
             return f"{len(running)} actions running"
-        return "planning next step"
+        return self._task or "planning next step"
 
     def _changed(self, *, immediate: bool = False) -> None:
         if self._status != "running":
@@ -540,7 +547,7 @@ class TaskProgress:
                 snapshot = self.snapshot()
                 content = snapshot["title"]
                 if snapshot["detail"]:
-                    content += f" — {snapshot['detail']}"
+                    content += f" - {snapshot['detail']}"
                 try:
                     await self._ctx.update(content, {"taskRun": snapshot})
                 except Exception as exc:
