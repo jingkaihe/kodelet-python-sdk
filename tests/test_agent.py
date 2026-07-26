@@ -12,9 +12,13 @@ import kodelet_sdk
 from kodelet_sdk import (
     BaseModel,
     Client,
+    CommandContext,
+    CommandResult,
     Extension,
     Profile,
     ToolUpdateData,
+    UISurfaceInputEvent,
+    UISurfaceResizeEvent,
     define_extension,
 )
 from kodelet_sdk.agent import BridgeTransport, SpawnedProcess, SpawnOptions
@@ -597,6 +601,199 @@ async def test_extension_bridge_routes_local_ui_handlers(
 
 
 @pytest.mark.asyncio
+async def test_extension_bridge_keeps_persistent_surfaces_alive_after_command_returns(
+    tmp_path: Path,
+) -> None:
+    extension_root_holder: dict[str, Path] = {}
+    background_tasks: set[asyncio.Future[Any]] = set()
+
+    def track(awaitable: Awaitable[Any]) -> None:
+        task = asyncio.ensure_future(awaitable)
+        background_tasks.add(task)
+        task.add_done_callback(background_tasks.discard)
+
+    def spawn(_command: str, _args: Sequence[str], options: SpawnOptions) -> FakeACPProcess:
+        env = options.get("env") or {}
+        config = json.loads(Path(env["KODELET_CONFIG_FILE"]).read_text(encoding="utf-8"))
+        extension_root_holder["path"] = Path(config["extensions"]["local_dir"])
+        return FakeACPProcess(session_id="conv-persistent-ui")
+
+    def extension_entrypoint(ext: Extension) -> None:
+        @ext.command("game", description="Open a persistent surface")
+        async def game(_input: Any, ctx: CommandContext) -> CommandResult:
+            surface = await ctx.ui.open_surface(
+                {"id": "game", "initialLines": ["loading"], "width": "50%"}
+            )
+
+            def resize(event: UISurfaceResizeEvent) -> None:
+                surface.update([f"size={event['width']}x{event['height']}"])
+                track(
+                    ctx.ui.append_transcript(
+                        {
+                            "title": "Resized",
+                            "message": f"{event['width']}x{event['height']}",
+                        }
+                    )
+                )
+
+            def input_event(event: UISurfaceInputEvent) -> None:
+                size = surface.size
+                surface.update(
+                    [
+                        f"key={event.get('key')};size="
+                        f"{size['width'] if size else None}x{size['height'] if size else None}"
+                    ]
+                )
+                if event.get("key") == "q":
+                    async def close_later() -> None:
+                        await asyncio.sleep(0)
+                        await surface.close()
+
+                    track(close_later())
+
+            surface.on_resize(resize)
+            surface.on_input(input_event)
+            return {"action": "respond", "response": "opened"}
+
+    client = Client(cwd=tmp_path, spawn=spawn)
+    session = await client.create_session(
+        extensions=[define_extension(extension_entrypoint)],
+        extension_transport="tcp",
+    )
+    executable = next(extension_root_holder["path"].glob("kodelet-extension-*"))
+    process = await asyncio.create_subprocess_exec(
+        str(executable),
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    assert process.stdin is not None
+    assert process.stdout is not None
+
+    await _write_frame(
+        process.stdin,
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "extension.initialize",
+            "params": {
+                "extension": {"id": "surface", "cwd": str(tmp_path)},
+                "capabilities": {"ui": {"surfaces": True, "transcript": True}},
+            },
+        },
+    )
+    await _read_frame(process.stdout)
+    await _write_frame(
+        process.stdin,
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "extension.command.execute",
+            "params": {
+                "name": "game",
+                "input": {},
+                "invocation": {
+                    "raw": "/game",
+                    "commandName": "game",
+                    "args": [],
+                    "flags": {},
+                },
+            },
+        },
+    )
+    open_request = await _read_frame(process.stdout)
+    assert open_request == {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "kodelet.ui.surface.open",
+        "params": {
+            "id": "game",
+            "options": {"width": "50%"},
+            "frame": {"sequence": 1, "lines": ["loading"]},
+        },
+    }
+    await _write_frame(
+        process.stdin,
+        {"jsonrpc": "2.0", "id": open_request["id"], "result": {"accepted": True}},
+    )
+    command_response = await _read_frame(process.stdout)
+    assert command_response == {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "result": {"action": "respond", "response": "opened"},
+    }
+
+    await _write_frame(
+        process.stdin,
+        {
+            "jsonrpc": "2.0",
+            "method": "extension.ui.surface.resize",
+            "params": {"id": "game", "sequence": 1, "width": 60, "height": 18},
+        },
+    )
+    resize_messages = await _read_and_ack_bridge_host_messages(process, 2)
+    frame_notification = next(
+        message
+        for message in resize_messages
+        if message["method"] == "kodelet.ui.surface.frame"
+    )
+    transcript_request = next(
+        message
+        for message in resize_messages
+        if message["method"] == "kodelet.ui.transcript.append"
+    )
+    assert frame_notification == {
+        "jsonrpc": "2.0",
+        "method": "kodelet.ui.surface.frame",
+        "params": {"id": "game", "frame": {"sequence": 2, "lines": ["size=60x18"]}},
+    }
+    assert "parentId" not in transcript_request
+    assert transcript_request["params"] == {"title": "Resized", "message": "60x18"}
+
+    await _write_frame(
+        process.stdin,
+        {
+            "jsonrpc": "2.0",
+            "method": "extension.ui.surface.input",
+            "params": {
+                "id": "game",
+                "sequence": 2,
+                "kind": "key",
+                "key": "q",
+                "text": "q",
+            },
+        },
+    )
+    input_messages = await _read_and_ack_bridge_host_messages(process, 2)
+    input_frame = next(
+        message
+        for message in input_messages
+        if message["method"] == "kodelet.ui.surface.frame"
+    )
+    close_request = next(
+        message
+        for message in input_messages
+        if message["method"] == "kodelet.ui.surface.close"
+    )
+    assert input_frame == {
+        "jsonrpc": "2.0",
+        "method": "kodelet.ui.surface.frame",
+        "params": {
+            "id": "game",
+            "frame": {"sequence": 3, "lines": ["key=q;size=60x18"]},
+        },
+    }
+    assert "parentId" not in close_request
+    assert close_request["params"] == {"id": "game", "sequence": 4}
+
+    if background_tasks:
+        await asyncio.gather(*background_tasks)
+    process.terminate()
+    await process.wait()
+    await session.close()
+
+
+@pytest.mark.asyncio
 async def test_extension_bridge_cancellation_is_connection_scoped(tmp_path: Path) -> None:
     extension_root_holder: dict[str, Path] = {}
 
@@ -826,6 +1023,51 @@ async def test_extension_bridge_rechecks_terminal_generation_inside_write_lock()
     with pytest.raises(asyncio.CancelledError):
         await task
     assert writer.buffer == bytearray()
+
+
+@pytest.mark.asyncio
+async def test_extension_bridge_cancellation_leaves_persistent_rpc_pending() -> None:
+    writer = _MemoryStreamWriter()
+    connection = _BridgeConnection(cast(asyncio.StreamWriter, writer))
+    state = _BridgeRequestState(7)
+    connection.requests[7] = state
+    loop = asyncio.get_running_loop()
+    persistent: asyncio.Future[Any] = loop.create_future()
+    scoped: asyncio.Future[Any] = loop.create_future()
+    connection.pending[1] = (None, persistent)
+    connection.pending[2] = (state, scoped)
+
+    connection.cancel_request(7)
+
+    assert connection.pending[1] == (None, persistent)
+    assert not persistent.done()
+    assert 2 not in connection.pending
+    with pytest.raises(asyncio.CancelledError):
+        scoped.result()
+    connection.pending.pop(1)
+    persistent.set_result({"accepted": True})
+
+
+async def _read_and_ack_bridge_host_messages(
+    process: asyncio.subprocess.Process,
+    count: int,
+) -> list[dict[str, Any]]:
+    assert process.stdin is not None
+    assert process.stdout is not None
+    messages: list[dict[str, Any]] = []
+    while len(messages) < count:
+        message = await _read_frame(process.stdout)
+        messages.append(message)
+        if message.get("method") and message.get("id") is not None:
+            await _write_frame(
+                process.stdin,
+                {
+                    "jsonrpc": "2.0",
+                    "id": message["id"],
+                    "result": {"accepted": True},
+                },
+            )
+    return messages
 
 
 async def _write_frame(writer: asyncio.StreamWriter, message: Mapping[str, Any]) -> None:

@@ -5,14 +5,15 @@ from collections.abc import Mapping
 from typing import Any
 
 from .api import Entrypoint, Extension, create_extension_host
-from .context import HostRPCClient, set_active_host_rpc_client
+from .context import HostRPCClient, run_with_host_rpc_client
 
 
 class ExtensionTestHarness:
     """In-process harness for testing extension registrations and handlers."""
 
-    def __init__(self, host: Extension) -> None:
+    def __init__(self, host: Extension, host_rpc_client: HostRPCClient | None = None) -> None:
         self._host = host
+        self._host_rpc_client = host_rpc_client
         self._initialized = False
         self._default_init: dict[str, Any] = {
             "protocolVersion": "2026-05-30",
@@ -55,19 +56,28 @@ class ExtensionTestHarness:
         """Execute a registered tool through the extension host."""
 
         self._ensure_initialized()
-        return await self._host.execute_tool(params)
+        return await run_with_host_rpc_client(
+            self._host_rpc_client,
+            lambda: self._host.execute_tool(params),
+        )
 
     async def execute_command(self, params: Mapping[str, Any]) -> dict[str, Any]:
         """Execute a registered command through the extension host."""
 
         self._ensure_initialized()
-        return await self._host.execute_command(params)
+        return await run_with_host_rpc_client(
+            self._host_rpc_client,
+            lambda: self._host.execute_command(params),
+        )
 
     async def handle_event(self, params: Mapping[str, Any]) -> dict[str, Any]:
         """Dispatch an event to registered event handlers."""
 
         self._ensure_initialized()
-        return await self._host.handle_event(params)
+        return await run_with_host_rpc_client(
+            self._host_rpc_client,
+            lambda: self._host.handle_event(params),
+        )
 
     def _ensure_initialized(self) -> None:
         if not self._initialized:
@@ -91,5 +101,4 @@ async def create_test_harness(
     """
 
     host = await create_extension_host(entrypoint)
-    set_active_host_rpc_client(host_rpc_client)
-    return ExtensionTestHarness(host)
+    return ExtensionTestHarness(host, host_rpc_client)

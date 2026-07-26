@@ -6,7 +6,7 @@ import os
 import shutil
 import tempfile
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, cast
 
@@ -18,6 +18,7 @@ from ..context import (
     UIInputRequest,
     UINotifyRequest,
     UISelectRequest,
+    _release_persistent_ui_state,
     run_with_host_rpc_client,
 )
 from .transport import (
@@ -131,8 +132,10 @@ class _BridgeConnection:
         self.writer = writer
         self.write_lock = asyncio.Lock()
         self.next_id = 0
-        self.pending: dict[int, tuple[_BridgeRequestState, asyncio.Future[Any]]] = {}
+        self.pending: dict[int, tuple[_BridgeRequestState | None, asyncio.Future[Any]]] = {}
         self.requests: dict[int | str, _BridgeRequestState] = {}
+        self.notification_handlers: set[Callable[[str, Any], None]] = set()
+        self.persistent_client: _PersistentConnectionHostRPCClient | None = None
         self.closed = False
 
     async def send(
@@ -157,12 +160,12 @@ class _BridgeConnection:
         state = self.requests.get(request_id)
         if state is not None:
             state.cancel()
-        for reverse_id, (pending_state, future) in list(self.pending.items()):
-            if pending_state is not state:
-                continue
-            self.pending.pop(reverse_id, None)
-            if not future.done():
-                future.set_exception(asyncio.CancelledError())
+            for reverse_id, (pending_state, future) in list(self.pending.items()):
+                if pending_state is not state:
+                    continue
+                self.pending.pop(reverse_id, None)
+                if not future.done():
+                    future.set_exception(asyncio.CancelledError())
 
     def finish_request(self, state: _BridgeRequestState) -> None:
         state.finish()
@@ -182,6 +185,8 @@ class _BridgeConnection:
         if self.closed:
             return
         self.closed = True
+        if self.persistent_client is not None:
+            _release_persistent_ui_state(self.persistent_client)
         for _, future in self.pending.values():
             if not future.done():
                 future.set_exception(RuntimeError("Extension bridge connection closed"))
@@ -193,11 +198,19 @@ class _BridgeConnection:
         if tasks:
             await asyncio.wait(tasks, timeout=1)
         self.requests.clear()
+        self.notification_handlers.clear()
+        self.persistent_client = None
         self.writer.close()
         try:
             await self.writer.wait_closed()
         except (ConnectionError, RuntimeError):
             pass
+
+    def handle_notification(self, method: str, params: Any) -> None:
+        if self.closed:
+            return
+        for handler in list(self.notification_handlers):
+            handler(method, params)
 
 
 class _ConnectionHostRPCClient(HostRPCClient):
@@ -212,6 +225,9 @@ class _ConnectionHostRPCClient(HostRPCClient):
         self._connection = connection
         self._parent_id = parent_id
         self._state = state
+        if connection.persistent_client is None:
+            connection.persistent_client = _PersistentConnectionHostRPCClient(server, connection)
+        self.persistent: HostRPCClient = connection.persistent_client
 
     async def request(self, method: str, params: Any | None = None) -> Any:
         return await self._server._request(
@@ -221,6 +237,33 @@ class _ConnectionHostRPCClient(HostRPCClient):
             method,
             params,
         )
+
+
+class _PersistentConnectionHostRPCClient(HostRPCClient):
+    def __init__(
+        self,
+        server: ExtensionSocketServer,
+        connection: _BridgeConnection,
+    ) -> None:
+        self._server = server
+        self._connection = connection
+
+    async def request(self, method: str, params: Any | None = None) -> Any:
+        return await self._server._request_persistent(self._connection, method, params)
+
+    async def notify(self, method: str, params: Any | None = None) -> None:
+        await self._connection.send({"jsonrpc": "2.0", "method": method, "params": params})
+
+    def on_notification(
+        self,
+        handler: Callable[[str, Any], None],
+    ) -> Callable[[], None]:
+        self._connection.notification_handlers.add(handler)
+
+        def unsubscribe() -> None:
+            self._connection.notification_handlers.discard(handler)
+
+        return unsubscribe
 
 
 class ExtensionSocketServer:
@@ -296,6 +339,31 @@ class ExtensionSocketServer:
         }
         try:
             await connection.send(message, state)
+            return await future
+        finally:
+            connection.pending.pop(request_id, None)
+
+    async def _request_persistent(
+        self,
+        connection: _BridgeConnection,
+        method: str,
+        params: Any | None = None,
+    ) -> Any:
+        if connection.closed:
+            raise RuntimeError("Extension bridge connection is closed")
+        connection.next_id += 1
+        request_id = connection.next_id
+        future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+        connection.pending[request_id] = (None, future)
+        try:
+            await connection.send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": method,
+                    "params": params,
+                }
+            )
             return await future
         finally:
             connection.pending.pop(request_id, None)
@@ -376,6 +444,9 @@ class ExtensionSocketServer:
             params = message.get("params")
             if isinstance(params, Mapping) and isinstance(params.get("id"), int | str):
                 connection.cancel_request(params["id"])
+            return
+        if isinstance(method, str) and message_id is None:
+            connection.handle_notification(method, message.get("params"))
             return
         if not isinstance(method, str) or not isinstance(message_id, int | str):
             return

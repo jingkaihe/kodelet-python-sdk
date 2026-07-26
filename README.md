@@ -149,7 +149,7 @@ async def search(input: SearchInput, ctx: ToolContext) -> ToolExecutionResult:
 
 `ctx.update(...)` is capability-gated and is a no-op when the connected Kodelet host does not support live extension-tool updates.
 
-When the host cancels an active request or disconnects, async handlers receive `asyncio.CancelledError`. Any late `ctx.update(...)` or UI reverse-RPC call from that cancelled request is rejected rather than being routed to a later call.
+When the host cancels an active request or disconnects, async handlers receive `asyncio.CancelledError`. Any late `ctx.update(...)` or transient `ctx.ui.input/confirm/select/notify(...)` call from that cancelled request is rejected rather than being routed to a later call. Persistent transcript, widget, and surface APIs are connection-scoped and remain usable after their opening handler returns.
 
 For long-running tasks with multiple activities, `TaskProgress` publishes a bounded `taskRun` snapshot and can either be updated directly or attached to a child Kodelet session:
 
@@ -231,6 +231,7 @@ Handlers receive `ctx` with Kodelet call metadata and helper namespaces:
 - `ctx.env.get(...)` for environment access.
 - `ctx.log.debug/info/warn/error(...)` for JSON logs to stderr.
 - `ctx.ui.input/confirm/select/notify(...)` for host UI reverse-RPC calls.
+- `ctx.ui.append_transcript(...)`, `ctx.ui.set_widget(...)`, and `ctx.ui.open_surface(...)` for capability-gated persistent native-TUI content.
 
 UI helpers accept protocol-shaped typed requests: `UIInputRequest`, `UIConfirmRequest`, `UISelectRequest`, and `UINotifyRequest`. The stdio runtime dispatches independent extension requests concurrently and includes the originating request's `parentId` on reverse-RPC calls so Kodelet can route UI interactions to the correct call context.
 
@@ -243,6 +244,50 @@ select_request: UISelectRequest = {"title": "Mode", "options": ["fast", "thoroug
 branch = await ctx.ui.input(input_request)
 mode = await ctx.ui.select(select_request)
 ```
+
+The native Kodelet TUI can advertise persistent transcript, widget, and interactive-surface support. `append_transcript(...)` and `set_widget(...)` are no-ops when unavailable; `open_surface(...)` raises `RuntimeError` when surfaces are unavailable. These APIs are connection-scoped, so a returned surface handle can continue receiving events and publishing frames after the tool, command, or event handler that opened it has returned.
+
+```python
+import asyncio
+
+
+await ctx.ui.append_transcript({"title": "Drawing saved", "message": "./drawing.png"})
+
+await ctx.ui.set_widget(
+    "status",
+    [
+        "Extension state",
+        {"spans": [{"text": " ready", "style": {"foreground": "#00ff00", "bold": True}}]},
+    ],
+)
+await ctx.ui.set_widget("status", ["Moved"], {"placement": "belowComposer"})
+await ctx.ui.set_widget("status", None)
+
+surface = await ctx.ui.open_surface(
+    {
+        "id": "game",
+        "initialLines": ["Loading…"],
+        "width": "75%",
+        "height": "80%",
+        "anchor": "center",
+        "margin": {"top": 1, "right": 1, "bottom": 1, "left": 1},
+    }
+)
+
+surface.on_resize(
+    lambda event: surface.update([f"Surface size: {event['width']}×{event['height']}"])
+)
+
+
+def handle_input(event):
+    if event["kind"] == "key" and event.get("key") == "q":
+        asyncio.create_task(surface.close())
+
+
+surface.on_input(handle_input)
+```
+
+`surface.update(...)` is synchronous and replace-in-place. The SDK keeps at most one frame transport write in flight and one replaceable latest pending frame per surface. Input, mouse, focus, blur, and resize notifications share an ordered host-event sequence; stale events are discarded. Surface dimensions accept positive terminal-cell counts or percentage strings such as `"75%"`, anchors cover all corners, edges, and center, and `nonCapturing: True` leaves keyboard focus with the underlying TUI.
 
 ### Testing extensions
 
