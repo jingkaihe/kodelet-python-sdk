@@ -238,6 +238,17 @@ class _ConnectionHostRPCClient(HostRPCClient):
             params,
         )
 
+    async def request_persistent(self, method: str, params: Any | None = None) -> Any:
+        if self._state.active:
+            return await self._server._request(
+                self._connection,
+                self._parent_id,
+                self._state,
+                method,
+                params,
+            )
+        return await self._server._request_persistent(self._connection, method, params)
+
 
 class _PersistentConnectionHostRPCClient(HostRPCClient):
     def __init__(

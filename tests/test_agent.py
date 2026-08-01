@@ -22,7 +22,11 @@ from kodelet_sdk import (
     define_extension,
 )
 from kodelet_sdk.agent import BridgeTransport, SpawnedProcess, SpawnOptions
-from kodelet_sdk.agent.bridge import _BridgeConnection, _BridgeRequestState
+from kodelet_sdk.agent.bridge import (
+    _BridgeConnection,
+    _BridgeRequestState,
+    _ConnectionHostRPCClient,
+)
 
 
 class FakeACPProcess(SpawnedProcess):
@@ -645,6 +649,7 @@ async def test_extension_bridge_keeps_persistent_surfaces_alive_after_command_re
                     ]
                 )
                 if event.get("key") == "q":
+
                     async def close_later() -> None:
                         await asyncio.sleep(0)
                         await surface.close()
@@ -705,9 +710,11 @@ async def test_extension_bridge_keeps_persistent_surfaces_alive_after_command_re
     assert open_request == {
         "jsonrpc": "2.0",
         "id": 1,
+        "parentId": 2,
         "method": "kodelet.ui.surface.open",
         "params": {
             "id": "game",
+            "scopeId": "",
             "options": {"width": "50%"},
             "frame": {"sequence": 1, "lines": ["loading"]},
         },
@@ -733,9 +740,7 @@ async def test_extension_bridge_keeps_persistent_surfaces_alive_after_command_re
     )
     resize_messages = await _read_and_ack_bridge_host_messages(process, 2)
     frame_notification = next(
-        message
-        for message in resize_messages
-        if message["method"] == "kodelet.ui.surface.frame"
+        message for message in resize_messages if message["method"] == "kodelet.ui.surface.frame"
     )
     transcript_request = next(
         message
@@ -745,10 +750,18 @@ async def test_extension_bridge_keeps_persistent_surfaces_alive_after_command_re
     assert frame_notification == {
         "jsonrpc": "2.0",
         "method": "kodelet.ui.surface.frame",
-        "params": {"id": "game", "frame": {"sequence": 2, "lines": ["size=60x18"]}},
+        "params": {
+            "id": "game",
+            "scopeId": "",
+            "frame": {"sequence": 2, "lines": ["size=60x18"]},
+        },
     }
     assert "parentId" not in transcript_request
-    assert transcript_request["params"] == {"title": "Resized", "message": "60x18"}
+    assert transcript_request["params"] == {
+        "scopeId": "",
+        "title": "Resized",
+        "message": "60x18",
+    }
 
     await _write_frame(
         process.stdin,
@@ -766,25 +779,22 @@ async def test_extension_bridge_keeps_persistent_surfaces_alive_after_command_re
     )
     input_messages = await _read_and_ack_bridge_host_messages(process, 2)
     input_frame = next(
-        message
-        for message in input_messages
-        if message["method"] == "kodelet.ui.surface.frame"
+        message for message in input_messages if message["method"] == "kodelet.ui.surface.frame"
     )
     close_request = next(
-        message
-        for message in input_messages
-        if message["method"] == "kodelet.ui.surface.close"
+        message for message in input_messages if message["method"] == "kodelet.ui.surface.close"
     )
     assert input_frame == {
         "jsonrpc": "2.0",
         "method": "kodelet.ui.surface.frame",
         "params": {
             "id": "game",
+            "scopeId": "",
             "frame": {"sequence": 3, "lines": ["key=q;size=60x18"]},
         },
     }
     assert "parentId" not in close_request
-    assert close_request["params"] == {"id": "game", "sequence": 4}
+    assert close_request["params"] == {"id": "game", "scopeId": "", "sequence": 4}
 
     if background_tasks:
         await asyncio.gather(*background_tasks)
@@ -820,6 +830,7 @@ async def test_extension_bridge_cancellation_is_connection_scoped(tmp_path: Path
             if input.mode == "quick":
                 return "quick result"
             if input.mode == "detached":
+
                 async def notify_later() -> None:
                     await asyncio.sleep(0.02)
                     try:
@@ -1046,6 +1057,52 @@ async def test_extension_bridge_cancellation_leaves_persistent_rpc_pending() -> 
         scoped.result()
     connection.pending.pop(1)
     persistent.set_result({"accepted": True})
+
+
+@pytest.mark.asyncio
+async def test_extension_bridge_persistent_request_is_not_replayed_after_completion() -> None:
+    calls: list[str] = []
+    writer = _MemoryStreamWriter()
+    connection = _BridgeConnection(cast(asyncio.StreamWriter, writer))
+    state = _BridgeRequestState(7)
+    connection.requests[7] = state
+
+    class FakeServer:
+        async def _request(
+            self,
+            request_connection: _BridgeConnection,
+            parent_id: int | str,
+            request_state: _BridgeRequestState,
+            method: str,
+            params: Any | None = None,
+        ) -> Any:
+            del method, params
+            assert request_connection is connection
+            assert parent_id == 7
+            assert request_state is state
+            calls.append("parented")
+            state.finish()
+            raise RuntimeError("Extension request completed")
+
+        async def _request_persistent(
+            self,
+            request_connection: _BridgeConnection,
+            method: str,
+            params: Any | None = None,
+        ) -> Any:
+            del method, params
+            assert request_connection is connection
+            calls.append("parentless")
+            return {"accepted": True}
+
+    client = _ConnectionHostRPCClient(cast(Any, FakeServer()), connection, 7, state)
+    with pytest.raises(RuntimeError, match="completed"):
+        await client.request_persistent(
+            "kodelet.ui.transcript.append",
+            {"scopeId": "conversation-a", "message": "once"},
+        )
+
+    assert calls == ["parented"]
 
 
 async def _read_and_ack_bridge_host_messages(

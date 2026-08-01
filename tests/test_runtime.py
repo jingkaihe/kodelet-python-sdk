@@ -5,7 +5,7 @@ import json
 import os
 import queue
 from collections.abc import Awaitable, Mapping
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -20,7 +20,12 @@ from kodelet_sdk import (
     UISurfaceInputEvent,
     UISurfaceResizeEvent,
 )
-from kodelet_sdk.runtime import StdioHostRPCClient, _StdioRequestState, run_stdio_server
+from kodelet_sdk.runtime import (
+    StdioHostRPCClient,
+    _RequestScopedHostRPCClient,
+    _StdioRequestState,
+    run_stdio_server,
+)
 
 
 @pytest.mark.asyncio
@@ -142,6 +147,7 @@ async def test_runtime_keeps_interactive_surfaces_alive_after_command_returns() 
                 ]
             )
             if event.get("key") == "q":
+
                 async def close_later() -> None:
                     await asyncio.sleep(0)
                     await surface.close()
@@ -169,6 +175,7 @@ async def test_runtime_keeps_interactive_surfaces_alive_after_command_returns() 
         {
             "name": "game",
             "input": {},
+            "context": {"uiScopeId": "conversation-a"},
             "invocation": {"raw": "/game", "commandName": "game", "args": [], "flags": {}},
         },
     )
@@ -178,22 +185,27 @@ async def test_runtime_keeps_interactive_surfaces_alive_after_command_returns() 
         for request in client.host_requests
         if request["method"] == "kodelet.ui.surface.open"
     )
-    assert "parentId" not in open_request
+    assert open_request["parentId"] == 2
     assert open_request["params"] == {
         "id": "game",
+        "scopeId": "conversation-a",
         "options": {"width": "50%"},
         "frame": {"sequence": 1, "lines": ["loading"]},
     }
 
     client.notify(
         "extension.ui.surface.resize",
-        {"id": "game", "sequence": 1, "width": 60, "height": 18},
+        {
+            "id": "game",
+            "scopeId": "conversation-a",
+            "sequence": 1,
+            "width": 60,
+            "height": 18,
+        },
     )
     resize_messages = await client.read_host_messages(2)
     frame_notification = next(
-        message
-        for message in resize_messages
-        if message["method"] == "kodelet.ui.surface.frame"
+        message for message in resize_messages if message["method"] == "kodelet.ui.surface.frame"
     )
     transcript_request = next(
         message
@@ -203,36 +215,52 @@ async def test_runtime_keeps_interactive_surfaces_alive_after_command_returns() 
     assert frame_notification == {
         "jsonrpc": "2.0",
         "method": "kodelet.ui.surface.frame",
-        "params": {"id": "game", "frame": {"sequence": 2, "lines": ["size=60x18"]}},
+        "params": {
+            "id": "game",
+            "scopeId": "conversation-a",
+            "frame": {"sequence": 2, "lines": ["size=60x18"]},
+        },
     }
     assert "parentId" not in transcript_request
-    assert transcript_request["params"] == {"title": "Resized", "message": "60x18"}
+    assert transcript_request["params"] == {
+        "title": "Resized",
+        "message": "60x18",
+        "scopeId": "conversation-a",
+    }
 
     client.notify(
         "extension.ui.surface.input",
-        {"id": "game", "sequence": 2, "kind": "key", "key": "q", "text": "q"},
+        {
+            "id": "game",
+            "scopeId": "conversation-a",
+            "sequence": 2,
+            "kind": "key",
+            "key": "q",
+            "text": "q",
+        },
     )
     input_messages = await client.read_host_messages(2)
     input_frame = next(
-        message
-        for message in input_messages
-        if message["method"] == "kodelet.ui.surface.frame"
+        message for message in input_messages if message["method"] == "kodelet.ui.surface.frame"
     )
     close_request = next(
-        message
-        for message in input_messages
-        if message["method"] == "kodelet.ui.surface.close"
+        message for message in input_messages if message["method"] == "kodelet.ui.surface.close"
     )
     assert input_frame == {
         "jsonrpc": "2.0",
         "method": "kodelet.ui.surface.frame",
         "params": {
             "id": "game",
+            "scopeId": "conversation-a",
             "frame": {"sequence": 3, "lines": ["key=q;size=60x18"]},
         },
     }
     assert "parentId" not in close_request
-    assert close_request["params"] == {"id": "game", "sequence": 4}
+    assert close_request["params"] == {
+        "id": "game",
+        "sequence": 4,
+        "scopeId": "conversation-a",
+    }
 
     if background_tasks:
         await asyncio.gather(*background_tasks)
@@ -314,6 +342,132 @@ async def test_runtime_correlates_concurrent_reverse_rpc_requests() -> None:
 
 
 @pytest.mark.asyncio
+async def test_runtime_correlates_concurrent_persistent_widget_requests() -> None:
+    ext = Extension(name="concurrent-widgets")
+    both_started = asyncio.Event()
+    started = 0
+
+    @ext.tool("widget", description="Update a persistent widget", input_schema={"type": "object"})
+    async def widget(input: Any, ctx: ToolContext) -> str:
+        nonlocal started
+        started += 1
+        if started == 2:
+            both_started.set()
+        await asyncio.wait_for(both_started.wait(), timeout=1)
+        await ctx.ui.set_widget("todo-progress", [input["label"]])
+        return input["label"]
+
+    server_reader = MemoryReader()
+    server_writer = MemoryWriter()
+    task = asyncio.create_task(run_stdio_server(ext, server_reader, server_writer))
+    client = RpcTestClient(server_reader, server_writer)
+
+    await client.call(
+        "extension.initialize",
+        {
+            "protocolVersion": "2026-05-30",
+            "extension": {"id": "concurrent-widgets", "cwd": os.getcwd(), "dataDir": ""},
+            "capabilities": {"ui": {"widgets": True}},
+        },
+    )
+
+    for request_id, label, scope_id in (
+        (2, "first", "conversation-a"),
+        (3, "second", "conversation-b"),
+    ):
+        server_reader.feed(
+            _frame(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": "extension.tool.execute",
+                    "params": {
+                        "name": "widget",
+                        "input": {"label": label},
+                        "context": {"uiScopeId": scope_id},
+                    },
+                }
+            )
+        )
+
+    widget_requests = [
+        await asyncio.wait_for(server_writer.read_frame(), timeout=1),
+        await asyncio.wait_for(server_writer.read_frame(), timeout=1),
+    ]
+    widget_by_label = {
+        request["params"]["frame"]["lines"][0]: request for request in widget_requests
+    }
+    assert widget_by_label["first"]["parentId"] == 2
+    assert widget_by_label["second"]["parentId"] == 3
+    assert widget_by_label["first"]["params"]["scopeId"] == "conversation-a"
+    assert widget_by_label["second"]["params"]["scopeId"] == "conversation-b"
+    assert [request["params"]["frame"]["sequence"] for request in widget_requests] == [1, 1]
+
+    for request in widget_requests:
+        sequence = request["params"]["frame"]["sequence"]
+        server_reader.feed(
+            _frame(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request["id"],
+                    "result": {"accepted": True, "latestSequence": sequence},
+                }
+            )
+        )
+
+    responses = [
+        await asyncio.wait_for(server_writer.read_frame(), timeout=1),
+        await asyncio.wait_for(server_writer.read_frame(), timeout=1),
+    ]
+    response_by_id = {response["id"]: response for response in responses}
+    assert response_by_id[2]["result"] == {"content": "first"}
+    assert response_by_id[3]["result"] == {"content": "second"}
+
+    server_reader.close()
+    await asyncio.wait_for(task, timeout=1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_state", ["cancelled", "completed"])
+async def test_stdio_persistent_request_is_not_replayed_after_request_ends(
+    terminal_state: str,
+) -> None:
+    calls: list[str] = []
+    state = _StdioRequestState(7)
+
+    class FakeClient:
+        async def request_for(
+            self,
+            request_state: _StdioRequestState,
+            method: str,
+            params: Any | None = None,
+        ) -> Any:
+            del method, params
+            assert request_state is state
+            calls.append("parented")
+            if terminal_state == "cancelled":
+                await state.cancel()
+                raise asyncio.CancelledError
+            await state.finish()
+            raise RuntimeError("Extension request completed")
+
+        async def request(self, method: str, params: Any | None = None) -> Any:
+            del method, params
+            calls.append("parentless")
+            return {"accepted": True}
+
+    client = _RequestScopedHostRPCClient(cast(StdioHostRPCClient, FakeClient()), state)
+    if terminal_state == "cancelled":
+        with pytest.raises(asyncio.CancelledError):
+            await client.request_persistent("kodelet.ui.transcript.append", {"message": "one"})
+    else:
+        with pytest.raises(RuntimeError, match="completed"):
+            await client.request_persistent("kodelet.ui.transcript.append", {"message": "one"})
+
+    assert calls == ["parented"]
+
+
+@pytest.mark.asyncio
 async def test_runtime_cancels_requests_and_blocks_late_reverse_rpc() -> None:
     ext = Extension(name="cancellable-rpc")
     started = asyncio.Event()
@@ -360,9 +514,7 @@ async def test_runtime_cancels_requests_and_blocks_late_reverse_rpc() -> None:
         )
     )
     await asyncio.wait_for(started.wait(), timeout=1)
-    server_reader.feed(
-        _frame({"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 2}})
-    )
+    server_reader.feed(_frame({"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 2}}))
     await asyncio.wait_for(cancelled.wait(), timeout=1)
     await asyncio.wait_for(stale_blocked.wait(), timeout=1)
 
@@ -573,9 +725,7 @@ class RpcTestClient:
             return response.get("result")
 
     def notify(self, method: str, params: Any | None = None) -> None:
-        self._server_reader.feed(
-            _frame({"jsonrpc": "2.0", "method": method, "params": params})
-        )
+        self._server_reader.feed(_frame({"jsonrpc": "2.0", "method": method, "params": params}))
 
     async def read_host_messages(self, count: int) -> list[dict[str, Any]]:
         messages: list[dict[str, Any]] = []
@@ -612,9 +762,7 @@ class RpcTestClient:
             result = {"accepted": True}
         else:
             result = {"status": "submitted", "value": "from-host"}
-        self._server_reader.feed(
-            _frame({"jsonrpc": "2.0", "id": message["id"], "result": result})
-        )
+        self._server_reader.feed(_frame({"jsonrpc": "2.0", "id": message["id"], "result": result}))
 
 
 async def _settle_event_loop() -> None:

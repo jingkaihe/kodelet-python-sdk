@@ -149,7 +149,7 @@ async def search(input: SearchInput, ctx: ToolContext) -> ToolExecutionResult:
 
 `ctx.update(...)` is capability-gated and is a no-op when the connected Kodelet host does not support live extension-tool updates.
 
-When the host cancels an active request or disconnects, async handlers receive `asyncio.CancelledError`. Any late `ctx.update(...)` or transient `ctx.ui.input/confirm/select/notify(...)` call from that cancelled request is rejected rather than being routed to a later call. Persistent transcript, widget, and surface APIs are connection-scoped and remain usable after their opening handler returns.
+When the host cancels an active request or disconnects, async handlers receive `asyncio.CancelledError`. Any late `ctx.update(...)` or transient `ctx.ui.input/confirm/select/notify(...)` call from that cancelled request is rejected rather than being routed to a later call. Persistent transcript, widget, and surface APIs retain the originating conversation's opaque UI scope and remain usable after their opening handler returns.
 
 For long-running tasks with multiple activities, `TaskProgress` publishes a bounded `taskRun` snapshot and can either be updated directly or attached to a child Kodelet session:
 
@@ -245,7 +245,7 @@ branch = await ctx.ui.input(input_request)
 mode = await ctx.ui.select(select_request)
 ```
 
-The native Kodelet TUI can advertise persistent transcript, widget, and interactive-surface support. `append_transcript(...)` and `set_widget(...)` are no-ops when unavailable; `open_surface(...)` raises `RuntimeError` when surfaces are unavailable. These APIs are connection-scoped, so a returned surface handle can continue receiving events and publishing frames after the tool, command, or event handler that opened it has returned.
+The native Kodelet TUI can advertise persistent transcript, widget, and interactive-surface support. `append_transcript(...)` and `set_widget(...)` are no-ops when unavailable; `open_surface(...)` raises `RuntimeError` when surfaces are unavailable. Persistent UI requests retain the originating request's `parentId` while a tool, command, or event handler is active and always carry `ctx.ui_scope_id` as an opaque durable scope, including an explicit empty string for host-global UI. This lets one extension reuse the same widget or surface ID independently in multiple conversations while returned surface handles continue receiving correctly scoped events and publishing frames through the persistent connection.
 
 ```python
 import asyncio
@@ -287,7 +287,7 @@ def handle_input(event):
 surface.on_input(handle_input)
 ```
 
-`surface.update(...)` is synchronous and replace-in-place. The SDK keeps at most one frame transport write in flight and one replaceable latest pending frame per surface. Input, mouse, focus, blur, and resize notifications share an ordered host-event sequence; stale events are discarded. Surface dimensions accept positive terminal-cell counts or percentage strings such as `"75%"`, anchors cover all corners, edges, and center, and `nonCapturing: True` leaves keyboard focus with the underlying TUI.
+`surface.update(...)` is synchronous and replace-in-place. The SDK keeps at most one frame transport write in flight and one replaceable latest pending frame per surface. Input, mouse, focus, blur, and resize notifications share an ordered host-event sequence; stale events are discarded. Surface dimensions accept positive terminal-cell counts or percentage strings such as `"75%"`, anchors cover all corners, edges, and center, and `nonCapturing: True` leaves keyboard focus with the underlying TUI. A failed `await surface.close()` keeps the handle owned and retryable; the ID is released only after the host acknowledges a successful close.
 
 ### Testing extensions
 

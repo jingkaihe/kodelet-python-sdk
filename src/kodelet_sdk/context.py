@@ -179,6 +179,7 @@ class UISurfaceInputEvent(TypedDict):
     sequence: int
     kind: Literal["key", "mouse", "focus", "blur"]
     id: NotRequired[str]
+    scopeId: NotRequired[str]
     key: NotRequired[str]
     text: NotRequired[str]
     alt: NotRequired[bool]
@@ -191,6 +192,7 @@ class UISurfaceResizeEvent(UISurfaceSize):
     """Ordered resize event delivered to a surface."""
 
     sequence: int
+    scopeId: NotRequired[str]
 
 
 class UISurface(Protocol):
@@ -236,10 +238,10 @@ class UIInputResponse(TypedDict, total=False):
 class HostRPCClient(Protocol):
     """Reverse-RPC client used by extension contexts to call the Kodelet host.
 
-    Clients may additionally expose ``persistent``, ``notify``, and
-    ``on_notification`` attributes. Persistent UI helpers discover those
-    optional capabilities dynamically so simple request-only test doubles stay
-    valid implementations of this protocol.
+    Clients may additionally expose ``request_persistent``, ``persistent``,
+    ``notify``, and ``on_notification`` attributes. Persistent UI helpers
+    discover those optional capabilities dynamically so simple request-only
+    test doubles stay valid implementations of this protocol.
     """
 
     async def request(self, method: str, params: Any | None = None) -> Any: ...
@@ -247,9 +249,9 @@ class HostRPCClient(Protocol):
 
 @dataclass
 class _PersistentUIState:
-    widget_sequences: dict[str, int]
-    surface_sequences: dict[str, int]
-    surfaces: dict[str, _UISurfaceHandle]
+    widget_sequences: dict[tuple[str, str], int]
+    surface_sequences: dict[tuple[str, str], int]
+    surfaces: dict[tuple[str, str], _UISurfaceHandle]
     notification_routing_installed: bool = False
 
 
@@ -653,6 +655,7 @@ class UIContext:
         self,
         init: Mapping[str, Any] | None = None,
         client: HostRPCClient | None | object = _HOST_RPC_CLIENT_UNSET,
+        ui_scope_id: str | None = None,
     ) -> None:
         resolved_client = (
             _current_host_rpc_client()
@@ -662,6 +665,16 @@ class UIContext:
         self._init = init
         self._client = resolved_client
         self._persistent_client = _persistent_host_rpc_client(resolved_client)
+        self._scope_id = _normalize_ui_scope_id(ui_scope_id)
+
+    async def _request_persistent_ui(self, method: str, params: Any) -> Any:
+        request_persistent = getattr(self._client, "request_persistent", None)
+        if callable(request_persistent):
+            return await request_persistent(method, params)
+        client = self._persistent_client
+        if client is None:
+            raise RuntimeError("Persistent extension UI is not available in this host")
+        return await client.request(method, params)
 
     async def input(self, request: UIInputRequest) -> str | None:
         """Ask the host for text input.
@@ -753,7 +766,10 @@ class UIContext:
         if not _extension_ui_supported(self._init, "transcript") or client is None:
             return
         payload = {"message": request} if isinstance(request, str) else dict(request)
-        await client.request("kodelet.ui.transcript.append", payload)
+        await self._request_persistent_ui(
+            "kodelet.ui.transcript.append",
+            _with_ui_scope(payload, self._scope_id),
+        )
 
     async def set_widget(
         self,
@@ -777,21 +793,27 @@ class UIContext:
             return
         object_id = _validate_ui_object_id(id)
         normalized_lines = None if lines is None else _normalize_frame_lines(lines)
-        sequence = _next_client_sequence(client, object_id, surface=False)
+        sequence = _next_client_sequence(client, self._scope_id, object_id, surface=False)
         if normalized_lines is None:
-            await client.request(
+            await self._request_persistent_ui(
                 "kodelet.ui.widget.remove",
-                {"id": object_id, "sequence": sequence},
+                _with_ui_scope(
+                    {"id": object_id, "sequence": sequence},
+                    self._scope_id,
+                ),
             )
             return
         placement = (options or {}).get("placement", "aboveComposer")
-        await client.request(
+        await self._request_persistent_ui(
             "kodelet.ui.widget.set",
-            {
-                "id": object_id,
-                "placement": placement,
-                "frame": {"sequence": sequence, "lines": normalized_lines},
-            },
+            _with_ui_scope(
+                {
+                    "id": object_id,
+                    "placement": placement,
+                    "frame": {"sequence": sequence, "lines": normalized_lines},
+                },
+                self._scope_id,
+            ),
         )
 
     async def open_surface(self, options: UISurfaceOpenOptions) -> UISurface:
@@ -819,26 +841,30 @@ class UIContext:
         )
         object_id = _validate_ui_object_id(requested_id)
         state = _persistent_ui_state(client)
-        if object_id in state.surfaces:
+        surface_key = (self._scope_id, object_id)
+        if surface_key in state.surfaces:
             raise RuntimeError(
                 f'Interactive surface "{object_id}" is already open, opening, or closing; '
                 "close it before reusing the ID"
             )
 
-        surface = _UISurfaceHandle(object_id, client)
-        state.surfaces[object_id] = surface
+        surface = _UISurfaceHandle(object_id, self._scope_id, client)
+        state.surfaces[surface_key] = surface
         _ensure_persistent_notification_routing(client)
         try:
-            response = await client.request(
+            response = await self._request_persistent_ui(
                 "kodelet.ui.surface.open",
-                {
-                    "id": object_id,
-                    "options": surface_options,
-                    "frame": {
-                        "sequence": surface._next_sequence(),
-                        "lines": initial_lines,
+                _with_ui_scope(
+                    {
+                        "id": object_id,
+                        "options": surface_options,
+                        "frame": {
+                            "sequence": surface._next_sequence(),
+                            "lines": initial_lines,
+                        },
                     },
-                },
+                    self._scope_id,
+                ),
             )
             if isinstance(response, Mapping) and response.get("accepted") is False:
                 reason = response.get("reason")
@@ -848,16 +874,17 @@ class UIContext:
                     else "The host rejected the interactive surface"
                 )
         except BaseException:
-            if state.surfaces.get(object_id) is surface:
-                state.surfaces.pop(object_id, None)
+            if state.surfaces.get(surface_key) is surface:
+                state.surfaces.pop(surface_key, None)
             raise
         surface._activate()
         return surface
 
 
 class _UISurfaceHandle:
-    def __init__(self, id: str, client: HostRPCClient) -> None:
+    def __init__(self, id: str, scope_id: str, client: HostRPCClient) -> None:
         self.id = id
+        self._scope_id = scope_id
         try:
             self._client_ref: weakref.ReferenceType[Any] | None = weakref.ref(client)
             self._strong_client: HostRPCClient | None = None
@@ -865,7 +892,9 @@ class _UISurfaceHandle:
             self._client_ref = None
             self._strong_client = client
         self._closed = False
+        self._closing = False
         self._active = False
+        self._close_lock = asyncio.Lock()
         self._pending_lines: list[UIFrameLine] | None = None
         self._frame_scheduled = False
         self._frame_in_flight = False
@@ -890,7 +919,7 @@ class _UISurfaceHandle:
     def update(self, lines: list[UIFrameLine]) -> None:
         """Queue a replacement frame without blocking the caller."""
 
-        if self._closed:
+        if self._closed or self._closing:
             return
         self._pending_lines = _normalize_frame_lines(lines)
         self._schedule_frame_flush()
@@ -898,20 +927,35 @@ class _UISurfaceHandle:
     async def close(self) -> None:
         """Close the surface and release its ID after the host acknowledges it."""
 
-        if self._closed:
-            return
-        self._clear_local_state()
-        client = self._resolve_client()
-        state = _find_persistent_ui_state(client) if client is not None else None
-        try:
-            if self._active and client is not None:
-                await client.request(
-                    "kodelet.ui.surface.close",
-                    {"id": self.id, "sequence": self._next_sequence()},
-                )
-        finally:
-            if state is not None and state.surfaces.get(self.id) is self:
-                state.surfaces.pop(self.id, None)
+        async with self._close_lock:
+            if self._closed:
+                return
+            self._closing = True
+            try:
+                client = self._resolve_client()
+                state = _find_persistent_ui_state(client) if client is not None else None
+                if self._active and client is not None:
+                    response = await client.request(
+                        "kodelet.ui.surface.close",
+                        _with_ui_scope(
+                            {"id": self.id, "sequence": self._next_sequence()},
+                            self._scope_id,
+                        ),
+                    )
+                    if isinstance(response, Mapping) and response.get("accepted") is False:
+                        reason = response.get("reason")
+                        raise RuntimeError(
+                            reason
+                            if isinstance(reason, str)
+                            else "The host rejected the interactive surface close"
+                        )
+                self._clear_local_state()
+                surface_key = (self._scope_id, self.id)
+                if state is not None and state.surfaces.get(surface_key) is self:
+                    state.surfaces.pop(surface_key, None)
+            finally:
+                self._closing = False
+                self._schedule_frame_flush()
 
     def on_input(
         self,
@@ -954,7 +998,7 @@ class _UISurfaceHandle:
         client = self._resolve_client()
         if client is None:
             raise RuntimeError("Extension host connection is closed")
-        return _next_client_sequence(client, self.id, surface=True)
+        return _next_client_sequence(client, self._scope_id, self.id, surface=True)
 
     def _resolve_client(self) -> HostRPCClient | None:
         if self._client_ref is not None:
@@ -984,6 +1028,7 @@ class _UISurfaceHandle:
     def _schedule_frame_flush(self) -> None:
         if (
             self._closed
+            or self._closing
             or self._frame_scheduled
             or self._frame_in_flight
             or self._pending_lines is None
@@ -994,7 +1039,12 @@ class _UISurfaceHandle:
 
     def _start_frame_flush(self) -> None:
         self._frame_scheduled = False
-        if self._closed or self._frame_in_flight or self._pending_lines is None:
+        if (
+            self._closed
+            or self._closing
+            or self._frame_in_flight
+            or self._pending_lines is None
+        ):
             return
         lines = self._pending_lines
         self._pending_lines = None
@@ -1005,13 +1055,20 @@ class _UISurfaceHandle:
         try:
             if self._closed:
                 return
+            if self._closing:
+                if self._pending_lines is None:
+                    self._pending_lines = lines
+                return
             client = self._resolve_client()
             if client is None:
                 return
-            params = {
-                "id": self.id,
-                "frame": {"sequence": self._next_sequence(), "lines": lines},
-            }
+            params = _with_ui_scope(
+                {
+                    "id": self.id,
+                    "frame": {"sequence": self._next_sequence(), "lines": lines},
+                },
+                self._scope_id,
+            )
             notify = getattr(client, "notify", None)
             if callable(notify):
                 result = notify("kodelet.ui.surface.frame", params)
@@ -1027,7 +1084,12 @@ class _UISurfaceHandle:
             self._schedule_frame_flush()
 
     def _handle_notification(self, method: str, params: Any) -> None:
-        if self._closed or not isinstance(params, Mapping) or params.get("id") != self.id:
+        if (
+            self._closed
+            or not isinstance(params, Mapping)
+            or params.get("id") != self.id
+            or _normalize_ui_scope_id(params.get("scopeId")) != self._scope_id
+        ):
             return
 
         input_event = method == "extension.ui.surface.input" and params.get("kind") in {
@@ -1039,9 +1101,7 @@ class _UISurfaceHandle:
         width = params.get("width")
         height = params.get("height")
         resize_event = (
-            method == "extension.ui.surface.resize"
-            and _is_number(width)
-            and _is_number(height)
+            method == "extension.ui.surface.resize" and _is_number(width) and _is_number(height)
         )
         if not input_event and not resize_event:
             return
@@ -1061,10 +1121,14 @@ class _UISurfaceHandle:
                 handler(event)
             return
 
-        event = cast(
-            UISurfaceResizeEvent,
-            {"sequence": sequence, "width": width, "height": height},
-        )
+        event_params: dict[str, Any] = {
+            "sequence": sequence,
+            "width": width,
+            "height": height,
+        }
+        if self._scope_id:
+            event_params["scopeId"] = self._scope_id
+        event = cast(UISurfaceResizeEvent, event_params)
         self._current_size = cast(UISurfaceSize, {"width": width, "height": height})
         if not self._resize_handlers:
             self._pending_resize_event = None if self._active else event
@@ -1173,11 +1237,12 @@ def _ensure_persistent_notification_routing(client: HostRPCClient | None) -> Non
         object_id = params.get("id")
         if not isinstance(object_id, str):
             return
+        scope_id = _normalize_ui_scope_id(params.get("scopeId"))
         routed_client = cast(HostRPCClient | None, client_ref()) if client_ref else client
         routed_state = _find_persistent_ui_state(routed_client)
         if routed_state is None:
             return
-        surface = routed_state.surfaces.get(object_id)
+        surface = routed_state.surfaces.get((scope_id, object_id))
         if surface is not None:
             surface._handle_notification(method, params)
 
@@ -1190,15 +1255,27 @@ def _ensure_persistent_notification_routing(client: HostRPCClient | None) -> Non
 
 def _next_client_sequence(
     client: HostRPCClient,
+    scope_id: str,
     object_id: str,
     *,
     surface: bool,
 ) -> int:
     state = _persistent_ui_state(client)
     sequences = state.surface_sequences if surface else state.widget_sequences
-    sequence = sequences.get(object_id, 0) + 1
-    sequences[object_id] = sequence
+    object_key = (scope_id, object_id)
+    sequence = sequences.get(object_key, 0) + 1
+    sequences[object_key] = sequence
     return sequence
+
+
+def _normalize_ui_scope_id(value: Any) -> str:
+    return value if isinstance(value, str) and value else ""
+
+
+def _with_ui_scope(params: Mapping[str, Any], scope_id: str) -> dict[str, Any]:
+    scoped = dict(params)
+    scoped["scopeId"] = scope_id
+    return scoped
 
 
 def _normalize_frame_lines(lines: Any) -> list[UIFrameLine]:
@@ -1257,6 +1334,7 @@ class SharedContext:
         data_dir = Path(str(data_dir_value)).resolve(strict=False)
         self.session_id = _optional_str(context.get("sessionId"))
         self.conversation_id = _optional_str(context.get("conversationId"))
+        self.ui_scope_id = _normalize_ui_scope_id(context.get("uiScopeId")) or None
         self.cwd = str(cwd)
         self.provider = _optional_str(context.get("provider"))
         self.model = _optional_str(context.get("model"))
@@ -1270,7 +1348,7 @@ class SharedContext:
         self.env = EnvContext()
         self.log = LogContext(_optional_str(extension.get("id")))
         self._host_rpc_client = _current_host_rpc_client()
-        self.ui = UIContext(init, self._host_rpc_client)
+        self.ui = UIContext(init, self._host_rpc_client, self.ui_scope_id)
 
 
 class ToolContext(SharedContext):

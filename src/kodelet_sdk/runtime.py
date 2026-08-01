@@ -233,6 +233,11 @@ class _RequestScopedHostRPCClient:
     async def request(self, method: str, params: Any | None = None) -> Any:
         return await self._client.request_for(self._state, method, params)
 
+    async def request_persistent(self, method: str, params: Any | None = None) -> Any:
+        if self._state.active:
+            return await self._client.request_for(self._state, method, params)
+        return await self._client.request(method, params)
+
 
 async def run_extension(entrypoint: Extension | Entrypoint) -> None:
     """Run an extension entrypoint over stdio.

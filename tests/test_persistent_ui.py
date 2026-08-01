@@ -84,6 +84,7 @@ async def test_widgets_use_sequences_and_surfaces_route_host_events() -> None:
     await harness.execute_command(
         {
             "name": "ui",
+            "context": {"uiScopeId": "conversation-a"},
             "invocation": {"raw": "/ui", "commandName": "ui", "args": [], "flags": {}},
         }
     )
@@ -93,6 +94,7 @@ async def test_widgets_use_sequences_and_surfaces_route_host_events() -> None:
             "kodelet.ui.widget.set",
             {
                 "id": "status",
+                "scopeId": "conversation-a",
                 "placement": "aboveComposer",
                 "frame": {
                     "sequence": 1,
@@ -114,19 +116,28 @@ async def test_widgets_use_sequences_and_surfaces_route_host_events() -> None:
             "kodelet.ui.widget.set",
             {
                 "id": "status",
+                "scopeId": "conversation-a",
                 "placement": "belowComposer",
                 "frame": {"sequence": 2, "lines": ["updated"]},
             },
         ),
-        ("kodelet.ui.widget.remove", {"id": "status", "sequence": 3}),
+        (
+            "kodelet.ui.widget.remove",
+            {"id": "status", "sequence": 3, "scopeId": "conversation-a"},
+        ),
         (
             "kodelet.ui.transcript.append",
-            {"title": "Saved", "message": "./drawing.png"},
+            {
+                "title": "Saved",
+                "message": "./drawing.png",
+                "scopeId": "conversation-a",
+            },
         ),
         (
             "kodelet.ui.surface.open",
             {
                 "id": "game",
+                "scopeId": "conversation-a",
                 "options": {"width": "75%", "maxHeight": "95%", "anchor": "center"},
                 "frame": {"sequence": 1, "lines": ["loading"]},
             },
@@ -137,35 +148,219 @@ async def test_widgets_use_sequences_and_surfaces_route_host_events() -> None:
     for handler in list(notification_handlers):
         handler(
             "extension.ui.surface.unknown",
-            {"id": "game", "sequence": 100},
+            {"id": "game", "scopeId": "conversation-a", "sequence": 100},
         )
         handler(
             "extension.ui.surface.resize",
-            {"id": "game", "sequence": 99, "width": "invalid", "height": 1},
+            {
+                "id": "game",
+                "scopeId": "conversation-a",
+                "sequence": 99,
+                "width": "invalid",
+                "height": 1,
+            },
         )
         handler(
             "extension.ui.surface.resize",
-            {"id": "game", "sequence": 1, "width": 80, "height": 20},
+            {
+                "id": "game",
+                "scopeId": "conversation-a",
+                "sequence": 1,
+                "width": 80,
+                "height": 20,
+            },
         )
         handler(
             "extension.ui.surface.input",
-            {"id": "game", "sequence": 2, "kind": "key", "key": "q", "text": "q"},
+            {
+                "id": "game",
+                "scopeId": "conversation-a",
+                "sequence": 2,
+                "kind": "key",
+                "key": "q",
+                "text": "q",
+            },
         )
         handler(
             "extension.ui.surface.resize",
-            {"id": "game", "sequence": 1, "width": 1, "height": 1},
+            {
+                "id": "game",
+                "scopeId": "conversation-a",
+                "sequence": 1,
+                "width": 1,
+                "height": 1,
+            },
         )
 
     assert opened_surface.size == {"width": 80, "height": 20}
-    assert resize_events == [{"sequence": 1, "width": 80, "height": 20}]
+    assert resize_events == [
+        {
+            "sequence": 1,
+            "scopeId": "conversation-a",
+            "width": 80,
+            "height": 20,
+        }
+    ]
     assert input_events == [
-        {"id": "game", "sequence": 2, "kind": "key", "key": "q", "text": "q"}
+        {
+            "id": "game",
+            "scopeId": "conversation-a",
+            "sequence": 2,
+            "kind": "key",
+            "key": "q",
+            "text": "q",
+        }
     ]
     await opened_surface.close()
     assert requests[-1] == (
         "kodelet.ui.surface.close",
-        {"id": "game", "sequence": 2},
+        {"id": "game", "sequence": 2, "scopeId": "conversation-a"},
     )
+
+
+@pytest.mark.asyncio
+async def test_same_surface_id_isolated_by_ui_scope_and_routes_scoped_events() -> None:
+    surfaces: dict[str, UISurface] = {}
+    input_events: dict[str, list[UISurfaceInputEvent]] = {
+        "conversation-a": [],
+        "conversation-b": [],
+    }
+    resize_events: dict[str, list[UISurfaceResizeEvent]] = {
+        "conversation-a": [],
+        "conversation-b": [],
+    }
+    requests: list[tuple[str, Any]] = []
+    notification_handlers: set[Callable[[str, Any], None]] = set()
+
+    class FakeRPC:
+        async def request(self, method: str, params: Any | None = None) -> Any:
+            requests.append((method, params))
+            return {"accepted": True}
+
+        def on_notification(
+            self,
+            handler: Callable[[str, Any], None],
+        ) -> Callable[[], None]:
+            notification_handlers.add(handler)
+            return lambda: notification_handlers.discard(handler)
+
+    ext = Extension()
+
+    @ext.command("open", description="Open one scoped surface")
+    async def open_surface(_input: Any, ctx: CommandContext) -> CommandResult:
+        scope_id = ctx.ui_scope_id
+        assert scope_id is not None
+        surface = await ctx.ui.open_surface({"id": "shared"})
+        surfaces[scope_id] = surface
+        surface.on_input(input_events[scope_id].append)
+        surface.on_resize(resize_events[scope_id].append)
+        return {"action": "respond", "response": scope_id}
+
+    harness = await create_test_harness(ext, FakeRPC())
+    harness.initialize({"capabilities": {"ui": {"surfaces": True}}})
+    for scope_id in ("conversation-a", "conversation-b"):
+        await harness.execute_command(
+            {
+                "name": "open",
+                "context": {"uiScopeId": scope_id},
+                "invocation": {
+                    "raw": "/open",
+                    "commandName": "open",
+                    "args": [],
+                    "flags": {},
+                },
+            }
+        )
+
+    assert requests == [
+        (
+            "kodelet.ui.surface.open",
+            {
+                "id": "shared",
+                "scopeId": "conversation-a",
+                "options": {},
+                "frame": {"sequence": 1, "lines": []},
+            },
+        ),
+        (
+            "kodelet.ui.surface.open",
+            {
+                "id": "shared",
+                "scopeId": "conversation-b",
+                "options": {},
+                "frame": {"sequence": 1, "lines": []},
+            },
+        ),
+    ]
+
+    for handler in list(notification_handlers):
+        handler(
+            "extension.ui.surface.input",
+            {
+                "id": "shared",
+                "scopeId": "conversation-a",
+                "sequence": 1,
+                "kind": "key",
+                "key": "a",
+            },
+        )
+        handler(
+            "extension.ui.surface.resize",
+            {
+                "id": "shared",
+                "scopeId": "conversation-b",
+                "sequence": 1,
+                "width": 80,
+                "height": 20,
+            },
+        )
+        handler(
+            "extension.ui.surface.input",
+            {
+                "id": "shared",
+                "scopeId": "conversation-c",
+                "sequence": 1,
+                "kind": "key",
+                "key": "ignored",
+            },
+        )
+
+    assert input_events == {
+        "conversation-a": [
+            {
+                "id": "shared",
+                "scopeId": "conversation-a",
+                "sequence": 1,
+                "kind": "key",
+                "key": "a",
+            }
+        ],
+        "conversation-b": [],
+    }
+    assert resize_events == {
+        "conversation-a": [],
+        "conversation-b": [
+            {
+                "scopeId": "conversation-b",
+                "sequence": 1,
+                "width": 80,
+                "height": 20,
+            }
+        ],
+    }
+
+    await surfaces["conversation-a"].close()
+    await surfaces["conversation-b"].close()
+    assert requests[-2:] == [
+        (
+            "kodelet.ui.surface.close",
+            {"id": "shared", "sequence": 2, "scopeId": "conversation-a"},
+        ),
+        (
+            "kodelet.ui.surface.close",
+            {"id": "shared", "sequence": 2, "scopeId": "conversation-b"},
+        ),
+    ]
 
 
 @pytest.mark.asyncio
@@ -234,15 +429,128 @@ async def test_surface_ids_remain_exclusive_until_close_finishes() -> None:
         "kodelet.ui.surface.open",
     ]
     assert [
-        params.get("sequence", params.get("frame", {}).get("sequence"))
-        for _, params in requests
+        params.get("sequence", params.get("frame", {}).get("sequence")) for _, params in requests
     ] == [1, 2, 3]
     assert opened_surface is not None
     await opened_surface.close()
     assert requests[-1] == (
         "kodelet.ui.surface.close",
-        {"id": "singleton", "sequence": 4},
+        {"id": "singleton", "sequence": 4, "scopeId": ""},
     )
+
+
+@pytest.mark.asyncio
+async def test_failed_surface_close_keeps_ownership_and_can_be_retried() -> None:
+    requests: list[tuple[str, Any]] = []
+    close_attempts = 0
+
+    class FakeRPC:
+        async def request(self, method: str, params: Any | None = None) -> Any:
+            nonlocal close_attempts
+            requests.append((method, params))
+            if method == "kodelet.ui.surface.close":
+                close_attempts += 1
+                if close_attempts == 1:
+                    raise RuntimeError("close failed")
+            return {"accepted": True}
+
+    ext = Extension()
+
+    @ext.command("retry-close", description="Retry a failed surface close")
+    async def retry_close(_input: Any, ctx: CommandContext) -> CommandResult:
+        surface = await ctx.ui.open_surface({"id": "retryable"})
+        with pytest.raises(RuntimeError, match="close failed"):
+            await surface.close()
+        with pytest.raises(RuntimeError, match="already open, opening, or closing"):
+            await ctx.ui.open_surface({"id": "retryable"})
+        await surface.close()
+        replacement = await ctx.ui.open_surface({"id": "retryable"})
+        await replacement.close()
+        return {"action": "respond", "response": "closed"}
+
+    harness = await create_test_harness(ext, FakeRPC())
+    harness.initialize({"capabilities": {"ui": {"surfaces": True}}})
+    await harness.execute_command(
+        {
+            "name": "retry-close",
+            "invocation": {
+                "raw": "/retry-close",
+                "commandName": "retry-close",
+                "args": [],
+                "flags": {},
+            },
+        }
+    )
+
+    assert [method for method, _ in requests] == [
+        "kodelet.ui.surface.open",
+        "kodelet.ui.surface.close",
+        "kodelet.ui.surface.close",
+        "kodelet.ui.surface.open",
+        "kodelet.ui.surface.close",
+    ]
+    assert [
+        params.get("sequence", params.get("frame", {}).get("sequence")) for _, params in requests
+    ] == [1, 2, 3, 4, 5]
+
+
+@pytest.mark.asyncio
+async def test_surface_update_during_pending_close_does_not_overtake_close() -> None:
+    requests: list[tuple[str, Any]] = []
+    notifications: list[tuple[str, Any]] = []
+    close_response: asyncio.Future[dict[str, bool]] = asyncio.get_running_loop().create_future()
+    close_started = asyncio.Event()
+
+    class FakeRPC:
+        async def request(self, method: str, params: Any | None = None) -> Any:
+            requests.append((method, params))
+            if method == "kodelet.ui.surface.close":
+                close_started.set()
+                return await close_response
+            return {"accepted": True}
+
+        async def notify(self, method: str, params: Any | None = None) -> None:
+            notifications.append((method, params))
+
+    opened_surface: UISurface | None = None
+    ext = Extension()
+
+    @ext.command("close-order", description="Keep close ordering stable")
+    async def close_order(_input: Any, ctx: CommandContext) -> CommandResult:
+        nonlocal opened_surface
+        opened_surface = await ctx.ui.open_surface({"id": "ordered"})
+        return {"action": "respond", "response": "opened"}
+
+    harness = await create_test_harness(ext, FakeRPC())
+    harness.initialize({"capabilities": {"ui": {"surfaces": True}}})
+    await harness.execute_command(
+        {
+            "name": "close-order",
+            "invocation": {
+                "raw": "/close-order",
+                "commandName": "close-order",
+                "args": [],
+                "flags": {},
+            },
+        }
+    )
+
+    assert opened_surface is not None
+    close_task = asyncio.create_task(opened_surface.close())
+    await close_started.wait()
+    opened_surface.update(["must not overtake close"])
+    await _settle_event_loop()
+
+    assert notifications == []
+    assert requests[-1] == (
+        "kodelet.ui.surface.close",
+        {"id": "ordered", "sequence": 2, "scopeId": ""},
+    )
+
+    close_response.set_result({"accepted": True})
+    await close_task
+    await _settle_event_loop()
+    assert notifications == []
 
 
 @pytest.mark.asyncio
@@ -299,11 +607,19 @@ async def test_surface_frames_keep_one_write_in_flight_and_latest_pending() -> N
     assert notifications == [
         (
             "kodelet.ui.surface.frame",
-            {"id": "bounded", "frame": {"sequence": 2, "lines": ["frame 1"]}},
+            {
+                "id": "bounded",
+                "frame": {"sequence": 2, "lines": ["frame 1"]},
+                "scopeId": "",
+            },
         ),
         (
             "kodelet.ui.surface.frame",
-            {"id": "bounded", "frame": {"sequence": 3, "lines": ["frame 3"]}},
+            {
+                "id": "bounded",
+                "frame": {"sequence": 3, "lines": ["frame 3"]},
+                "scopeId": "",
+            },
         ),
     ]
 
@@ -459,8 +775,7 @@ async def test_persistent_ui_ids_validate_before_routing_or_sequence_allocation(
         "kodelet.ui.surface.close",
     ]
     assert [
-        params.get("sequence", params.get("frame", {}).get("sequence"))
-        for _, params in requests
+        params.get("sequence", params.get("frame", {}).get("sequence")) for _, params in requests
     ] == [1, 1, 2]
 
 
@@ -481,9 +796,7 @@ async def test_persistent_ui_frame_collections_require_lists() -> None:
             await ctx.ui.set_widget("status", cast(Any, "ready"))
         await ctx.ui.set_widget("status", ["ready"])
         with pytest.raises(TypeError, match="frame lines must be a list"):
-            await ctx.ui.open_surface(
-                {"id": "game", "initialLines": cast(Any, "loading")}
-            )
+            await ctx.ui.open_surface({"id": "game", "initialLines": cast(Any, "loading")})
         surface = await ctx.ui.open_surface({"id": "game"})
         with pytest.raises(TypeError, match="frame lines must be a list"):
             surface.update(cast(Any, "updated"))
@@ -510,8 +823,7 @@ async def test_persistent_ui_frame_collections_require_lists() -> None:
         "kodelet.ui.surface.close",
     ]
     assert [
-        params.get("sequence", params.get("frame", {}).get("sequence"))
-        for _, params in requests
+        params.get("sequence", params.get("frame", {}).get("sequence")) for _, params in requests
     ] == [1, 1, 2]
 
 
@@ -555,8 +867,7 @@ async def test_rejected_surface_open_releases_ownership_and_preserves_sequence()
         "kodelet.ui.surface.close",
     ]
     assert [
-        params.get("sequence", params.get("frame", {}).get("sequence"))
-        for _, params in requests
+        params.get("sequence", params.get("frame", {}).get("sequence")) for _, params in requests
     ] == [1, 2, 3]
 
 
