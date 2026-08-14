@@ -307,8 +307,12 @@ async def test_command_validation_can_pass_to_next_route() -> None:
         target: str
 
     @ext.command("review", description="Review code", input_schema=ReviewInput)
-    async def review(input: ReviewInput, _ctx: Any) -> dict[str, str]:
-        return {"action": "runAgent", "prompt": f"Review {input.target}"}
+    async def review(input: ReviewInput, _ctx: Any) -> CommandResult:
+        return {
+            "action": "runAgent",
+            "prompt": f"Review {input.target}",
+            "display": f"Please review {input.target}",
+        }
 
     harness = await create_test_harness(ext)
     result = await harness.execute_command(
@@ -319,6 +323,24 @@ async def test_command_validation_can_pass_to_next_route() -> None:
         }
     )
     assert result == {"action": "pass"}
+
+    valid = await harness.execute_command(
+        {
+            "name": "review",
+            "input": {"target": "HEAD"},
+            "invocation": {
+                "raw": "/review target=HEAD",
+                "commandName": "review",
+                "args": ["target=HEAD"],
+                "flags": {"target": "HEAD"},
+            },
+        }
+    )
+    assert valid == {
+        "action": "runAgent",
+        "prompt": "Review HEAD",
+        "display": "Please review HEAD",
+    }
 
 
 @pytest.mark.asyncio

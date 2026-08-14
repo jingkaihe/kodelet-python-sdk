@@ -113,6 +113,7 @@ async def test_review_example_registers_recipe_command(tmp_path: Path) -> None:
 
     assert result["action"] == "runAgent"
     assert result["recipeName"] == "review"
+    assert result["display"] == "Please review HEAD"
     assert "Review the code changes relative to `HEAD`" in result["prompt"]
     assert "tests" in result["prompt"]
 

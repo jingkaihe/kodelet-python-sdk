@@ -88,6 +88,7 @@ class CommandRunAgentResult(TypedDict):
     action: Literal["runAgent"]
     prompt: str
     recipeName: NotRequired[str]
+    display: NotRequired[str]
 
 
 CommandResult: TypeAlias = CommandPassResult | CommandRespondResult | CommandRunAgentResult

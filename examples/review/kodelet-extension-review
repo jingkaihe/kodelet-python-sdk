@@ -39,6 +39,7 @@ async def review_changes(input: ReviewChangesInput, ctx: CommandContext) -> Comm
     return {
         "action": "runAgent",
         "recipeName": "review",
+        "display": f"Please review {input.target}",
         "prompt": render_template(
             prompt_template,
             {

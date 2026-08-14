@@ -133,7 +133,7 @@ session = await client.create_session(
 - `@ext.on(event, priority=0, timeout_in_sec=None)` registers an event handler such as `session.start`, `tool.call`, `tool.update`, or `agent.end`.
 - `await ext.run()` starts the async stdio runtime; `ext.run_sync()` is a synchronous entrypoint convenience.
 
-Handlers may be synchronous or asynchronous. Tool handlers may return a string, which is converted to `{ "content": ... }`, or a protocol-shaped mapping. Command handlers return `{ "action": "pass" }`, `{ "action": "respond", "response": ... }`, or `{ "action": "runAgent", "prompt": ... }`.
+Handlers may be synchronous or asynchronous. Tool handlers may return a string, which is converted to `{ "content": ... }`, or a protocol-shaped mapping. Command handlers return `{ "action": "pass" }`, `{ "action": "respond", "response": ... }`, or `{ "action": "runAgent", "prompt": ... }`. A `runAgent` result may include optional `display` text to replace the slash command in the visible and persisted user message while keeping `prompt` as the LLM input.
 
 Long-running tool handlers can publish transient accumulated snapshots through their context. Each update replaces the previous snapshot for that tool call; only the handler's return value is persisted or sent back to the model:
 
