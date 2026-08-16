@@ -85,6 +85,28 @@ await client.close()
 
 Each `tool.update` contains the latest accumulated output snapshot, not a new delta. Listeners receive every snapshot. To keep completed responses bounded, `response.events` retains only the latest `tool.update` for each `toolCallId`, followed by the authoritative `tool.result`.
 
+An extension tool can create a child session that inherits the caller's live context. `inherit_context` asks the host to snapshot the in-memory conversation into an isolated fork, excluding the unresolved trailing tool call, and then loads that fork in the child ACP process:
+
+```python
+@ext.tool("delegate", description="Delegate work", input_schema=TaskInput)
+async def delegate(input: TaskInput, ctx: ToolContext) -> str:
+    client = Client()
+    try:
+        session = await client.create_session(
+            inherit_context=ctx,
+            cwd=ctx.cwd,
+            streaming=True,
+        )
+        response = await session.run_and_wait(message=input.task)
+        return response.content
+    finally:
+        await client.close()
+```
+
+The fork preserves provider-native history and the persisted model/provider configuration while leaving the parent conversation unchanged. `inherit_context` is mutually exclusive with both `resume` and `profile`; the inherited conversation's stored profile and provider configuration are loaded by ACP. For lower-level control, `await ctx.fork_conversation()` returns the forked conversation ID, which can be passed to `create_session(resume=...)`.
+
+Live forks require the active tool call to have access to a persistent in-memory conversation. `fork_conversation()` raises `ConversationForkUnavailableError` when the host or invocation cannot provide one, such as a run with persistence disabled or a runner-placed tool. Extensions that can operate without inherited context may catch that specific error and fall back to creating a fresh profile-based session; other host RPC errors indicate a real snapshot or persistence failure and should be surfaced.
+
 Agent sessions can expose in-process Python extensions for that session. Inline extensions are served through a temporary JSON-RPC bridge and are removed when the session closes.
 
 ```python

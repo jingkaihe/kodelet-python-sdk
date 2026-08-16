@@ -8,7 +8,12 @@ from collections.abc import Callable, Mapping
 from typing import Any, Protocol, cast
 
 from .api import Entrypoint, Extension, create_extension_host
-from .context import HostRPCClient, _release_persistent_ui_state, run_with_host_rpc_client
+from .context import (
+    HostRPCClient,
+    HostRPCError,
+    _release_persistent_ui_state,
+    run_with_host_rpc_client,
+)
 
 
 class _StdioRequestState:
@@ -216,7 +221,7 @@ class StdioHostRPCClient(HostRPCClient):
             return True
         if error := response.get("error"):
             if isinstance(error, Mapping):
-                future.set_exception(RuntimeError(str(error.get("message") or "JSON-RPC error")))
+                future.set_exception(HostRPCError(error))
             else:
                 future.set_exception(RuntimeError("JSON-RPC error"))
         else:

@@ -27,6 +27,7 @@ from kodelet_sdk.agent.bridge import (
     _BridgeRequestState,
     _ConnectionHostRPCClient,
 )
+from kodelet_sdk.agent.rpc import ACPRPCClient
 
 
 class FakeACPProcess(SpawnedProcess):
@@ -263,6 +264,126 @@ async def test_inline_profile_isolation_filters_ambient_kodelet_environment(
     assert env["KODELET_PROVIDER"] == "explicit-provider"
     assert env["KODELET_CONFIG_FILE_MODE"] == "isolated"
     await client.close()
+
+
+@pytest.mark.asyncio
+async def test_session_can_inherit_tool_context_through_live_fork() -> None:
+    processes: list[FakeACPProcess] = []
+
+    class InheritedContext:
+        async def fork_conversation(self) -> str:
+            return "forked-conversation"
+
+    def spawn(_command: str, _args: Sequence[str], _options: SpawnOptions) -> FakeACPProcess:
+        process = FakeACPProcess()
+        processes.append(process)
+        return process
+
+    client = Client(spawn=spawn)
+    session = await client.create_session(
+        inherit_context=cast(Any, InheritedContext()),
+        cwd="/workspace",
+    )
+
+    assert session.id == "forked-conversation"
+    assert [request["method"] for request in processes[0].requests] == [
+        "initialize",
+        "session/load",
+    ]
+    assert processes[0].requests[1]["params"] == {
+        "sessionId": "forked-conversation",
+        "cwd": "/workspace",
+    }
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_session_cancellation_while_forking_closes_spawned_process() -> None:
+    processes: list[FakeACPProcess] = []
+    fork_started = asyncio.Event()
+
+    class InheritedContext:
+        async def fork_conversation(self) -> str:
+            fork_started.set()
+            await asyncio.Event().wait()
+            return "unreachable"
+
+    def spawn(_command: str, _args: Sequence[str], _options: SpawnOptions) -> FakeACPProcess:
+        process = FakeACPProcess()
+        processes.append(process)
+        return process
+
+    client = Client(spawn=spawn)
+    create_task = asyncio.create_task(
+        client.create_session(inherit_context=cast(Any, InheritedContext()))
+    )
+    await asyncio.wait_for(fork_started.wait(), timeout=1)
+
+    create_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await create_task
+
+    require_process = processes[0]
+    assert require_process._closed.is_set()
+
+
+@pytest.mark.asyncio
+async def test_session_rejects_resume_with_inherited_context() -> None:
+    class InheritedContext:
+        async def fork_conversation(self) -> str:
+            return "forked-conversation"
+
+    client = Client()
+    with pytest.raises(ValueError, match="resume and inherit_context"):
+        await client.create_session(
+            resume="existing-conversation",
+            inherit_context=cast(Any, InheritedContext()),
+        )
+
+
+@pytest.mark.asyncio
+async def test_session_rejects_profile_with_inherited_context() -> None:
+    class InheritedContext:
+        async def fork_conversation(self) -> str:
+            return "forked-conversation"
+
+    client = Client()
+    with pytest.raises(ValueError, match="profile and inherit_context"):
+        await client.create_session(
+            profile="other-profile",
+            inherit_context=cast(Any, InheritedContext()),
+        )
+
+
+@pytest.mark.asyncio
+async def test_acp_rpc_cancellation_discards_late_response_and_keeps_reader_alive() -> None:
+    class DeferredLoadProcess(FakeACPProcess):
+        def __init__(self) -> None:
+            super().__init__()
+            self.load_started = asyncio.Event()
+            self.load_request: Mapping[str, Any] | None = None
+
+        async def _handle_request(self, request: Mapping[str, Any]) -> None:
+            if request.get("method") == "session/load":
+                self.load_request = request
+                self.load_started.set()
+                return
+            await super()._handle_request(request)
+
+    process = DeferredLoadProcess()
+    rpc = ACPRPCClient(process)
+    load_task = asyncio.create_task(rpc.load_session("forked-conversation", "/workspace"))
+    await asyncio.wait_for(process.load_started.wait(), timeout=1)
+
+    load_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await load_task
+    assert rpc._pending == {}
+
+    assert process.load_request is not None
+    process._respond(process.load_request["id"], {})
+    assert await rpc.create_session("/workspace") == "conv-1"
+    await rpc.close()
 
 
 @pytest.mark.asyncio

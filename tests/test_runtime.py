@@ -15,6 +15,7 @@ from kodelet_sdk import (
     CommandResult,
     Extension,
     Field,
+    HostRPCError,
     ToolContext,
     UIContext,
     UISurfaceInputEvent,
@@ -26,6 +27,25 @@ from kodelet_sdk.runtime import (
     _StdioRequestState,
     run_stdio_server,
 )
+
+
+@pytest.mark.asyncio
+async def test_stdio_client_preserves_host_rpc_error_code() -> None:
+    writer = MemoryWriter()
+    client = StdioHostRPCClient(writer)
+    task = asyncio.create_task(client.request("kodelet.conversation.fork"))
+    request = await writer.read_frame()
+
+    assert client.handle_response(
+        {
+            "jsonrpc": "2.0",
+            "id": request["id"],
+            "error": {"code": -32004, "message": "fork unavailable"},
+        }
+    )
+    with pytest.raises(HostRPCError, match="fork unavailable") as exc_info:
+        await task
+    assert exc_info.value.code == -32004
 
 
 @pytest.mark.asyncio

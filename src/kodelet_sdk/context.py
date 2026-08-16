@@ -235,6 +235,20 @@ class UIInputResponse(TypedDict, total=False):
     reason: str
 
 
+class HostRPCError(RuntimeError):
+    """JSON-RPC error returned by the Kodelet extension host."""
+
+    def __init__(self, error: Mapping[str, Any]) -> None:
+        super().__init__(str(error.get("message") or "JSON-RPC error"))
+        code = error.get("code")
+        self.code = code if isinstance(code, int) else 0
+        self.data = error.get("data")
+
+
+class ConversationForkUnavailableError(RuntimeError):
+    """The active tool invocation cannot provide a live conversation fork."""
+
+
 class HostRPCClient(Protocol):
     """Reverse-RPC client used by extension contexts to call the Kodelet host.
 
@@ -261,6 +275,7 @@ _persistent_ui_states_by_id: dict[
     tuple[weakref.ReferenceType[Any], _PersistentUIState],
 ] = {}
 _HOST_RPC_CLIENT_UNSET = object()
+_CONVERSATION_FORK_UNAVAILABLE_CODE = -32004
 
 
 _active_host_rpc_client: HostRPCClient | None = None
@@ -1039,12 +1054,7 @@ class _UISurfaceHandle:
 
     def _start_frame_flush(self) -> None:
         self._frame_scheduled = False
-        if (
-            self._closed
-            or self._closing
-            or self._frame_in_flight
-            or self._pending_lines is None
-        ):
+        if self._closed or self._closing or self._frame_in_flight or self._pending_lines is None:
             return
         lines = self._pending_lines
         self._pending_lines = None
@@ -1361,6 +1371,7 @@ class ToolContext(SharedContext):
     ) -> None:
         super().__init__(init, context)
         self._tool_updates_enabled = _tool_updates_supported(init)
+        self._conversation_fork_enabled = _conversation_fork_supported(init)
 
     async def update(
         self,
@@ -1388,6 +1399,42 @@ class ToolContext(SharedContext):
         if data is not None:
             payload["data"] = data
         await client.request("kodelet.tool.update", payload)
+
+    async def fork_conversation(self) -> str:
+        """Create an isolated persisted fork of the caller's live context.
+
+        The host snapshots the active in-memory conversation before the current
+        tool result is appended, removes the unresolved trailing tool call, and
+        returns a new conversation ID suitable for ``Client.create_session``.
+
+        Raises:
+            ConversationForkUnavailableError: If the host or active invocation
+                cannot provide a live conversation fork.
+            RuntimeError: If the host fails to create a fork or returns an invalid
+                response.
+        """
+
+        if not self._conversation_fork_enabled:
+            raise ConversationForkUnavailableError(
+                "Live conversation forking is not supported by this Kodelet host"
+            )
+        client = self._host_rpc_client
+        if client is None:
+            raise ConversationForkUnavailableError(
+                "Live conversation forking requires an active tool request"
+            )
+        try:
+            response = await client.request("kodelet.conversation.fork")
+        except HostRPCError as exc:
+            if exc.code == _CONVERSATION_FORK_UNAVAILABLE_CODE:
+                raise ConversationForkUnavailableError(str(exc)) from exc
+            raise
+        if not isinstance(response, Mapping):
+            raise RuntimeError("Invalid conversation fork response from Kodelet host")
+        conversation_id = response.get("conversationId")
+        if not isinstance(conversation_id, str) or not conversation_id.strip():
+            raise RuntimeError("Conversation fork response did not include a conversation ID")
+        return conversation_id.strip()
 
 
 class EventContext(SharedContext):
@@ -1453,6 +1500,16 @@ def _tool_updates_supported(init: Mapping[str, Any] | None) -> bool:
         return True
     tools = capabilities.get("tools")
     return isinstance(tools, Mapping) and tools.get("updates") is True
+
+
+def _conversation_fork_supported(init: Mapping[str, Any] | None) -> bool:
+    if not init:
+        return False
+    capabilities = init.get("capabilities")
+    if not isinstance(capabilities, Mapping):
+        return False
+    conversations = capabilities.get("conversations")
+    return isinstance(conversations, Mapping) and conversations.get("fork") is True
 
 
 def _default_data_dir(extension_id: str) -> str:

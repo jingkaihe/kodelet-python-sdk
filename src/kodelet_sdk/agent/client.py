@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Unpack, cast
 
 from ..api import Entrypoint, Extension
+from ..context import ToolContext
 from .bridge import InMemoryExtensionBridge, TempConfig
 from .rpc import ACPRPCClient
 from .session import Session
@@ -65,14 +66,18 @@ class Client:
         """
 
         merged_options: dict[str, Any] = {**dict(options or {}), **kwargs}
+        resume = merged_options.get("resume")
+        inherit_context = cast(ToolContext | None, merged_options.get("inherit_context"))
+        if isinstance(resume, str) and resume and inherit_context is not None:
+            raise ValueError("resume and inherit_context cannot be used together")
+        if merged_options.get("profile") is not None and inherit_context is not None:
+            raise ValueError("profile and inherit_context cannot be used together")
         extensions = cast(
             Sequence[Entrypoint | Extension] | None,
             merged_options.get("extensions"),
         )
         ui = cast(AgentUIHandlers | None, merged_options.get("ui"))
-        extension_transport = _normalize_bridge_transport(
-            merged_options.get("extension_transport")
-        )
+        extension_transport = _normalize_bridge_transport(merged_options.get("extension_transport"))
         bridge = (
             await InMemoryExtensionBridge.create(
                 extensions,
@@ -100,7 +105,8 @@ class Client:
             )
             rpc = ACPRPCClient(process)
             await rpc.initialize()
-            resume = merged_options.get("resume")
+            if inherit_context is not None:
+                resume = await inherit_context.fork_conversation()
             session_id = (
                 await rpc.load_session(str(resume), cwd)
                 if isinstance(resume, str) and resume
@@ -117,7 +123,7 @@ class Client:
             )
             self._sessions.add(session)
             return session
-        except Exception:
+        except BaseException:
             if rpc is not None:
                 await rpc.close()
             if bridge is not None:

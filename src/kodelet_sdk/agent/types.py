@@ -6,7 +6,13 @@ from typing import Any, Literal, Protocol, TypeAlias, TypedDict, cast
 
 from .._utils import AttrDict
 from ..api import Entrypoint, Extension
-from ..context import UIConfirmRequest, UIInputRequest, UINotifyRequest, UISelectRequest
+from ..context import (
+    ToolContext,
+    UIConfirmRequest,
+    UIInputRequest,
+    UINotifyRequest,
+    UISelectRequest,
+)
 
 ProfileInput: TypeAlias = Mapping[str, Any]
 BridgeTransport: TypeAlias = Literal["unix", "tcp"]
@@ -72,6 +78,7 @@ class CreateSessionOptions(TypedDict, total=False):
     streaming: bool
     cwd: str
     resume: str
+    inherit_context: ToolContext
     max_turns: int
     extension_transport: BridgeTransport
     ui: AgentUIHandlers

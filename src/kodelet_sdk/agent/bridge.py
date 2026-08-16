@@ -14,6 +14,7 @@ from .._utils import maybe_await
 from ..api import Entrypoint, Extension, create_extension_host
 from ..context import (
     HostRPCClient,
+    HostRPCError,
     UIConfirmRequest,
     UIInputRequest,
     UINotifyRequest,
@@ -542,7 +543,7 @@ class ExtensionSocketServer:
             return
         error = response.get("error")
         if isinstance(error, Mapping):
-            pending.set_exception(RuntimeError(str(error.get("message") or "JSON-RPC error")))
+            pending.set_exception(HostRPCError(error))
         else:
             pending.set_result(response.get("result"))
 

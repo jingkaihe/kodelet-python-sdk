@@ -83,6 +83,7 @@ class ACPRPCClient:
         if self._closed:
             return
         self._closed = True
+        self._reject_pending(RuntimeError("kodelet acp process closed"))
         self._process.terminate()
         try:
             await asyncio.wait_for(self._process.wait(), timeout=1)
@@ -106,10 +107,9 @@ class ACPRPCClient:
             await self._write(
                 {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
             )
-        except Exception:
+            return await future
+        finally:
             self._pending.pop(request_id, None)
-            raise
-        return await future
 
     def notify(self, method: str, params: Any | None = None) -> None:
         if not self._closed:
@@ -186,6 +186,8 @@ class ACPRPCClient:
         pending = self._pending.pop(message_id, None)
         if pending is None:
             return
+        if pending.done():
+            return
         error = message.get("error")
         if isinstance(error, Mapping):
             pending.set_exception(RPCError(error))
@@ -210,7 +212,8 @@ class ACPRPCClient:
 
     def _reject_pending(self, error: Exception) -> None:
         for pending in self._pending.values():
-            pending.set_exception(error)
+            if not pending.done():
+                pending.set_exception(error)
         self._pending.clear()
 
 

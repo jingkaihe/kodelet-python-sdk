@@ -14,10 +14,12 @@ from kodelet_sdk import (
     BaseModel,
     CommandContext,
     CommandResult,
+    ConversationForkUnavailableError,
     EventContext,
     EventName,
     EventResult,
     Extension,
+    HostRPCError,
     Jinja2,
     JSONSchema,
     Pydantic,
@@ -398,9 +400,7 @@ async def test_tool_update_handler_can_replace_accumulated_snapshot() -> None:
         return {"output": {"content": "[redacted]"}}
 
     harness = await create_test_harness(ext)
-    assert harness.initialize()["subscriptions"] == [
-        {"event": "tool.update", "priority": 0}
-    ]
+    assert harness.initialize()["subscriptions"] == [{"event": "tool.update", "priority": 0}]
     result = await harness.handle_event(
         {
             "id": "evt",
@@ -556,9 +556,7 @@ async def test_context_helpers_cover_workspace_storage_process_env_and_ui(
         {"message": "Done"},
     ]
 
-    assert await harness.execute_tool({"name": "stream", "input": {}}) == {
-        "content": "done"
-    }
+    assert await harness.execute_tool({"name": "stream", "input": {}}) == {"content": "done"}
     assert fake_rpc.requests[-1] == (
         "kodelet.tool.update",
         {"content": "Searching code", "data": {"step": 1}},
@@ -584,10 +582,87 @@ async def test_tool_updates_are_ignored_without_host_capability() -> None:
 
     harness = await create_test_harness(ext, FakeRPC())
     harness.initialize({"capabilities": {}})
-    assert await harness.execute_tool({"name": "stream", "input": {}}) == {
-        "content": "done"
-    }
+    assert await harness.execute_tool({"name": "stream", "input": {}}) == {"content": "done"}
     assert requests == []
+
+
+@pytest.mark.asyncio
+async def test_tool_context_forks_live_conversation_when_supported() -> None:
+    requests: list[tuple[str, Any | None]] = []
+
+    class FakeRPC:
+        async def request(self, method: str, params: Any | None = None) -> Any:
+            requests.append((method, params))
+            return {"conversationId": "forked-conversation"}
+
+    ext = Extension()
+
+    @ext.tool("fork", description="Fork context", input_schema={})
+    async def fork(_input: Any, ctx: ToolContext) -> str:
+        return await ctx.fork_conversation()
+
+    harness = await create_test_harness(ext, FakeRPC())
+    harness.initialize({"capabilities": {"conversations": {"fork": True}}})
+
+    assert await harness.execute_tool({"name": "fork", "input": {}}) == {
+        "content": "forked-conversation"
+    }
+    assert requests == [("kodelet.conversation.fork", None)]
+
+
+@pytest.mark.asyncio
+async def test_tool_context_rejects_conversation_fork_without_host_capability() -> None:
+    ext = Extension()
+
+    @ext.tool("fork", description="Fork context", input_schema={})
+    async def fork(_input: Any, ctx: ToolContext) -> str:
+        with pytest.raises(ConversationForkUnavailableError, match="not supported"):
+            await ctx.fork_conversation()
+        return "unsupported"
+
+    harness = await create_test_harness(ext)
+    harness.initialize({"capabilities": {}})
+    assert await harness.execute_tool({"name": "fork", "input": {}}) == {"content": "unsupported"}
+
+
+@pytest.mark.asyncio
+async def test_tool_context_translates_fork_unavailable_host_error() -> None:
+    class FakeRPC:
+        async def request(self, method: str, params: Any | None = None) -> Any:
+            del method, params
+            raise HostRPCError({"code": -32004, "message": "fork unavailable"})
+
+    ext = Extension()
+
+    @ext.tool("fork", description="Fork context", input_schema={})
+    async def fork(_input: Any, ctx: ToolContext) -> str:
+        with pytest.raises(ConversationForkUnavailableError, match="fork unavailable"):
+            await ctx.fork_conversation()
+        return "unavailable"
+
+    harness = await create_test_harness(ext, FakeRPC())
+    harness.initialize({"capabilities": {"conversations": {"fork": True}}})
+    assert await harness.execute_tool({"name": "fork", "input": {}}) == {"content": "unavailable"}
+
+
+@pytest.mark.asyncio
+async def test_tool_context_preserves_real_fork_host_error() -> None:
+    class FakeRPC:
+        async def request(self, method: str, params: Any | None = None) -> Any:
+            del method, params
+            raise HostRPCError({"code": -32000, "message": "disk full"})
+
+    ext = Extension()
+
+    @ext.tool("fork", description="Fork context", input_schema={})
+    async def fork(_input: Any, ctx: ToolContext) -> str:
+        with pytest.raises(HostRPCError, match="disk full"):
+            await ctx.fork_conversation()
+        return "failed"
+
+    harness = await create_test_harness(ext, FakeRPC())
+    harness.initialize({"capabilities": {"conversations": {"fork": True}}})
+    assert await harness.execute_tool({"name": "fork", "input": {}}) == {"content": "failed"}
 
 
 @pytest.mark.asyncio
