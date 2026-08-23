@@ -23,6 +23,7 @@ from kodelet_sdk import (
     Jinja2,
     JSONSchema,
     Pydantic,
+    ShortcutContext,
     ToolCallEvent,
     ToolContext,
     ToolExecutionResult,
@@ -119,6 +120,16 @@ def test_public_typing_surface() -> None:
         )
         assert_type(ask_result, CoroutineType[Any, Any, CommandResult])
 
+    @ext.shortcut("ctrl+alt+r", description="Refresh project context")
+    async def refresh(ctx: ShortcutContext) -> None:
+        assert_type(ctx.cwd, str)
+
+    refresh_handler: Callable[[ShortcutContext], Awaitable[None]] = refresh
+    assert refresh_handler is refresh
+    if TYPE_CHECKING:
+        refresh_result = refresh(ShortcutContext(None))
+        assert_type(refresh_result, CoroutineType[Any, Any, None])
+
     @ext.on("tool.call")
     def approve(event: ToolCallEvent, _ctx: EventContext) -> EventResult:
         assert_type(event.tool.name, str)
@@ -168,6 +179,8 @@ def test_public_typing_surface() -> None:
 
 @pytest.mark.asyncio
 async def test_registers_tools_commands_events_and_executes_handlers() -> None:
+    shortcut_context: dict[str, str | None] = {}
+
     async def entrypoint(ext: Extension) -> None:
         ext.set_metadata(name="weather", version="0.1.0")
 
@@ -199,6 +212,18 @@ async def test_registers_tools_commands_events_and_executes_handlers() -> None:
                 "response": f"{ctx.input['commandName']}: {'healthy' if input.verbose else 'ok'}",
             }
 
+        @ext.shortcut("option+control+r", description="Refresh project context")
+        async def refresh(ctx: ShortcutContext) -> None:
+            shortcut_context.update(
+                {
+                    "conversation_id": ctx.conversation_id,
+                    "cwd": ctx.cwd,
+                    "profile": ctx.profile,
+                    "recipe_name": ctx.recipe_name,
+                    "invoked_by": ctx.invoked_by,
+                }
+            )
+
         @ext.on("tool.call", priority=10, timeout_in_sec=5)
         async def rewrite_weather(event: Any, _ctx: Any) -> dict[str, Any] | None:
             if event.tool.name == "get_weather":
@@ -219,6 +244,7 @@ async def test_registers_tools_commands_events_and_executes_handlers() -> None:
     assert init["tools"][0]["inputSchema"]["type"] == "object"
     assert init["commands"][0]["name"] == "doctor"
     assert init["commands"][0]["timeoutInSec"] == 30
+    assert init["shortcuts"] == [{"key": "ctrl+alt+r", "description": "Refresh project context"}]
     assert init["subscriptions"] == [
         {"event": "tool.call", "priority": 10, "timeoutInSec": 5},
         {"event": "agent.end", "priority": 0},
@@ -243,6 +269,29 @@ async def test_registers_tools_commands_events_and_executes_handlers() -> None:
     )
     assert command_result == {"action": "respond", "response": "doctor: healthy"}
 
+    assert (
+        await harness.execute_shortcut(
+            {
+                "key": "ALT+CTRL+R",
+                "context": {
+                    "conversationId": "conv-shortcut",
+                    "cwd": os.getcwd(),
+                    "profile": "default",
+                    "recipeName": "review",
+                    "invokedBy": "main",
+                },
+            }
+        )
+        is None
+    )
+    assert shortcut_context == {
+        "conversation_id": "conv-shortcut",
+        "cwd": os.getcwd(),
+        "profile": "default",
+        "recipe_name": "review",
+        "invoked_by": "main",
+    }
+
     event_result = await harness.handle_event(
         {
             "id": "evt_1",
@@ -260,6 +309,87 @@ async def test_registers_tools_commands_events_and_executes_handlers() -> None:
         }
     )
     assert agent_end_result == {"followUpMessages": ["inspect tests"]}
+
+
+@pytest.mark.parametrize(
+    ("shortcut", "expected"),
+    [
+        ("Control+R", "ctrl+r"),
+        ("option+p", "alt+p"),
+        ("ALT+5", "alt+5"),
+        ("option+control+r", "ctrl+alt+r"),
+        ("F12", "f12"),
+    ],
+)
+def test_normalizes_supported_shortcut_forms(shortcut: str, expected: str) -> None:
+    ext = Extension()
+
+    def handler(_ctx: ShortcutContext) -> None:
+        return None
+
+    ext.register_shortcut(shortcut, handler=handler)
+    assert ext.initialize({"extension": {"id": "shortcut"}})["shortcuts"] == [{"key": expected}]
+
+
+def test_rejects_duplicate_shortcut_registrations() -> None:
+    ext = Extension()
+
+    def handler(_ctx: ShortcutContext) -> None:
+        return None
+
+    ext.register_shortcut("ctrl+alt+r", handler=handler)
+    with pytest.raises(
+        ValueError, match=r"Duplicate extension shortcut registration: ctrl\+alt\+r"
+    ):
+        ext.register_shortcut("option+control+r", handler=handler)
+
+
+@pytest.mark.parametrize(
+    "shortcut",
+    [
+        "",
+        "r",
+        "shift+r",
+        "ctrl+shift+r",
+        "command+r",
+        "ctrl+r extra",
+        "ctrl+ctrl+r",
+        "ctrl+i",
+        "ctrl+m",
+        "ctrl+alt+i",
+        "ctrl+1",
+        "alt+space",
+        "alt+f5",
+        "ctrl+up",
+        "f13",
+        "ctrl+unknown",
+        "ctrl+é",
+        "alt+İ",
+        "alt+K",
+    ],
+)
+def test_rejects_unsupported_and_terminal_ambiguous_shortcuts(shortcut: str) -> None:
+    ext = Extension()
+
+    def handler(_ctx: ShortcutContext) -> None:
+        return None
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            r"Extension shortcut key is required|"
+            r"Invalid extension shortcut|"
+            r"Unsupported extension shortcut"
+        ),
+    ):
+        ext.register_shortcut(shortcut, handler=handler)
+
+
+@pytest.mark.asyncio
+async def test_execute_shortcut_rejects_unknown_key() -> None:
+    harness = await create_test_harness(Extension())
+    with pytest.raises(ValueError, match=r"Unknown extension shortcut: ctrl\+r"):
+        await harness.execute_shortcut({"key": "ctrl+r"})
 
 
 @pytest.mark.asyncio
@@ -416,6 +546,28 @@ async def test_tool_update_handler_can_replace_accumulated_snapshot() -> None:
         }
     )
     assert result == {"output": {"content": "[redacted]"}}
+
+
+@pytest.mark.asyncio
+async def test_agent_init_can_disable_tools_using_invoked_by_context() -> None:
+    ext = Extension()
+
+    @ext.on("agent.init")
+    async def disable_recursive_tool(_event: Any, ctx: EventContext) -> EventResult:
+        assert ctx.invoked_by == "subagent"
+        return {"tools": {"disable": ["subagent"]}}
+
+    harness = await create_test_harness(ext)
+    result = await harness.handle_event(
+        {
+            "id": "evt-agent-init",
+            "event": "agent.init",
+            "payload": {"systemPrompt": "base"},
+            "context": {"invokedBy": "subagent"},
+        }
+    )
+
+    assert result == {"tools": {"disable": ["subagent"], "enable": []}}
 
 
 @pytest.mark.asyncio

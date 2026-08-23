@@ -16,6 +16,7 @@ from kodelet_sdk import (
     CommandResult,
     Extension,
     Profile,
+    ShortcutContext,
     ToolUpdateData,
     UISurfaceInputEvent,
     UISurfaceResizeEvent,
@@ -638,6 +639,7 @@ async def test_extension_bridge_routes_local_ui_handlers(
     extension_transport: BridgeTransport,
 ) -> None:
     selected_values: list[str] = []
+    shortcut_contexts: list[tuple[str | None, str | None]] = []
     extension_root_holder: dict[str, Path] = {}
 
     def spawn(_command: str, _args: Sequence[str], options: SpawnOptions) -> FakeACPProcess:
@@ -659,6 +661,10 @@ async def test_extension_bridge_routes_local_ui_handlers(
             selected = await ctx.ui.select({"title": input.question, "options": input.options})
             selected_values.append(selected or "")
             return selected or "dismissed"
+
+        @ext.shortcut("ctrl+alt+r", description="Refresh project context")
+        async def refresh(ctx: ShortcutContext) -> None:
+            shortcut_contexts.append((ctx.conversation_id, ctx.recipe_name))
 
     client = Client(cwd=tmp_path, spawn=spawn)
     session = await client.create_session(
@@ -691,6 +697,9 @@ async def test_extension_bridge_routes_local_ui_handlers(
     )
     init_response = await _read_frame(process.stdout)
     assert init_response["result"]["name"] == "workspace"
+    assert init_response["result"]["shortcuts"] == [
+        {"key": "ctrl+alt+r", "description": "Refresh project context"}
+    ]
 
     await _write_frame(
         process.stdin,
@@ -719,6 +728,25 @@ async def test_extension_bridge_routes_local_ui_handlers(
     tool_response = await _read_frame(process.stdout)
     assert tool_response["result"] == {"content": "B"}
     assert selected_values == ["B"]
+
+    await _write_frame(
+        process.stdin,
+        {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "extension.shortcut.execute",
+            "params": {
+                "key": "alt+control+r",
+                "context": {
+                    "conversationId": "conv-shortcut",
+                    "recipeName": "review",
+                },
+            },
+        },
+    )
+    shortcut_response = await _read_frame(process.stdout)
+    assert shortcut_response["result"] is None
+    assert shortcut_contexts == [("conv-shortcut", "review")]
 
     process.terminate()
     await process.wait()

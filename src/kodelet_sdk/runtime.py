@@ -398,6 +398,8 @@ async def _dispatch(host: Extension, request: Mapping[str, Any]) -> Any:
         return await host.execute_tool(params)
     if method == "extension.command.execute":
         return await host.execute_command(params)
+    if method == "extension.shortcut.execute":
+        return await host.execute_shortcut(params)
     if method == "extension.event.handle":
         return await host.handle_event(params)
     raise ValueError(f"Unknown JSON-RPC method: {method}")

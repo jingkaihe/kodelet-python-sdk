@@ -70,6 +70,15 @@ class ExtensionTestHarness:
             lambda: self._host.execute_command(params),
         )
 
+    async def execute_shortcut(self, params: Mapping[str, Any]) -> None:
+        """Execute a registered shortcut through the extension host."""
+
+        self._ensure_initialized()
+        await run_with_host_rpc_client(
+            self._host_rpc_client,
+            lambda: self._host.execute_shortcut(params),
+        )
+
     async def handle_event(self, params: Mapping[str, Any]) -> dict[str, Any]:
         """Dispatch an event to registered event handlers."""
 

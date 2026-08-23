@@ -1322,7 +1322,7 @@ def _is_number(value: Any) -> bool:
 
 
 class SharedContext:
-    """Common context passed to tools, commands, and event handlers.
+    """Common context passed to tools, commands, shortcuts, and event handlers.
 
     Attributes mirror the Kodelet call context and include helper namespaces:
     ``storage``, ``path``, ``fs``, ``process``, ``env``, ``log``, and ``ui``.
@@ -1443,6 +1443,12 @@ class EventContext(SharedContext):
     pass
 
 
+class ShortcutContext(SharedContext):
+    """Context passed to shortcut handlers."""
+
+    pass
+
+
 class CommandContext(SharedContext):
     """Context passed to command handlers.
 
@@ -1481,6 +1487,13 @@ def create_event_context(
     context: Mapping[str, Any] | None = None,
 ) -> EventContext:
     return EventContext(init, context)
+
+
+def create_shortcut_context(
+    init: Mapping[str, Any] | None,
+    context: Mapping[str, Any] | None = None,
+) -> ShortcutContext:
+    return ShortcutContext(init, context)
 
 
 def _extension_info(init: Mapping[str, Any] | None) -> Mapping[str, Any]:

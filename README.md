@@ -2,7 +2,7 @@
 
 Python SDK for authoring [Kodelet](https://github.com/jingkaihe/kodelet) extensions.
 
-The SDK speaks Kodelet's JSON-RPC extension protocol over stdio and provides an asyncio-first API for registering tools, commands, and event handlers.
+The SDK speaks Kodelet's JSON-RPC extension protocol over stdio and provides an asyncio-first API for registering tools, commands, native TUI shortcuts, and event handlers.
 
 ## Quick start
 
@@ -152,10 +152,24 @@ session = await client.create_session(
 - `Extension(name=None, version=None)` creates an extension host.
 - `@ext.tool(name=None, description=None, input_schema=None, timeout_in_sec=None)` registers a tool.
 - `@ext.command(name=None, description=None, input_schema=None, aliases=None, kind=None, timeout_in_sec=None)` registers a command.
+- `@ext.shortcut(shortcut, description=None)` registers a native TUI keyboard shortcut handler; `ext.register_shortcut(shortcut, handler=..., description=None)` is the explicit form.
 - `@ext.on(event, priority=0, timeout_in_sec=None)` registers an event handler such as `session.start`, `tool.call`, `tool.update`, or `agent.end`.
 - `await ext.run()` starts the async stdio runtime; `ext.run_sync()` is a synchronous entrypoint convenience.
 
 Handlers may be synchronous or asynchronous. Tool handlers may return a string, which is converted to `{ "content": ... }`, or a protocol-shaped mapping. Command handlers return `{ "action": "pass" }`, `{ "action": "respond", "response": ... }`, or `{ "action": "runAgent", "prompt": ... }`. A `runAgent` result may include optional `display` text to replace the slash command in the visible and persisted user message while keeping `prompt` as the LLM input.
+
+Shortcut handlers receive a `ShortcutContext` with the normal shared workspace, storage, process, environment, logging, and UI helpers. They follow the same asyncio cancellation behavior as other extension handlers. Registration is independent from slash commands: pressing the effective key invokes the handler directly, and validated shortcuts appear in the native TUI's shortcut help.
+
+Supported shortcut identifiers are case-insensitive ASCII single chords: `ctrl+<ASCII letter>`, `alt+<ASCII letter-or-digit>`, `ctrl+alt+<ASCII letter>`, and unmodified `f1` through `f12`. `control` aliases `ctrl`, `option` aliases `alt`, and modifier order does not matter. `ctrl+i` and `ctrl+m`, including Ctrl+Alt variants, are rejected because terminals report them as Tab and Enter. Shift, Command/Meta/Super, modified function keys, punctuation, spaces, non-ASCII characters, and navigation-key combinations are unsupported. The native TUI skips reserved host bindings, reports overrides and extension-to-extension conflicts, and shows only effective registrations. Shortcuts currently execute only in local native `kodelet chat` sessions.
+
+```python
+from kodelet_sdk import ShortcutContext
+
+
+@ext.shortcut("ctrl+alt+r", description="Refresh project context")
+async def refresh(ctx: ShortcutContext) -> None:
+    await ctx.ui.notify("Project context refreshed")
+```
 
 Long-running tool handlers can publish transient accumulated snapshots through their context. Each update replaces the previous snapshot for that tool call; only the handler's return value is persisted or sent back to the model:
 
@@ -330,6 +344,8 @@ async def test_tool():
     result = await harness.execute_tool({"name": "echo", "input": {"text": "hi"}})
     assert result == {"content": "hi"}
 ```
+
+Use `await harness.execute_shortcut({"key": "ctrl+r", "context": {...}})` to invoke a registered shortcut handler in-process.
 
 ## Examples
 

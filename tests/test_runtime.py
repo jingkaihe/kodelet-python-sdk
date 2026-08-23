@@ -16,6 +16,7 @@ from kodelet_sdk import (
     Extension,
     Field,
     HostRPCError,
+    ShortcutContext,
     ToolContext,
     UIContext,
     UISurfaceInputEvent,
@@ -85,6 +86,7 @@ async def test_stdio_client_close_disconnects_open_surface_handles() -> None:
 @pytest.mark.asyncio
 async def test_runtime_serves_json_rpc_and_reverse_host_rpc() -> None:
     ext = Extension(name="rpc")
+    shortcut_contexts: list[tuple[str | None, str | None]] = []
 
     class EchoInput(BaseModel):
         text: str = Field(min_length=1)
@@ -94,6 +96,11 @@ async def test_runtime_serves_json_rpc_and_reverse_host_rpc() -> None:
         await ctx.update("Working", {"step": 1})
         answer = await ctx.ui.input({"title": "Choose"})
         return {"content": f"{input.text.upper()}:{answer}"}
+
+    @ext.shortcut("ctrl+alt+r", description="Refresh project context")
+    async def refresh(ctx: ShortcutContext) -> None:
+        shortcut_contexts.append((ctx.conversation_id, ctx.recipe_name))
+        await ctx.ui.notify("Refreshed")
 
     server_reader = MemoryReader()
     server_writer = MemoryWriter()
@@ -111,21 +118,32 @@ async def test_runtime_serves_json_rpc_and_reverse_host_rpc() -> None:
     )
     assert init["name"] == "rpc"
     assert init["tools"][0]["name"] == "echo"
+    assert init["shortcuts"] == [{"key": "ctrl+alt+r", "description": "Refresh project context"}]
 
     result = await client.call(
         "extension.tool.execute",
         {"name": "echo", "input": {"text": "hello"}, "context": {"cwd": os.getcwd()}},
     )
     assert result == {"content": "HELLO:from-host"}
+    shortcut_result = await client.call(
+        "extension.shortcut.execute",
+        {
+            "key": "alt+control+r",
+            "context": {"conversationId": "conv-shortcut", "recipeName": "review"},
+        },
+    )
+    assert shortcut_result is None
+    assert shortcut_contexts == [("conv-shortcut", "review")]
     assert [request["method"] for request in client.host_requests] == [
         "kodelet.tool.update",
         "kodelet.ui.input",
+        "kodelet.ui.notify",
     ]
     assert client.host_requests[0]["params"] == {
         "content": "Working",
         "data": {"step": 1},
     }
-    assert [request["parentId"] for request in client.host_requests] == [2, 2]
+    assert [request["parentId"] for request in client.host_requests] == [2, 2, 3]
 
     server_reader.close()
     await asyncio.wait_for(task, timeout=1)
@@ -550,6 +568,66 @@ async def test_runtime_cancels_requests_and_blocks_late_reverse_rpc() -> None:
     )
     response = await asyncio.wait_for(server_writer.read_frame(), timeout=1)
     assert response == {"jsonrpc": "2.0", "id": 2, "result": {"content": "quick result"}}
+
+    server_reader.close()
+    await asyncio.wait_for(task, timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_runtime_cancels_shortcut_handlers() -> None:
+    ext = Extension(name="cancellable-shortcut")
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    @ext.shortcut("ctrl+r", description="Wait for cancellation")
+    async def wait(ctx: ShortcutContext) -> None:
+        if ctx.profile == "quick":
+            return
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    server_reader = MemoryReader()
+    server_writer = MemoryWriter()
+    task = asyncio.create_task(run_stdio_server(ext, server_reader, server_writer))
+    client = RpcTestClient(server_reader, server_writer)
+    await client.call(
+        "extension.initialize",
+        {
+            "protocolVersion": "2026-05-30",
+            "extension": {"id": "cancellable-shortcut", "cwd": os.getcwd(), "dataDir": ""},
+        },
+    )
+
+    server_reader.feed(
+        _frame(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "extension.shortcut.execute",
+                "params": {"key": "ctrl+r"},
+            }
+        )
+    )
+    await asyncio.wait_for(started.wait(), timeout=1)
+    server_reader.feed(_frame({"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 2}}))
+    await asyncio.wait_for(cancelled.wait(), timeout=1)
+
+    server_reader.feed(
+        _frame(
+            {
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "extension.shortcut.execute",
+                "params": {"key": "ctrl+r", "context": {"profile": "quick"}},
+            }
+        )
+    )
+    response = await asyncio.wait_for(server_writer.read_frame(), timeout=1)
+    assert response == {"jsonrpc": "2.0", "id": 3, "result": None}
 
     server_reader.close()
     await asyncio.wait_for(task, timeout=1)

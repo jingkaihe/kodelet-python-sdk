@@ -29,9 +29,11 @@ from ._utils import (
 from .context import (
     CommandContext,
     EventContext,
+    ShortcutContext,
     ToolContext,
     create_command_context,
     create_event_context,
+    create_shortcut_context,
     create_tool_context,
 )
 from .schemas import SchemaAdapter, SchemaLike, infer_schema_from_callable
@@ -56,9 +58,11 @@ EventName: TypeAlias = Literal[
 ]
 ToolHandler = Callable[[Any, ToolContext], Awaitable[Any] | Any]
 CommandHandler = Callable[[Any, CommandContext], Awaitable[Any] | Any]
+ShortcutHandler = Callable[[ShortcutContext], Awaitable[None] | None]
 EventHandler = Callable[[Any, EventContext], Awaitable[Any] | Any]
 Entrypoint = Callable[["Extension"], Awaitable[None] | None]
 HandlerT = TypeVar("HandlerT", bound=Callable[..., Any])
+ShortcutHandlerT = TypeVar("ShortcutHandlerT", bound=ShortcutHandler)
 
 
 class ToolExecutionResult(TypedDict, total=False):
@@ -255,6 +259,13 @@ class CommandRegistration:
 
 
 @dataclass(frozen=True)
+class ShortcutRegistration:
+    key: str
+    description: str | None
+    handler: ShortcutHandler
+
+
+@dataclass(frozen=True)
 class EventHandlerRegistration:
     event: str
     priority: int
@@ -266,10 +277,11 @@ class EventHandlerRegistration:
 class Extension:
     """Register and run a Kodelet extension.
 
-    An ``Extension`` owns tool, command, and event-handler registrations and
+    An ``Extension`` owns tool, command, shortcut, and event-handler registrations and
     exposes the JSON-RPC methods that the Kodelet host calls over stdio. Most
     extensions create one instance, decorate async functions with :meth:`tool`,
-    :meth:`command`, and :meth:`on`, then call :meth:`run` or :meth:`run_sync`.
+    :meth:`command`, :meth:`shortcut`, and :meth:`on`, then call :meth:`run` or
+    :meth:`run_sync`.
 
     Args:
         name: Optional display name returned during ``extension.initialize``.
@@ -286,6 +298,7 @@ class Extension:
         self._tools: dict[str, ToolRegistration] = {}
         self._commands_by_name: dict[str, CommandRegistration] = {}
         self._command_registrations: list[CommandRegistration] = []
+        self._shortcuts: dict[str, ShortcutRegistration] = {}
         self._handlers: list[EventHandlerRegistration] = []
         self._order = 0
         self._init_params: Mapping[str, Any] | None = None
@@ -488,6 +501,63 @@ class Extension:
 
         return decorator
 
+    def register_shortcut(
+        self,
+        shortcut: str,
+        *,
+        handler: ShortcutHandler,
+        description: str | None = None,
+    ) -> None:
+        """Register a native TUI keyboard shortcut explicitly.
+
+        Args:
+            shortcut: Case-insensitive single key chord supported by Kodelet's
+                native TUI, such as ``"ctrl+r"`` or ``"f5"``.
+            handler: Callable invoked as ``handler(ctx)``. It may be sync or
+                async; its return value is ignored.
+            description: Optional human-readable label shown in shortcut help.
+
+        Raises:
+            ValueError: If the shortcut is unsupported or conflicts with an
+                existing registration in this extension.
+        """
+
+        key = _normalize_shortcut_key(shortcut)
+        if key in self._shortcuts:
+            raise ValueError(f"Duplicate extension shortcut registration: {key}")
+        self._shortcuts[key] = ShortcutRegistration(
+            key=key,
+            description=description,
+            handler=handler,
+        )
+
+    def shortcut(
+        self,
+        shortcut: str,
+        *,
+        description: str | None = None,
+    ) -> Callable[[ShortcutHandlerT], ShortcutHandlerT]:
+        """Decorate a function as a native TUI keyboard shortcut handler.
+
+        Args:
+            shortcut: Case-insensitive single key chord supported by Kodelet's
+                native TUI.
+            description: Optional human-readable label shown in shortcut help.
+
+        Returns:
+            A decorator that returns the original function unchanged.
+        """
+
+        def decorator(func: ShortcutHandlerT) -> ShortcutHandlerT:
+            self.register_shortcut(
+                shortcut,
+                description=description,
+                handler=func,
+            )
+            return func
+
+        return decorator
+
     @overload
     def on(self, event: str, handler: HandlerT, /) -> HandlerT: ...
 
@@ -556,7 +626,7 @@ class Extension:
 
         Returns:
             JSON-serializable extension metadata, tool registrations, command
-            registrations, and event subscriptions.
+            registrations, shortcut registrations, and event subscriptions.
         """
 
         self._init_params = params
@@ -566,8 +636,10 @@ class Extension:
             "name": self._metadata.get("name") or extension_id or "extension",
             "tools": [self._tool_to_json(registration) for registration in self._tools.values()],
             "commands": [
-                self._command_to_json(registration)
-                for registration in self._command_registrations
+                self._command_to_json(registration) for registration in self._command_registrations
+            ],
+            "shortcuts": [
+                self._shortcut_to_json(registration) for registration in self._shortcuts.values()
             ],
             "subscriptions": self._subscriptions(),
         }
@@ -632,6 +704,24 @@ class Extension:
             create_command_context(self._init_params, context, invocation),
         )
         return {"action": "pass"} if result is None else to_plain(result)
+
+    async def execute_shortcut(self, params: Mapping[str, Any]) -> None:
+        """Handle Kodelet's ``extension.shortcut.execute`` JSON-RPC request.
+
+        Args:
+            params: Raw shortcut parameters containing ``key`` and optional
+                call ``context``.
+
+        Raises:
+            ValueError: If no shortcut is registered for the normalized key.
+        """
+
+        key = _normalize_shortcut_key(str(params.get("key", "")))
+        shortcut = self._shortcuts.get(key)
+        if shortcut is None:
+            raise ValueError(f"Unknown extension shortcut: {key}")
+        context = _mapping_or_empty(params.get("context"))
+        await maybe_await(shortcut.handler(create_shortcut_context(self._init_params, context)))
 
     async def handle_event(self, params: Mapping[str, Any]) -> dict[str, Any]:
         """Handle Kodelet's ``extension.event.handle`` JSON-RPC request.
@@ -728,6 +818,12 @@ class Extension:
             result["kind"] = registration.kind
         return result
 
+    def _shortcut_to_json(self, registration: ShortcutRegistration) -> dict[str, Any]:
+        result = {"key": registration.key}
+        if registration.description is not None:
+            result["description"] = registration.description
+        return result
+
     def _subscriptions(self) -> list[dict[str, Any]]:
         by_event: dict[str, dict[str, float | int | None]] = {}
         for handler in self._handlers:
@@ -769,7 +865,7 @@ def define_extension(entrypoint: Entrypoint) -> Entrypoint:
 
     Args:
         entrypoint: Callable that receives an :class:`Extension` and registers
-            tools, commands, and event handlers.
+            tools, commands, shortcuts, and event handlers.
 
     Returns:
         The same callable.
@@ -889,3 +985,72 @@ def _merge_tool_patch(current: Any, next_patch: Any) -> dict[str, list[Any]]:
             *list(next_mapping.get("enable") or []),
         ],
     }
+
+
+def _normalize_shortcut_key(shortcut: str) -> str:
+    value = shortcut.strip()
+    if not value:
+        raise ValueError("Extension shortcut key is required")
+    if not value.isascii():
+        raise ValueError(
+            f"Unsupported extension shortcut: {shortcut}; "
+            "shortcut identifiers must use ASCII characters"
+        )
+    value = value.lower()
+    if any(character.isspace() for character in value):
+        raise ValueError(f"Invalid extension shortcut: {shortcut}")
+
+    modifier_aliases = {
+        "control": "ctrl",
+        "option": "alt",
+    }
+    parts = value.split("+")
+    if any(not part for part in parts):
+        raise ValueError(f"Invalid extension shortcut: {shortcut}")
+
+    modifiers: set[str] = set()
+    base = ""
+    for raw_part in parts:
+        part = modifier_aliases.get(raw_part, raw_part)
+        if part in {"ctrl", "alt"}:
+            if part in modifiers:
+                raise ValueError(f"Invalid extension shortcut: {shortcut}")
+            modifiers.add(part)
+            continue
+        if part in {"shift", "cmd", "command", "meta", "super"}:
+            raise ValueError(f"Unsupported extension shortcut modifier: {raw_part}")
+        if base:
+            raise ValueError(f"Invalid extension shortcut: {shortcut}")
+        base = part
+    if not base:
+        raise ValueError(f"Invalid extension shortcut: {shortcut}")
+
+    ctrl = "ctrl" in modifiers
+    alt = "alt" in modifiers
+    function_key = base in {f"f{index}" for index in range(1, 13)}
+    if function_key:
+        if ctrl or alt:
+            raise ValueError(
+                f"Unsupported extension shortcut: {shortcut}; function keys must not use modifiers"
+            )
+        return base
+    if not ctrl and not alt:
+        raise ValueError(
+            f"Unsupported extension shortcut: {shortcut}; use ctrl+letter, "
+            "alt+letter-or-digit, ctrl+alt+letter, or f1 through f12"
+        )
+
+    ascii_letter = len(base) == 1 and "a" <= base <= "z"
+    ascii_digit = len(base) == 1 and "0" <= base <= "9"
+    valid_base = ascii_letter or (alt and not ctrl and ascii_digit)
+    if not valid_base:
+        raise ValueError(f"Unsupported extension shortcut key: {shortcut}")
+    if ctrl and base in {"i", "m"}:
+        terminal_key = "tab" if base == "i" else "enter"
+        raise ValueError(
+            f"Unsupported extension shortcut: {shortcut}; "
+            f"terminals report ctrl+{base} as {terminal_key}"
+        )
+
+    ordered_modifiers = [modifier for modifier in ("ctrl", "alt") if modifier in modifiers]
+    return "+".join((*ordered_modifiers, base))

@@ -555,6 +555,8 @@ class ExtensionSocketServer:
             return await self._host.execute_tool(request_params)
         if method == "extension.command.execute":
             return await self._host.execute_command(request_params)
+        if method == "extension.shortcut.execute":
+            return await self._host.execute_shortcut(request_params)
         if method == "extension.event.handle":
             return await self._host.handle_event(request_params)
         raise RuntimeError(f"Unknown JSON-RPC method: {method}")
