@@ -24,6 +24,8 @@ from kodelet_sdk import (
     JSONSchema,
     Pydantic,
     ShortcutContext,
+    ShortcutResult,
+    ShortcutSubmitResult,
     ToolCallEvent,
     ToolContext,
     ToolExecutionResult,
@@ -121,14 +123,17 @@ def test_public_typing_surface() -> None:
         assert_type(ask_result, CoroutineType[Any, Any, CommandResult])
 
     @ext.shortcut("ctrl+alt+r", description="Refresh project context")
-    async def refresh(ctx: ShortcutContext) -> None:
+    async def refresh(ctx: ShortcutContext) -> ShortcutResult:
         assert_type(ctx.cwd, str)
+        return {"action": "submit", "message": "/refresh"}
 
-    refresh_handler: Callable[[ShortcutContext], Awaitable[None]] = refresh
+    refresh_handler: Callable[[ShortcutContext], Awaitable[ShortcutResult]] = refresh
     assert refresh_handler is refresh
     if TYPE_CHECKING:
         refresh_result = refresh(ShortcutContext(None))
-        assert_type(refresh_result, CoroutineType[Any, Any, None])
+        assert_type(refresh_result, CoroutineType[Any, Any, ShortcutResult])
+        submit_result: ShortcutSubmitResult = {"action": "submit", "message": "/refresh"}
+        assert_type(submit_result, ShortcutSubmitResult)
 
     @ext.on("tool.call")
     def approve(event: ToolCallEvent, _ctx: EventContext) -> EventResult:
@@ -213,7 +218,7 @@ async def test_registers_tools_commands_events_and_executes_handlers() -> None:
             }
 
         @ext.shortcut("option+control+r", description="Refresh project context")
-        async def refresh(ctx: ShortcutContext) -> None:
+        async def refresh(ctx: ShortcutContext) -> ShortcutResult:
             shortcut_context.update(
                 {
                     "conversation_id": ctx.conversation_id,
@@ -223,6 +228,7 @@ async def test_registers_tools_commands_events_and_executes_handlers() -> None:
                     "invoked_by": ctx.invoked_by,
                 }
             )
+            return {"action": "submit", "message": "/refresh"}
 
         @ext.on("tool.call", priority=10, timeout_in_sec=5)
         async def rewrite_weather(event: Any, _ctx: Any) -> dict[str, Any] | None:
@@ -269,21 +275,18 @@ async def test_registers_tools_commands_events_and_executes_handlers() -> None:
     )
     assert command_result == {"action": "respond", "response": "doctor: healthy"}
 
-    assert (
-        await harness.execute_shortcut(
-            {
-                "key": "ALT+CTRL+R",
-                "context": {
-                    "conversationId": "conv-shortcut",
-                    "cwd": os.getcwd(),
-                    "profile": "default",
-                    "recipeName": "review",
-                    "invokedBy": "main",
-                },
-            }
-        )
-        is None
-    )
+    assert await harness.execute_shortcut(
+        {
+            "key": "ALT+CTRL+R",
+            "context": {
+                "conversationId": "conv-shortcut",
+                "cwd": os.getcwd(),
+                "profile": "default",
+                "recipeName": "review",
+                "invokedBy": "main",
+            },
+        }
+    ) == {"action": "submit", "message": "/refresh"}
     assert shortcut_context == {
         "conversation_id": "conv-shortcut",
         "cwd": os.getcwd(),
@@ -390,6 +393,38 @@ async def test_execute_shortcut_rejects_unknown_key() -> None:
     harness = await create_test_harness(Extension())
     with pytest.raises(ValueError, match=r"Unknown extension shortcut: ctrl\+r"):
         await harness.execute_shortcut({"key": "ctrl+r"})
+
+
+@pytest.mark.asyncio
+async def test_shortcut_submit_requires_host_capability() -> None:
+    ext = Extension()
+
+    @ext.shortcut("ctrl+r")
+    def refresh(_ctx: ShortcutContext) -> ShortcutResult:
+        return {"action": "submit", "message": "/refresh"}
+
+    harness = await create_test_harness(ext)
+    harness.initialize({"capabilities": {}})
+
+    with pytest.raises(
+        RuntimeError,
+        match="Shortcut submit results are not supported by this host",
+    ):
+        await harness.execute_shortcut({"key": "ctrl+r"})
+
+
+@pytest.mark.asyncio
+async def test_shortcut_without_result_remains_supported() -> None:
+    ext = Extension()
+
+    @ext.shortcut("ctrl+r")
+    def refresh(_ctx: ShortcutContext) -> None:
+        return None
+
+    harness = await create_test_harness(ext)
+    harness.initialize({"capabilities": {}})
+
+    assert await harness.execute_shortcut({"key": "ctrl+r"}) is None
 
 
 @pytest.mark.asyncio

@@ -4,7 +4,7 @@ import os
 from collections.abc import Mapping
 from typing import Any
 
-from .api import Entrypoint, Extension, create_extension_host
+from .api import Entrypoint, Extension, ShortcutResult, create_extension_host
 from .context import HostRPCClient, run_with_host_rpc_client
 
 
@@ -24,7 +24,7 @@ class ExtensionTestHarness:
                 "dataDir": "",
                 "config": {},
             },
-            "capabilities": {"toolUpdates": True},
+            "capabilities": {"toolUpdates": True, "shortcuts": {"submit": True}},
         }
 
     def initialize(self, params: Mapping[str, Any] | None = None) -> dict[str, Any]:
@@ -70,11 +70,11 @@ class ExtensionTestHarness:
             lambda: self._host.execute_command(params),
         )
 
-    async def execute_shortcut(self, params: Mapping[str, Any]) -> None:
+    async def execute_shortcut(self, params: Mapping[str, Any]) -> ShortcutResult | None:
         """Execute a registered shortcut through the extension host."""
 
         self._ensure_initialized()
-        await run_with_host_rpc_client(
+        return await run_with_host_rpc_client(
             self._host_rpc_client,
             lambda: self._host.execute_shortcut(params),
         )

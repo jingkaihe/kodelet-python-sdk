@@ -17,6 +17,7 @@ from kodelet_sdk import (
     Field,
     HostRPCError,
     ShortcutContext,
+    ShortcutResult,
     ToolContext,
     UIContext,
     UISurfaceInputEvent,
@@ -98,9 +99,10 @@ async def test_runtime_serves_json_rpc_and_reverse_host_rpc() -> None:
         return {"content": f"{input.text.upper()}:{answer}"}
 
     @ext.shortcut("ctrl+alt+r", description="Refresh project context")
-    async def refresh(ctx: ShortcutContext) -> None:
+    async def refresh(ctx: ShortcutContext) -> ShortcutResult:
         shortcut_contexts.append((ctx.conversation_id, ctx.recipe_name))
         await ctx.ui.notify("Refreshed")
+        return {"action": "submit", "message": "/refresh"}
 
     server_reader = MemoryReader()
     server_writer = MemoryWriter()
@@ -113,7 +115,11 @@ async def test_runtime_serves_json_rpc_and_reverse_host_rpc() -> None:
             "protocolVersion": "2026-05-30",
             "kodelet": {"version": "test"},
             "extension": {"id": "rpc", "cwd": os.getcwd(), "dataDir": ""},
-            "capabilities": {"toolUpdates": True, "ui": {"input": True}},
+            "capabilities": {
+                "toolUpdates": True,
+                "shortcuts": {"submit": True},
+                "ui": {"input": True},
+            },
         },
     )
     assert init["name"] == "rpc"
@@ -132,7 +138,7 @@ async def test_runtime_serves_json_rpc_and_reverse_host_rpc() -> None:
             "context": {"conversationId": "conv-shortcut", "recipeName": "review"},
         },
     )
-    assert shortcut_result is None
+    assert shortcut_result == {"action": "submit", "message": "/refresh"}
     assert shortcut_contexts == [("conv-shortcut", "review")]
     assert [request["method"] for request in client.host_requests] == [
         "kodelet.tool.update",

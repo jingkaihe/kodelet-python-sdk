@@ -17,6 +17,7 @@ from kodelet_sdk import (
     Extension,
     Profile,
     ShortcutContext,
+    ShortcutResult,
     ToolUpdateData,
     UISurfaceInputEvent,
     UISurfaceResizeEvent,
@@ -663,8 +664,9 @@ async def test_extension_bridge_routes_local_ui_handlers(
             return selected or "dismissed"
 
         @ext.shortcut("ctrl+alt+r", description="Refresh project context")
-        async def refresh(ctx: ShortcutContext) -> None:
+        async def refresh(ctx: ShortcutContext) -> ShortcutResult:
             shortcut_contexts.append((ctx.conversation_id, ctx.recipe_name))
+            return {"action": "submit", "message": "/refresh"}
 
     client = Client(cwd=tmp_path, spawn=spawn)
     session = await client.create_session(
@@ -691,7 +693,10 @@ async def test_extension_bridge_routes_local_ui_handlers(
             "method": "extension.initialize",
             "params": {
                 "extension": {"id": "workspace", "cwd": str(tmp_path)},
-                "capabilities": {"toolUpdates": True},
+                "capabilities": {
+                    "toolUpdates": True,
+                    "shortcuts": {"submit": True},
+                },
             },
         },
     )
@@ -745,7 +750,7 @@ async def test_extension_bridge_routes_local_ui_handlers(
         },
     )
     shortcut_response = await _read_frame(process.stdout)
-    assert shortcut_response["result"] is None
+    assert shortcut_response["result"] == {"action": "submit", "message": "/refresh"}
     assert shortcut_contexts == [("conv-shortcut", "review")]
 
     process.terminate()

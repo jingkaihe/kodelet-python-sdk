@@ -58,11 +58,9 @@ EventName: TypeAlias = Literal[
 ]
 ToolHandler = Callable[[Any, ToolContext], Awaitable[Any] | Any]
 CommandHandler = Callable[[Any, CommandContext], Awaitable[Any] | Any]
-ShortcutHandler = Callable[[ShortcutContext], Awaitable[None] | None]
 EventHandler = Callable[[Any, EventContext], Awaitable[Any] | Any]
 Entrypoint = Callable[["Extension"], Awaitable[None] | None]
 HandlerT = TypeVar("HandlerT", bound=Callable[..., Any])
-ShortcutHandlerT = TypeVar("ShortcutHandlerT", bound=ShortcutHandler)
 
 
 class ToolExecutionResult(TypedDict, total=False):
@@ -96,6 +94,21 @@ class CommandRunAgentResult(TypedDict):
 
 
 CommandResult: TypeAlias = CommandPassResult | CommandRespondResult | CommandRunAgentResult
+
+
+class ShortcutSubmitResult(TypedDict):
+    """Shortcut result that submits a conversation message."""
+
+    action: Literal["submit"]
+    message: str
+
+
+ShortcutResult: TypeAlias = ShortcutSubmitResult
+ShortcutHandler = Callable[
+    [ShortcutContext],
+    Awaitable[ShortcutResult | None] | ShortcutResult | None,
+]
+ShortcutHandlerT = TypeVar("ShortcutHandlerT", bound=ShortcutHandler)
 
 
 class EventBlock(TypedDict):
@@ -514,7 +527,7 @@ class Extension:
             shortcut: Case-insensitive single key chord supported by Kodelet's
                 native TUI, such as ``"ctrl+r"`` or ``"f5"``.
             handler: Callable invoked as ``handler(ctx)``. It may be sync or
-                async; its return value is ignored.
+                async and may return a shortcut result.
             description: Optional human-readable label shown in shortcut help.
 
         Raises:
@@ -705,15 +718,20 @@ class Extension:
         )
         return {"action": "pass"} if result is None else to_plain(result)
 
-    async def execute_shortcut(self, params: Mapping[str, Any]) -> None:
+    async def execute_shortcut(self, params: Mapping[str, Any]) -> ShortcutResult | None:
         """Handle Kodelet's ``extension.shortcut.execute`` JSON-RPC request.
 
         Args:
             params: Raw shortcut parameters containing ``key`` and optional
                 call ``context``.
 
+        Returns:
+            An optional host action returned by the shortcut handler.
+
         Raises:
             ValueError: If no shortcut is registered for the normalized key.
+            RuntimeError: If the handler returns a submit result unsupported
+                by the host.
         """
 
         key = _normalize_shortcut_key(str(params.get("key", "")))
@@ -721,7 +739,14 @@ class Extension:
         if shortcut is None:
             raise ValueError(f"Unknown extension shortcut: {key}")
         context = _mapping_or_empty(params.get("context"))
-        await maybe_await(shortcut.handler(create_shortcut_context(self._init_params, context)))
+        result = await maybe_await(
+            shortcut.handler(create_shortcut_context(self._init_params, context))
+        )
+        if result is None:
+            return None
+        if not _shortcut_submit_supported(self._init_params):
+            raise RuntimeError("Shortcut submit results are not supported by this host")
+        return cast(ShortcutResult, to_plain(result))
 
     async def handle_event(self, params: Mapping[str, Any]) -> dict[str, Any]:
         """Handle Kodelet's ``extension.event.handle`` JSON-RPC request.
@@ -985,6 +1010,12 @@ def _merge_tool_patch(current: Any, next_patch: Any) -> dict[str, list[Any]]:
             *list(next_mapping.get("enable") or []),
         ],
     }
+
+
+def _shortcut_submit_supported(init: Mapping[str, Any] | None) -> bool:
+    capabilities = init.get("capabilities") if isinstance(init, Mapping) else None
+    shortcuts = capabilities.get("shortcuts") if isinstance(capabilities, Mapping) else None
+    return isinstance(shortcuts, Mapping) and shortcuts.get("submit") is True
 
 
 def _normalize_shortcut_key(shortcut: str) -> str:
