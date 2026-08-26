@@ -1400,12 +1400,15 @@ class ToolContext(SharedContext):
             payload["data"] = data
         await client.request("kodelet.tool.update", payload)
 
-    async def fork_conversation(self) -> str:
+    async def fork_conversation(self, name: str | None = None) -> str:
         """Create an isolated persisted fork of the caller's live context.
 
         The host snapshots the active in-memory conversation before the current
         tool result is appended, removes the unresolved trailing tool call, and
         returns a new conversation ID suitable for ``Client.create_session``.
+
+        Args:
+            name: Optional explicit user-facing name for the forked conversation.
 
         Raises:
             ConversationForkUnavailableError: If the host or active invocation
@@ -1424,7 +1427,8 @@ class ToolContext(SharedContext):
                 "Live conversation forking requires an active tool request"
             )
         try:
-            response = await client.request("kodelet.conversation.fork")
+            params = {"name": name} if name is not None and name.strip() else None
+            response = await client.request("kodelet.conversation.fork", params)
         except HostRPCError as exc:
             if exc.code == _CONVERSATION_FORK_UNAVAILABLE_CODE:
                 raise ConversationForkUnavailableError(str(exc)) from exc

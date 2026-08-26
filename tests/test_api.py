@@ -798,6 +798,35 @@ async def test_tool_context_forks_live_conversation_when_supported() -> None:
 
 
 @pytest.mark.asyncio
+async def test_tool_context_requests_named_live_conversation_fork() -> None:
+    requests: list[tuple[str, Any | None]] = []
+
+    class FakeRPC:
+        async def request(self, method: str, params: Any | None = None) -> Any:
+            requests.append((method, params))
+            return {"conversationId": " forked-conversation "}
+
+    ext = Extension()
+
+    @ext.tool("fork", description="Fork context", input_schema={})
+    async def fork(_input: Any, ctx: ToolContext) -> str:
+        return await ctx.fork_conversation(name="  Investigate fork naming  ")
+
+    harness = await create_test_harness(ext, FakeRPC())
+    harness.initialize({"capabilities": {"conversations": {"fork": True}}})
+
+    assert await harness.execute_tool({"name": "fork", "input": {}}) == {
+        "content": "forked-conversation"
+    }
+    assert requests == [
+        (
+            "kodelet.conversation.fork",
+            {"name": "  Investigate fork naming  "},
+        )
+    ]
+
+
+@pytest.mark.asyncio
 async def test_tool_context_rejects_conversation_fork_without_host_capability() -> None:
     ext = Extension()
 

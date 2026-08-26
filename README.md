@@ -103,9 +103,9 @@ async def delegate(input: TaskInput, ctx: ToolContext) -> str:
         await client.close()
 ```
 
-The fork preserves provider-native history and the persisted model/provider configuration while leaving the parent conversation unchanged. `inherit_context` is mutually exclusive with both `resume` and `profile`; the inherited conversation's stored profile and provider configuration are loaded by ACP. For lower-level control, `await ctx.fork_conversation()` returns the forked conversation ID, which can be passed to `create_session(resume=...)`.
+The fork preserves provider-native history and the persisted model/provider configuration while leaving the parent conversation unchanged. `inherit_context` is mutually exclusive with both `resume` and `profile`; the inherited conversation's stored profile and provider configuration are loaded by ACP. For lower-level control, `await ctx.fork_conversation(name="Delegated task")` returns a named forked conversation ID, which can be passed to `create_session(resume=...)`; omit `name` to preserve the source conversation name.
 
-Live forks require the active tool call to have access to a persistent in-memory conversation. `fork_conversation()` raises `ConversationForkUnavailableError` when the host or invocation cannot provide one, such as a run with persistence disabled or a runner-placed tool. Extensions that can operate without inherited context may catch that specific error and fall back to creating a fresh profile-based session; other host RPC errors indicate a real snapshot or persistence failure and should be surfaced.
+Live forks require a persistent in-memory conversation. `fork_conversation()` raises `ConversationForkUnavailableError` when unavailable; other host RPC errors should be surfaced.
 
 Agent sessions can expose in-process Python extensions for that session. Inline extensions are served through a temporary JSON-RPC bridge and are removed when the session closes.
 
