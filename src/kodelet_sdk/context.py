@@ -249,6 +249,55 @@ class ConversationForkUnavailableError(RuntimeError):
     """The active tool invocation cannot provide a live conversation fork."""
 
 
+class BackgroundTaskLease:
+    """Host-owned lifetime lease for extension work continuing after a handler returns."""
+
+    def __init__(
+        self,
+        client: HostRPCClient | None,
+        lease_id: str | None,
+    ) -> None:
+        self._client = client
+        self._persistent_client = _persistent_host_rpc_client(client)
+        self._lease_id = lease_id
+        self._closed = False
+
+    @property
+    def id(self) -> str | None:
+        """Return the host lease ID, or ``None`` for hosts that need no lease."""
+
+        return self._lease_id
+
+    async def close(self) -> None:
+        """Release the host lifetime lease. Repeated calls are harmless."""
+
+        if self._closed:
+            return
+        if self._lease_id is None:
+            self._closed = True
+            return
+        params = {"leaseId": self._lease_id}
+        request_persistent = getattr(self._client, "request_persistent", None)
+        if callable(request_persistent):
+            await request_persistent("kodelet.runtime.background.release", params)
+        else:
+            if self._persistent_client is None:
+                raise RuntimeError("Persistent extension host RPC is unavailable")
+            await self._persistent_client.request("kodelet.runtime.background.release", params)
+        self._closed = True
+
+    async def __aenter__(self) -> BackgroundTaskLease:
+        return self
+
+    async def __aexit__(
+        self,
+        _exc_type: type[BaseException] | None,
+        _exc: BaseException | None,
+        _traceback: Any,
+    ) -> None:
+        await self.close()
+
+
 class HostRPCClient(Protocol):
     """Reverse-RPC client used by extension contexts to call the Kodelet host.
 
@@ -1317,6 +1366,19 @@ def _extension_ui_supported(
     return isinstance(ui, Mapping) and ui.get(feature) is True
 
 
+def _runtime_capability_supported(
+    init: Mapping[str, Any] | None,
+    feature: Literal["backgroundTasks"],
+) -> bool:
+    if init is None:
+        return False
+    capabilities = init.get("capabilities")
+    if not isinstance(capabilities, Mapping):
+        return False
+    runtime = capabilities.get("runtime")
+    return isinstance(runtime, Mapping) and runtime.get(feature) is True
+
+
 def _is_number(value: Any) -> bool:
     return isinstance(value, int | float) and not isinstance(value, bool)
 
@@ -1358,7 +1420,53 @@ class SharedContext:
         self.env = EnvContext()
         self.log = LogContext(_optional_str(extension.get("id")))
         self._host_rpc_client = _current_host_rpc_client()
+        self._background_tasks_enabled = _runtime_capability_supported(
+            init,
+            "backgroundTasks",
+        )
         self.ui = UIContext(init, self._host_rpc_client, self.ui_scope_id)
+
+    async def acquire_background_task(
+        self,
+        description: str | None = None,
+    ) -> BackgroundTaskLease:
+        """Keep host runtime resources alive for asynchronous extension work.
+
+        Acquire the lease while the originating handler is active, then close it
+        after all associated background work has reached a terminal state. Local
+        persistent hosts return a no-op lease because their runtime already has a
+        host-wide lifetime.
+
+        Args:
+            description: Optional concise diagnostic label for the background work.
+
+        Raises:
+            RuntimeError: If the host does not support background work or cannot
+                acquire its required lifetime lease.
+        """
+
+        if not self._background_tasks_enabled:
+            raise RuntimeError("Background extension tasks are not available in this host")
+        client = self._host_rpc_client
+        if client is None:
+            return BackgroundTaskLease(None, None)
+        params = None
+        if description is not None and description.strip():
+            params = {"description": description.strip()}
+        try:
+            response = await client.request("kodelet.runtime.background.acquire", params)
+        except HostRPCError as exc:
+            if exc.code == -32601:
+                return BackgroundTaskLease(None, None)
+            raise
+        if not isinstance(response, Mapping):
+            raise RuntimeError("Invalid background task lease response from Kodelet host")
+        lease_id = response.get("leaseId")
+        if lease_id is None:
+            return BackgroundTaskLease(None, None)
+        if not isinstance(lease_id, str) or not lease_id.strip():
+            raise RuntimeError("Background task lease response did not include a lease ID")
+        return BackgroundTaskLease(client, lease_id.strip())
 
 
 class ToolContext(SharedContext):

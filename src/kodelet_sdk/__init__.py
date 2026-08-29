@@ -65,6 +65,7 @@ from .api import (
     on,
 )
 from .context import (
+    BackgroundTaskLease,
     CommandContext,
     CommandFlagValue,
     CommandInvocation,
@@ -146,6 +147,7 @@ __all__ = [
     "AssistantMessageData",
     "AssistantMessageDeltaData",
     "AssistantThinkingDeltaData",
+    "BackgroundTaskLease",
     "BaseModel",
     "BridgeTransport",
     "Client",

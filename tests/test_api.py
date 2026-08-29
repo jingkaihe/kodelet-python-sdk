@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, assert_type
 import pytest
 
 from kodelet_sdk import (
+    BackgroundTaskLease,
     BaseModel,
     CommandContext,
     CommandResult,
@@ -859,6 +860,128 @@ async def test_tool_context_translates_fork_unavailable_host_error() -> None:
     harness = await create_test_harness(ext, FakeRPC())
     harness.initialize({"capabilities": {"conversations": {"fork": True}}})
     assert await harness.execute_tool({"name": "fork", "input": {}}) == {"content": "unavailable"}
+
+
+@pytest.mark.asyncio
+async def test_background_task_lease_uses_persistent_rpc_and_retries_failed_release() -> None:
+    requests: list[tuple[str, Any | None, bool]] = []
+    release_attempts = 0
+    lease: BackgroundTaskLease | None = None
+
+    class FakeRPC:
+        async def request(self, method: str, params: Any | None = None) -> Any:
+            requests.append((method, params, False))
+            assert method == "kodelet.runtime.background.acquire"
+            return {"leaseId": " lease-1 "}
+
+        async def request_persistent(self, method: str, params: Any | None = None) -> Any:
+            nonlocal release_attempts
+            requests.append((method, params, True))
+            release_attempts += 1
+            if release_attempts == 1:
+                raise RuntimeError("temporary release failure")
+            return {"released": True}
+
+    ext = Extension()
+
+    @ext.tool("background", description="Start background work", input_schema={})
+    async def background(_input: Any, ctx: ToolContext) -> str:
+        nonlocal lease
+        lease = await ctx.acquire_background_task("  index repository  ")
+        return lease.id or "local"
+
+    harness = await create_test_harness(ext, FakeRPC())
+    harness.initialize(
+        {
+            "capabilities": {
+                "runtime": {
+                    "backgroundTasks": True,
+                }
+            }
+        }
+    )
+
+    assert await harness.execute_tool({"name": "background", "input": {}}) == {
+        "content": "lease-1"
+    }
+    assert lease is not None
+    with pytest.raises(RuntimeError, match="temporary release failure"):
+        await lease.close()
+    await lease.close()
+    await lease.close()
+    assert requests == [
+        (
+            "kodelet.runtime.background.acquire",
+            {"description": "index repository"},
+            False,
+        ),
+        (
+            "kodelet.runtime.background.release",
+            {"leaseId": "lease-1"},
+            True,
+        ),
+        (
+            "kodelet.runtime.background.release",
+            {"leaseId": "lease-1"},
+            True,
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_background_task_capability_returns_local_noop_and_rejects_unavailable_host() -> None:
+    local_lease: BackgroundTaskLease | None = None
+    persistent_requests: list[tuple[str, Any | None]] = []
+
+    class PersistentRPC:
+        async def request(self, method: str, params: Any | None = None) -> Any:
+            persistent_requests.append((method, params))
+            return {}
+
+    ext = Extension()
+
+    @ext.tool("background", description="Start background work", input_schema={})
+    async def background(_input: Any, ctx: ToolContext) -> str:
+        nonlocal local_lease
+        local_lease = await ctx.acquire_background_task()
+        return local_lease.id or "local"
+
+    harness = await create_test_harness(ext, PersistentRPC())
+    harness.initialize({"capabilities": {"runtime": {"backgroundTasks": True}}})
+    assert await harness.execute_tool({"name": "background", "input": {}}) == {
+        "content": "local"
+    }
+    assert local_lease is not None
+    await local_lease.close()
+    await local_lease.close()
+    assert persistent_requests == [("kodelet.runtime.background.acquire", None)]
+
+    class LegacyRPC:
+        async def request(self, method: str, params: Any | None = None) -> Any:
+            del method, params
+            raise HostRPCError({"code": -32601, "message": "host request method not found"})
+
+    legacy_harness = await create_test_harness(ext, LegacyRPC())
+    legacy_harness.initialize({"capabilities": {"runtime": {"backgroundTasks": True}}})
+    assert await legacy_harness.execute_tool({"name": "background", "input": {}}) == {
+        "content": "local"
+    }
+    assert local_lease is not None
+    await local_lease.close()
+
+    unavailable = Extension()
+
+    @unavailable.tool("background", description="Start background work", input_schema={})
+    async def unavailable_background(_input: Any, ctx: ToolContext) -> str:
+        with pytest.raises(RuntimeError, match="not available"):
+            await ctx.acquire_background_task()
+        return "unavailable"
+
+    unavailable_harness = await create_test_harness(unavailable)
+    unavailable_harness.initialize({"capabilities": {}})
+    assert await unavailable_harness.execute_tool({"name": "background", "input": {}}) == {
+        "content": "unavailable"
+    }
 
 
 @pytest.mark.asyncio

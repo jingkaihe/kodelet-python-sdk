@@ -284,6 +284,7 @@ Handlers receive `ctx` with Kodelet call metadata and helper namespaces:
 - `ctx.process.exec(...)` and `ctx.process.spawn(...)` for async process execution.
 - `ctx.env.get(...)` for environment access.
 - `ctx.log.debug/info/warn/error(...)` for JSON logs to stderr.
+- `await ctx.acquire_background_task(...)` for a host lifetime lease around work that may outlive the current handler.
 - `ctx.ui.input/confirm/select/notify(...)` for host UI reverse-RPC calls.
 - `ctx.ui.append_transcript(...)`, `ctx.ui.set_widget(...)`, and `ctx.ui.open_surface(...)` for capability-gated persistent native-TUI content.
 
@@ -297,6 +298,16 @@ select_request: UISelectRequest = {"title": "Mode", "options": ["fast", "thoroug
 
 branch = await ctx.ui.input(input_request)
 mode = await ctx.ui.select(select_request)
+```
+
+Background leases retain host runtime resources; they do not persist extension-specific task state. Acquire the lease before returning from the originating handler and close it after the worker and its final state or UI updates complete. Persistent local hosts return a no-op lease, while runner-backed hosts retain the conversation's extension runtime and execution instance until the last lease is released.
+
+```python
+lease = await ctx.acquire_background_task("index repository")
+try:
+    await run_background_worker()
+finally:
+    await lease.close()
 ```
 
 The native Kodelet TUI can advertise persistent transcript, widget, and interactive-surface support. `append_transcript(...)` and `set_widget(...)` are no-ops when unavailable; `open_surface(...)` raises `RuntimeError` when surfaces are unavailable. Persistent UI requests retain the originating request's `parentId` while a tool, command, or event handler is active and always carry `ctx.ui_scope_id` as an opaque durable scope, including an explicit empty string for host-global UI. This lets one extension reuse the same widget or surface ID independently in multiple conversations while returned surface handles continue receiving correctly scoped events and publishing frames through the persistent connection.
