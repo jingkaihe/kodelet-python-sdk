@@ -4,9 +4,14 @@ import asyncio
 import inspect
 import json
 from collections.abc import Callable, Mapping, Sequence
-from typing import Any
+from typing import Any, cast
 
-from .types import AgentRunError, SpawnedProcess
+from .types import (
+    AgentRunError,
+    SessionSteeringOutcome,
+    SessionSteerResult,
+    SpawnedProcess,
+)
 
 ACP_PROTOCOL_VERSION = 1
 
@@ -31,12 +36,13 @@ class ACPRPCClient:
         self._notification_handlers: set[Callable[[str, Any], None]] = set()
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._closed = False
+        self._steering_supported = False
         self._stdout_task = asyncio.create_task(self._read_stdout()) if process.stdout else None
         self._stderr_task = asyncio.create_task(self._read_stderr()) if process.stderr else None
         self._wait_task = asyncio.create_task(self._wait_for_process())
 
     async def initialize(self) -> None:
-        await self.request(
+        result = await self.request(
             "initialize",
             {
                 "protocolVersion": ACP_PROTOCOL_VERSION,
@@ -46,6 +52,11 @@ class ACPRPCClient:
                 },
                 "clientInfo": {"name": "kodelet-sdk", "title": "Kodelet SDK"},
             },
+        )
+        metadata = result.get("_meta") if isinstance(result, Mapping) else None
+        steering = metadata.get("steering") if isinstance(metadata, Mapping) else None
+        self._steering_supported = (
+            isinstance(steering, Mapping) and steering.get("supported") is True
         )
 
     async def create_session(self, cwd: str) -> str:
@@ -67,6 +78,34 @@ class ACPRPCClient:
             return {}
         stop_reason = result.get("stopReason")
         return {"stopReason": stop_reason} if isinstance(stop_reason, str) else {}
+
+    async def steer_session(self, session_id: str, message: str) -> SessionSteerResult:
+        """Queue steering for an active ACP session."""
+
+        if not self._steering_supported:
+            raise RuntimeError("kodelet acp does not advertise session steering support")
+        result = await self.request(
+            "_session/steering",
+            {
+                "sessionId": session_id,
+                "prompt": [{"type": "text", "text": message}],
+                "_meta": {"steering": {"idleBehavior": "promptRequired"}},
+            },
+        )
+        outcome = result.get("outcome") if isinstance(result, Mapping) else None
+        if outcome not in {"injected", "startedNewTurn", "promptRequired", "failed"}:
+            raise RuntimeError("Invalid _session/steering response from kodelet acp")
+        reason = result.get("reason")
+        if reason is not None and not isinstance(reason, str):
+            raise RuntimeError("Invalid _session/steering response from kodelet acp")
+        if outcome == "promptRequired" and reason != "noRunningTurn":
+            raise RuntimeError("Invalid _session/steering response from kodelet acp")
+        response: SessionSteerResult = {
+            "outcome": cast(SessionSteeringOutcome, outcome),
+        }
+        if isinstance(reason, str):
+            response["reason"] = reason
+        return response
 
     def cancel_session(self, session_id: str) -> None:
         self.notify("session/cancel", {"sessionId": session_id})

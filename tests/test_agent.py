@@ -16,6 +16,7 @@ from kodelet_sdk import (
     CommandResult,
     Extension,
     Profile,
+    SessionSteerResult,
     ShortcutContext,
     ShortcutResult,
     ToolUpdateData,
@@ -31,6 +32,8 @@ from kodelet_sdk.agent.bridge import (
 )
 from kodelet_sdk.agent.rpc import ACPRPCClient
 
+_DEFAULT_RESPONSE = object()
+
 
 class FakeACPProcess(SpawnedProcess):
     def __init__(
@@ -39,6 +42,8 @@ class FakeACPProcess(SpawnedProcess):
         session_id: str = "conv-1",
         on_prompt: Callable[[Mapping[str, Any], FakeACPProcess], Awaitable[None] | None]
         | None = None,
+        steer_result: Any = _DEFAULT_RESPONSE,
+        steering_supported: bool = True,
     ) -> None:
         self.stdout = _QueueLineReader()
         self.stderr = _QueueLineReader()
@@ -46,6 +51,12 @@ class FakeACPProcess(SpawnedProcess):
         self.requests: list[dict[str, Any]] = []
         self._session_id = session_id
         self._on_prompt = on_prompt
+        self._steer_result = (
+            {"outcome": "injected"}
+            if steer_result is _DEFAULT_RESPONSE
+            else steer_result
+        )
+        self._steering_supported = steering_supported
         self._closed = asyncio.Event()
         self._returncode = 0
         self._tasks: set[asyncio.Task[Any]] = set()
@@ -88,7 +99,16 @@ class FakeACPProcess(SpawnedProcess):
         if method == "initialize":
             self._respond(
                 request_id,
-                {"protocolVersion": 1, "agentCapabilities": {}, "authMethods": []},
+                {
+                    "protocolVersion": 1,
+                    "agentCapabilities": {},
+                    "authMethods": [],
+                    "_meta": (
+                        {"steering": {"supported": True}}
+                        if self._steering_supported
+                        else None
+                    ),
+                },
             )
             return
         if method == "session/new":
@@ -106,6 +126,9 @@ class FakeACPProcess(SpawnedProcess):
                 self._respond(request_id, {"stopReason": "end_turn"})
             except Exception as exc:
                 self._respond_error(request_id, str(exc))
+            return
+        if method == "_session/steering":
+            self._respond(request_id, self._steer_result)
             return
         self._respond_error(request_id, f"Unexpected method: {method}")
 
@@ -169,7 +192,9 @@ def test_agent_package_preserves_public_reexports() -> None:
 
     assert agent.Client is Client
     assert agent.Profile is Profile
+    assert agent.SessionSteerResult is SessionSteerResult
     assert kodelet_sdk.Client is Client
+    assert kodelet_sdk.SessionSteerResult is SessionSteerResult
     assert client_module.Client is Client
 
 
@@ -385,6 +410,95 @@ async def test_acp_rpc_cancellation_discards_late_response_and_keeps_reader_aliv
     assert process.load_request is not None
     process._respond(process.load_request["id"], {})
     assert await rpc.create_session("/workspace") == "conv-1"
+    await rpc.close()
+
+
+@pytest.mark.asyncio
+async def test_session_steers_active_run_and_rejects_blank_messages() -> None:
+    prompt_started = asyncio.Event()
+    release_prompt = asyncio.Event()
+    processes: list[FakeACPProcess] = []
+
+    async def on_prompt(_request: Mapping[str, Any], _process: FakeACPProcess) -> None:
+        prompt_started.set()
+        await release_prompt.wait()
+
+    def spawn(_command: str, _args: Sequence[str], _options: SpawnOptions) -> FakeACPProcess:
+        process = FakeACPProcess(on_prompt=on_prompt)
+        processes.append(process)
+        return process
+
+    client = Client(spawn=spawn)
+    session = await client.create_session()
+    run_task = asyncio.create_task(session.run_and_wait(message="inspect the change"))
+    await asyncio.wait_for(prompt_started.wait(), timeout=1)
+
+    with pytest.raises(ValueError, match="non-empty"):
+        await session.steer("   ")
+    result: SessionSteerResult = await session.steer("  focus on the race  ")
+
+    assert result == {"outcome": "injected"}
+    steer_requests = [
+        request
+        for request in processes[0].requests
+        if request["method"] == "_session/steering"
+    ]
+    assert len(steer_requests) == 1
+    assert steer_requests[0]["params"] == {
+        "sessionId": "conv-1",
+        "prompt": [{"type": "text", "text": "focus on the race"}],
+        "_meta": {"steering": {"idleBehavior": "promptRequired"}},
+    }
+
+    release_prompt.set()
+    await run_task
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_session_steer_requires_active_open_run() -> None:
+    process = FakeACPProcess()
+    client = Client(spawn=lambda *_args: process)
+    session = await client.create_session()
+
+    with pytest.raises(RuntimeError, match="without an active run"):
+        await session.steer("focus")
+    assert not any(
+        request["method"] == "_session/steering" for request in process.requests
+    )
+
+    await session.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        await session.steer("focus")
+
+
+@pytest.mark.asyncio
+async def test_acp_rpc_rejects_malformed_steering_responses() -> None:
+    process = FakeACPProcess(
+        steer_result={"outcome": "unknown"},
+    )
+    rpc = ACPRPCClient(process)
+
+    await rpc.initialize()
+
+    with pytest.raises(RuntimeError, match="Invalid _session/steering response"):
+        await rpc.steer_session("conv-1", "focus")
+
+    await rpc.close()
+
+
+@pytest.mark.asyncio
+async def test_acp_rpc_requires_advertised_steering_capability() -> None:
+    process = FakeACPProcess(steering_supported=False)
+    rpc = ACPRPCClient(process)
+    await rpc.initialize()
+
+    with pytest.raises(RuntimeError, match="does not advertise session steering support"):
+        await rpc.steer_session("conv-1", "focus")
+    assert not any(
+        request["method"] == "_session/steering" for request in process.requests
+    )
+
     await rpc.close()
 
 

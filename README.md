@@ -107,6 +107,24 @@ The fork preserves provider-native history and the persisted model/provider conf
 
 Live forks require a persistent in-memory conversation. `fork_conversation()` raises `ConversationForkUnavailableError` when unavailable; other host RPC errors should be surfaced.
 
+An active session can receive additional guidance without starting another run. Call `steer()` only after a streaming event confirms that the run is active:
+
+```python
+import asyncio
+
+run_active = asyncio.Event()
+session.once("assistant.thinking_start", lambda _event: run_active.set())
+run_task = asyncio.create_task(
+    session.run_and_wait(message="Review the persistence implementation")
+)
+
+await run_active.wait()
+steered = await session.steer("Also check transaction boundaries")
+response = await run_task
+```
+
+`steer()` uses the ACP `_session/steering` extension and returns an outcome such as `{"outcome": "injected"}`. It rejects calls when no run is active or the ACP server does not advertise `_meta.steering.supported`. The SDK requests `idleBehavior: "promptRequired"`, so an end-of-turn race returns `{"outcome": "promptRequired", "reason": "noRunningTurn"}` rather than silently starting another turn. `injected` means Kodelet queued the message, not that the model consumed it before the prompt ended; guidance left unconsumed remains on the conversation for a later run. Blank steering messages are rejected locally.
+
 Agent sessions can expose in-process Python extensions for that session. Inline extensions are served through a temporary JSON-RPC bridge and are removed when the session closes.
 
 ```python

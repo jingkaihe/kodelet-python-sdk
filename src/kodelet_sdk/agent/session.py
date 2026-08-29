@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any, TypeAlias, Unpack, cast
 
 from .._utils import AttrDict
 from .rpc import ACPRPCClient
-from .types import AgentResponse, AgentStreamEvent, RunOptions
+from .types import AgentResponse, AgentStreamEvent, RunOptions, SessionSteerResult
 
 if TYPE_CHECKING:
     from .bridge import InMemoryExtensionBridge, TempConfig
@@ -149,6 +149,18 @@ class Session:
         """CamelCase alias for :meth:`run_and_wait`."""
 
         return await self.run_and_wait(*args, **kwargs)
+
+    async def steer(self, message: str) -> SessionSteerResult:
+        """Queue a user steering message for the active run."""
+
+        if self._closed:
+            raise RuntimeError("Cannot steer a closed Kodelet session")
+        if not self._running:
+            raise RuntimeError("Cannot steer a Kodelet session without an active run")
+        message = message.strip()
+        if not message:
+            raise ValueError("Steering message must be a non-empty string")
+        return await self._rpc.steer_session(self._conversation_id, message)
 
     async def close(self) -> None:
         """Close the underlying ACP process and temporary session resources."""

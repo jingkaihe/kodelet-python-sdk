@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from typing import Any, Literal, Protocol, TypeAlias, TypedDict, cast
+from typing import Any, Literal, NotRequired, Protocol, TypeAlias, TypedDict, cast
 
 from .._utils import AttrDict
 from ..api import Entrypoint, Extension
@@ -90,6 +90,21 @@ class RunOptions(TypedDict, total=False):
     message: str
     images: Sequence[str]
     max_turns: int
+
+
+SessionSteeringOutcome: TypeAlias = Literal[
+    "injected",
+    "startedNewTurn",
+    "promptRequired",
+    "failed",
+]
+
+
+class SessionSteerResult(TypedDict):
+    """Result returned after steering an active agent session."""
+
+    outcome: SessionSteeringOutcome
+    reason: NotRequired[str]
 
 
 class AssistantMessageDeltaData(TypedDict):
@@ -231,6 +246,8 @@ __all__ = [
     "Profile",
     "ProfileInput",
     "RunOptions",
+    "SessionSteerResult",
+    "SessionSteeringOutcome",
     "SpawnFunction",
     "SpawnOptions",
     "SpawnedProcess",
