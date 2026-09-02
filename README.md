@@ -176,6 +176,24 @@ session = await client.create_session(
 
 Handlers may be synchronous or asynchronous. Tool handlers may return a string, which is converted to `{ "content": ... }`, or a protocol-shaped mapping. Command handlers return `{ "action": "pass" }`, `{ "action": "respond", "response": ... }`, or `{ "action": "runAgent", "prompt": ... }`. A `runAgent` result may include optional `display` text to replace the slash command in the visible and persisted user message while keeping `prompt` as the LLM input.
 
+Tool results may include host-facing presentation metadata under `data["presentation"]`:
+
+```python
+from kodelet_sdk import ToolExecutionResult, ToolPresentation
+
+presentation: ToolPresentation = {
+    "summary": "Found 2 matches",
+    "body": "- `src/api.py`\n- `tests/test_api.py`",
+    "format": "markdown",
+}
+result: ToolExecutionResult = {
+    "content": "Found 2 matches.",
+    "data": {"presentation": presentation},
+}
+```
+
+`summary` is required and supplies the complete compact label. `body` optionally provides expanded details; only an omitted body falls back to the ordinary tool content. `format`, when present, declares the body as plain `text` or `markdown`. The SDK forwards this advisory object unchanged inside the generic `data` mapping, and it does not replace model-facing `content`, status, errors, or provenance. Hosts validate presentation metadata as untrusted input, sanitize Markdown, ignore malformed values, and may truncate bodies to their configured extension output limit.
+
 Shortcut handlers receive a `ShortcutContext` and may return `{"action": "submit", "message": "/dictate"}` when the host advertises `capabilities.shortcuts.submit`. Validated shortcuts appear in the native TUI's shortcut help.
 
 Supported shortcut identifiers are case-insensitive ASCII single chords: `ctrl+<ASCII letter>`, `alt+<ASCII letter-or-digit>`, `ctrl+alt+<ASCII letter>`, and unmodified `f1` through `f12`. `control` aliases `ctrl`, `option` aliases `alt`, and modifier order does not matter. `ctrl+i` and `ctrl+m`, including Ctrl+Alt variants, are rejected because terminals report them as Tab and Enter. Shift, Command/Meta/Super, modified function keys, punctuation, spaces, non-ASCII characters, and navigation-key combinations are unsupported. The native TUI skips reserved host bindings, reports overrides and extension-to-extension conflicts, and shows only effective registrations. Shortcuts currently execute only in local native `kodelet chat` sessions.

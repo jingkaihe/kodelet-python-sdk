@@ -63,8 +63,25 @@ Entrypoint = Callable[["Extension"], Awaitable[None] | None]
 HandlerT = TypeVar("HandlerT", bound=Callable[..., Any])
 
 
+class ToolPresentation(TypedDict, total=False):
+    """Host-facing presentation metadata stored at ``data["presentation"]``.
+
+    ``summary`` is the complete compact label. ``body`` optionally provides
+    expanded content, and ``format`` declares whether that content is plain text
+    or Markdown. Hosts validate this advisory metadata as untrusted input and
+    may truncate the body to their extension output limit.
+    """
+
+    summary: Required[str]
+    body: str
+    format: Literal["text", "markdown"]
+
+
 class ToolExecutionResult(TypedDict, total=False):
-    """Protocol-shaped result returned by extension tool handlers."""
+    """Protocol-shaped result returned by extension tool handlers.
+
+    Optional presentation metadata belongs at ``data["presentation"]``.
+    """
 
     content: Required[str]
     data: Mapping[str, Any]

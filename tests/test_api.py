@@ -31,6 +31,7 @@ from kodelet_sdk import (
     ToolContext,
     ToolExecutionResult,
     ToolInputSchema,
+    ToolPresentation,
     ToolUpdateEvent,
     UIConfirmRequest,
     UIFrameLine,
@@ -66,6 +67,18 @@ def test_public_typing_surface() -> None:
     ext = Extension()
     update_event_name: EventName = "tool.update"
     assert update_event_name == "tool.update"
+    presentation: ToolPresentation = {
+        "summary": "Echo complete",
+        "body": "Returned `hello`.",
+        "format": "markdown",
+    }
+    presented_result: ToolExecutionResult = {
+        "content": "hello",
+        "data": {"presentation": presentation, "source": "typing-test"},
+    }
+    assert_type(presentation, ToolPresentation)
+    assert_type(presented_result, ToolExecutionResult)
+    assert presented_result["data"]["presentation"] == presentation
     style: UIStyle = {"foreground": "#00ff00", "bold": True}
     frame_line: UIFrameLine = {"spans": [{"text": "ready", "style": style}]}
     margin: UIMargin = {"top": 1, "bottom": 1}
@@ -901,9 +914,7 @@ async def test_background_task_lease_uses_persistent_rpc_and_retries_failed_rele
         }
     )
 
-    assert await harness.execute_tool({"name": "background", "input": {}}) == {
-        "content": "lease-1"
-    }
+    assert await harness.execute_tool({"name": "background", "input": {}}) == {"content": "lease-1"}
     assert lease is not None
     with pytest.raises(RuntimeError, match="temporary release failure"):
         await lease.close()
@@ -948,9 +959,7 @@ async def test_background_task_capability_returns_local_noop_and_rejects_unavail
 
     harness = await create_test_harness(ext, PersistentRPC())
     harness.initialize({"capabilities": {"runtime": {"backgroundTasks": True}}})
-    assert await harness.execute_tool({"name": "background", "input": {}}) == {
-        "content": "local"
-    }
+    assert await harness.execute_tool({"name": "background", "input": {}}) == {"content": "local"}
     assert local_lease is not None
     await local_lease.close()
     await local_lease.close()

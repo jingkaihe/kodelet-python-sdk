@@ -19,6 +19,8 @@ from kodelet_sdk import (
     ShortcutContext,
     ShortcutResult,
     ToolContext,
+    ToolExecutionResult,
+    ToolPresentation,
     UIContext,
     UISurfaceInputEvent,
     UISurfaceResizeEvent,
@@ -93,10 +95,18 @@ async def test_runtime_serves_json_rpc_and_reverse_host_rpc() -> None:
         text: str = Field(min_length=1)
 
     @ext.tool("echo", description="Echo text", input_schema=EchoInput)
-    async def echo(input: EchoInput, ctx: Any) -> dict[str, str]:
+    async def echo(input: EchoInput, ctx: Any) -> ToolExecutionResult:
         await ctx.update("Working", {"step": 1})
         answer = await ctx.ui.input({"title": "Choose"})
-        return {"content": f"{input.text.upper()}:{answer}"}
+        presentation: ToolPresentation = {
+            "summary": "Echo complete",
+            "body": f"Returned `{input.text.upper()}`.",
+            "format": "markdown",
+        }
+        return {
+            "content": f"{input.text.upper()}:{answer}",
+            "data": {"presentation": presentation},
+        }
 
     @ext.shortcut("ctrl+alt+r", description="Refresh project context")
     async def refresh(ctx: ShortcutContext) -> ShortcutResult:
@@ -130,7 +140,16 @@ async def test_runtime_serves_json_rpc_and_reverse_host_rpc() -> None:
         "extension.tool.execute",
         {"name": "echo", "input": {"text": "hello"}, "context": {"cwd": os.getcwd()}},
     )
-    assert result == {"content": "HELLO:from-host"}
+    assert result == {
+        "content": "HELLO:from-host",
+        "data": {
+            "presentation": {
+                "summary": "Echo complete",
+                "body": "Returned `HELLO`.",
+                "format": "markdown",
+            }
+        },
+    }
     shortcut_result = await client.call(
         "extension.shortcut.execute",
         {
