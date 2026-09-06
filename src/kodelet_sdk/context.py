@@ -14,6 +14,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, NotRequired, Protocol, Required, TypeAlias, TypedDict, cast
 
+from .child import ChildClient
+
 CommandFlagValue: TypeAlias = str | bool | list[str]
 
 
@@ -316,6 +318,7 @@ class _PersistentUIState:
     surface_sequences: dict[tuple[str, str], int]
     surfaces: dict[tuple[str, str], _UISurfaceHandle]
     notification_routing_installed: bool = False
+    capabilities: Mapping[str, Any] | None = None
 
 
 _PERSISTENT_UI_STATE_ATTR = "_kodelet_sdk_persistent_ui_state"
@@ -730,6 +733,7 @@ class UIContext:
         self._client = resolved_client
         self._persistent_client = _persistent_host_rpc_client(resolved_client)
         self._scope_id = _normalize_ui_scope_id(ui_scope_id)
+        _ensure_persistent_notification_routing(self._persistent_client)
 
     async def _request_persistent_ui(self, method: str, params: Any) -> Any:
         request_persistent = getattr(self._client, "request_persistent", None)
@@ -827,7 +831,7 @@ class UIContext:
         """
 
         client = self._persistent_client
-        if not _extension_ui_supported(self._init, "transcript") or client is None:
+        if not _extension_ui_supported(self._init, "transcript", client) or client is None:
             return
         payload = {"message": request} if isinstance(request, str) else dict(request)
         await self._request_persistent_ui(
@@ -853,7 +857,7 @@ class UIContext:
         """
 
         client = self._persistent_client
-        if not _extension_ui_supported(self._init, "widgets") or client is None:
+        if not _extension_ui_supported(self._init, "widgets", client) or client is None:
             return
         object_id = _validate_ui_object_id(id)
         normalized_lines = None if lines is None else _normalize_frame_lines(lines)
@@ -895,7 +899,7 @@ class UIContext:
         """
 
         client = self._persistent_client
-        if not _extension_ui_supported(self._init, "surfaces") or client is None:
+        if not _extension_ui_supported(self._init, "surfaces", client) or client is None:
             raise RuntimeError("Interactive extension surfaces are not available in this host")
 
         surface_options = dict(options)
@@ -956,6 +960,7 @@ class _UISurfaceHandle:
             self._client_ref = None
             self._strong_client = client
         self._closed = False
+        self._open_sequence = 0
         self._closing = False
         self._active = False
         self._close_lock = asyncio.Lock()
@@ -1056,13 +1061,18 @@ class _UISurfaceHandle:
         return unsubscribe
 
     def _activate(self) -> None:
+        if self._closed:
+            raise RuntimeError("The host closed the interactive surface while it was opening")
         self._active = True
 
     def _next_sequence(self) -> int:
         client = self._resolve_client()
         if client is None:
             raise RuntimeError("Extension host connection is closed")
-        return _next_client_sequence(client, self._scope_id, self.id, surface=True)
+        sequence = _next_client_sequence(client, self._scope_id, self.id, surface=True)
+        if self._open_sequence == 0:
+            self._open_sequence = sequence
+        return sequence
 
     def _resolve_client(self) -> HostRPCClient | None:
         if self._client_ref is not None:
@@ -1149,6 +1159,16 @@ class _UISurfaceHandle:
             or params.get("id") != self.id
             or _normalize_ui_scope_id(params.get("scopeId")) != self._scope_id
         ):
+            return
+
+        if method == "extension.ui.surface.closed":
+            if params.get("openSequence") == self._open_sequence:
+                self._clear_local_state()
+                client = self._resolve_client()
+                state = _find_persistent_ui_state(client) if client is not None else None
+                key = (self._scope_id, self.id)
+                if state is not None and state.surfaces.get(key) is self:
+                    state.surfaces.pop(key, None)
             return
 
         input_event = method == "extension.ui.surface.input" and params.get("kind") in {
@@ -1293,14 +1313,17 @@ def _ensure_persistent_notification_routing(client: HostRPCClient | None) -> Non
     def route(method: str, params: Any) -> None:
         if not isinstance(params, Mapping):
             return
-        object_id = params.get("id")
-        if not isinstance(object_id, str):
-            return
-        scope_id = _normalize_ui_scope_id(params.get("scopeId"))
         routed_client = cast(HostRPCClient | None, client_ref()) if client_ref else client
         routed_state = _find_persistent_ui_state(routed_client)
         if routed_state is None:
             return
+        if method == "kodelet.ui.capabilities":
+            routed_state.capabilities = dict(params)
+            return
+        object_id = params.get("id")
+        if not isinstance(object_id, str):
+            return
+        scope_id = _normalize_ui_scope_id(params.get("scopeId"))
         surface = routed_state.surfaces.get((scope_id, object_id))
         if surface is not None:
             surface._handle_notification(method, params)
@@ -1356,7 +1379,11 @@ def _validate_ui_object_id(object_id: str) -> str:
 def _extension_ui_supported(
     init: Mapping[str, Any] | None,
     feature: Literal["widgets", "surfaces", "transcript"],
+    client: HostRPCClient | None = None,
 ) -> bool:
+    state = _find_persistent_ui_state(client) if client is not None else None
+    if state is not None and state.capabilities is not None:
+        return state.capabilities.get(feature) is True
     if init is None:
         return False
     capabilities = init.get("capabilities")
@@ -1420,6 +1447,7 @@ class SharedContext:
         self.env = EnvContext()
         self.log = LogContext(_optional_str(extension.get("id")))
         self._host_rpc_client = _current_host_rpc_client()
+        self.children = ChildClient(self._host_rpc_client)
         self._background_tasks_enabled = _runtime_capability_supported(
             init,
             "backgroundTasks",

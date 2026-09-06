@@ -53,6 +53,27 @@ async def test_stdio_client_preserves_host_rpc_error_code() -> None:
 
 
 @pytest.mark.asyncio
+async def test_native_surface_revoked_while_opening_cannot_activate() -> None:
+    writer = MemoryWriter()
+    client = StdioHostRPCClient(writer)
+    ui = UIContext({"capabilities": {"ui": {"surfaces": True}}}, client, "conversation")
+    opening = asyncio.create_task(ui.open_surface({"id": "canvas"}))
+    request = await writer.read_frame()
+    client.handle_notification(
+        "extension.ui.surface.closed",
+        {
+            "scopeId": "conversation",
+            "id": "canvas",
+            "openSequence": request["params"]["frame"]["sequence"],
+        },
+    )
+    client.handle_response({"jsonrpc": "2.0", "id": request["id"], "result": {"accepted": True}})
+    with pytest.raises(RuntimeError, match=r"closed.*while.*opening"):
+        await opening
+    await client.close()
+
+
+@pytest.mark.asyncio
 async def test_stdio_client_close_disconnects_open_surface_handles() -> None:
     writer = MemoryWriter()
     client = StdioHostRPCClient(writer)

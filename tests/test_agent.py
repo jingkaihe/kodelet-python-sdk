@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -26,6 +27,7 @@ from kodelet_sdk import (
 )
 from kodelet_sdk.agent import BridgeTransport, SpawnedProcess, SpawnOptions
 from kodelet_sdk.agent.bridge import (
+    InMemoryExtensionBridge,
     _BridgeConnection,
     _BridgeRequestState,
     _ConnectionHostRPCClient,
@@ -236,7 +238,7 @@ def test_profile_maps_early_profiler_spelling_and_nested_config() -> None:
 
 
 @pytest.mark.asyncio
-async def test_session_writes_inline_profile_to_temporary_override_config() -> None:
+async def test_session_sends_typed_daemon_flags_without_temporary_config() -> None:
     calls: list[dict[str, Any]] = []
 
     def spawn(_command: str, args: Sequence[str], options: SpawnOptions) -> FakeACPProcess:
@@ -250,30 +252,21 @@ async def test_session_writes_inline_profile_to_temporary_override_config() -> N
             "provider": "openai",
             "model": "gpt-5.5",
             "allowed_tools": ["sdk_echo"],
-            "openai": {"api_mode": "responses", "service_tier": "fast"},
         }
     )
 
     env = calls[0]["env"]
-    assert env["KODELET_CONFIG_FILE_MODE"] == "isolated"
-    assert env.get("KODELET_MODEL") is None
-    config_path = env["KODELET_CONFIG_FILE"]
-    assert calls[0]["args"] == ["acp"]
-    assert json.loads(await _read_text(Path(config_path))) == {
-        "name": "openai",
-        "provider": "openai",
-        "model": "gpt-5.5",
-        "allowed_tools": ["sdk_echo"],
-        "openai": {"api_mode": "responses", "service_tier": "fast"},
-        "profile": "default",
-    }
+    assert "KODELET_CONFIG_FILE_MODE" not in env
+    assert "KODELET_CONFIG_FILE" not in env
+    assert calls[0]["args"] == [
+        "acp", "--provider=openai", "--model=gpt-5.5", '--allowed-tools="sdk_echo"',
+    ]
 
     await session.close()
-    assert not await _exists(Path(config_path))
 
 
 @pytest.mark.asyncio
-async def test_inline_profile_isolation_filters_ambient_kodelet_environment(
+async def test_inline_options_do_not_rewrite_client_environment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[dict[str, Any]] = []
@@ -287,19 +280,19 @@ async def test_inline_profile_isolation_filters_ambient_kodelet_environment(
     await client.create_session(profile={"provider": "openai", "model": "inline-model"})
 
     env = calls[0]["env"]
-    assert env.get("KODELET_MODEL") is None
+    assert env["KODELET_MODEL"] == "ambient-model"
     assert env["KODELET_PROVIDER"] == "explicit-provider"
-    assert env["KODELET_CONFIG_FILE_MODE"] == "isolated"
+    assert "KODELET_CONFIG_FILE_MODE" not in env
     await client.close()
 
 
 @pytest.mark.asyncio
-async def test_session_can_inherit_tool_context_through_live_fork() -> None:
+async def test_session_rejects_unscoped_inherited_context_before_spawn() -> None:
     processes: list[FakeACPProcess] = []
 
     class InheritedContext:
         async def fork_conversation(self) -> str:
-            return "forked-conversation"
+            raise AssertionError("must not fork before scoped authorization")
 
     def spawn(_command: str, _args: Sequence[str], _options: SpawnOptions) -> FakeACPProcess:
         process = FakeACPProcess()
@@ -307,44 +300,34 @@ async def test_session_can_inherit_tool_context_through_live_fork() -> None:
         return process
 
     client = Client(spawn=spawn)
-    session = await client.create_session(
-        inherit_context=cast(Any, InheritedContext()),
-        cwd="/workspace",
-    )
-
-    assert session.id == "forked-conversation"
-    assert [request["method"] for request in processes[0].requests] == [
-        "initialize",
-        "session/load",
-    ]
-    assert processes[0].requests[1]["params"] == {
-        "sessionId": "forked-conversation",
-        "cwd": "/workspace",
-    }
+    with pytest.raises(ValueError, match=r"ctx\.children"):
+        await client.create_session(inherit_context=cast(Any, InheritedContext()))
+    assert processes == []
     await client.close()
 
 
 @pytest.mark.asyncio
-async def test_session_cancellation_while_forking_closes_spawned_process() -> None:
+async def test_session_cancellation_while_loading_closes_spawned_process() -> None:
     processes: list[FakeACPProcess] = []
-    fork_started = asyncio.Event()
+    load_started = asyncio.Event()
 
-    class InheritedContext:
-        async def fork_conversation(self) -> str:
-            fork_started.set()
-            await asyncio.Event().wait()
-            return "unreachable"
+    class DeferredProcess(FakeACPProcess):
+        async def _handle_request(self, request: Mapping[str, Any]) -> None:
+            if request.get("method") == "session/load":
+                load_started.set()
+                return
+            await super()._handle_request(request)
 
     def spawn(_command: str, _args: Sequence[str], _options: SpawnOptions) -> FakeACPProcess:
-        process = FakeACPProcess()
+        process = DeferredProcess()
         processes.append(process)
         return process
 
     client = Client(spawn=spawn)
     create_task = asyncio.create_task(
-        client.create_session(inherit_context=cast(Any, InheritedContext()))
+        client.create_session(resume="existing")
     )
-    await asyncio.wait_for(fork_started.wait(), timeout=1)
+    await asyncio.wait_for(load_started.wait(), timeout=1)
 
     create_task.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -361,7 +344,7 @@ async def test_session_rejects_resume_with_inherited_context() -> None:
             return "forked-conversation"
 
     client = Client()
-    with pytest.raises(ValueError, match="resume and inherit_context"):
+    with pytest.raises(ValueError, match=r"ctx\.children"):
         await client.create_session(
             resume="existing-conversation",
             inherit_context=cast(Any, InheritedContext()),
@@ -375,7 +358,7 @@ async def test_session_rejects_profile_with_inherited_context() -> None:
             return "forked-conversation"
 
     client = Client()
-    with pytest.raises(ValueError, match="profile and inherit_context"):
+    with pytest.raises(ValueError, match=r"ctx\.children"):
         await client.create_session(
             profile="other-profile",
             inherit_context=cast(Any, InheritedContext()),
@@ -669,8 +652,8 @@ async def test_session_runs_kodelet_acp_json_rpc_and_emits_stream_events() -> No
     assert response.stopReason == "end_turn"
     assert session.id == "conv-1"
     assert calls[0]["command"] == "kodelet-test"
-    assert calls[0]["cwd"] == "/workspace"
-    assert calls[0]["args"] == ["--profile", "work", "acp", "--max-turns", "2"]
+    assert calls[0]["cwd"] == os.getcwd()
+    assert calls[0]["args"] == ["acp", "--max-turns=2", "--profile=work"]
     assert calls[0]["env"].get("KODELET_CONFIG_FILE") is None
     assert [request["method"] for request in processes[0].requests] == [
         "initialize",
@@ -687,7 +670,7 @@ async def test_session_runs_kodelet_acp_json_rpc_and_emits_stream_events() -> No
 
 
 @pytest.mark.asyncio
-async def test_session_exposes_in_process_extensions_through_temporary_json_rpc_bridge(
+async def test_session_rejects_inline_extensions_before_spawning(
     tmp_path: Path,
 ) -> None:
     calls: list[dict[str, Any]] = []
@@ -720,31 +703,16 @@ async def test_session_exposes_in_process_extensions_through_temporary_json_rpc_
         return selected or "dismissed"
 
     client = Client(cwd=tmp_path, spawn=spawn)
-    session = await client.create_session(
-        extensions=[ext],
-        ui={"select": lambda request: request["options"][0]},
-    )
-    await session.run_and_wait(message="hello")
-
-    env = calls[0]["env"]
-    assert env["KODELET_CONFIG_FILE_MODE"] == "merge"
-    config_path = Path(env["KODELET_CONFIG_FILE"])
-    config = json.loads(await _read_text(config_path))
-    assert config["extensions"]["enabled"] is True
-    extension_root = Path(config["extensions"]["local_dir"])
-    assert config["extensions"]["allow"] == [str(extension_root)]
-    assert await _is_dir(extension_root)
-    extension_executables = [
-        entry.name
-        for entry in await _iterdir(extension_root)
-        if entry.name.startswith("kodelet-extension-")
-    ]
-    assert len(extension_executables) == 1
-    assert calls[0]["args"] == ["acp"]
-
+    with pytest.raises(ValueError, match=r"ctx\.children"):
+        await client.create_session(extensions=[ext])
+    with pytest.raises(ValueError, match="Inline extension UI"):
+        await client.create_session(ui={"select": lambda request: request["options"][0]})
+    with pytest.raises(ValueError):
+        await client.create_session(profile={"openai": {"api_key": "must-not-forward"}})
+    with pytest.raises(ValueError):
+        await client.create_session(options=cast(Any, None))
+    assert calls == []
     await client.close()
-    assert not await _exists(config_path)
-    assert not await _exists(extension_root)
 
 
 @pytest.mark.asyncio
@@ -755,13 +723,6 @@ async def test_extension_bridge_routes_local_ui_handlers(
 ) -> None:
     selected_values: list[str] = []
     shortcut_contexts: list[tuple[str | None, str | None]] = []
-    extension_root_holder: dict[str, Path] = {}
-
-    def spawn(_command: str, _args: Sequence[str], options: SpawnOptions) -> FakeACPProcess:
-        env = options.get("env") or {}
-        config = json.loads(Path(env["KODELET_CONFIG_FILE"]).read_text(encoding="utf-8"))
-        extension_root_holder["path"] = Path(config["extensions"]["local_dir"])
-        return FakeACPProcess(session_id="conv-ui")
 
     def extension_entrypoint(ext: Extension) -> None:
         ext.set_metadata(name="workspace")
@@ -782,14 +743,13 @@ async def test_extension_bridge_routes_local_ui_handlers(
             shortcut_contexts.append((ctx.conversation_id, ctx.recipe_name))
             return {"action": "submit", "message": "/refresh"}
 
-    client = Client(cwd=tmp_path, spawn=spawn)
-    session = await client.create_session(
-        extensions=[define_extension(extension_entrypoint)],
-        extension_transport=extension_transport,
-        ui={"select": lambda request: request["options"][1]},
+    # Exercise the legacy bridge in isolation, not via daemon session execution.
+    session = await InMemoryExtensionBridge.create(
+        [define_extension(extension_entrypoint)],
+        {"transport": extension_transport, "ui": {"select": lambda request: request["options"][1]}},
     )
 
-    executable = next(extension_root_holder["path"].glob("kodelet-extension-*"))
+    executable = next(iter(await _iterdir(Path(session.config()["local_dir"]))))
     assert f"'transport': '{extension_transport}'" in await _read_text(executable)
     process = await asyncio.create_subprocess_exec(
         str(executable),
@@ -876,19 +836,12 @@ async def test_extension_bridge_routes_local_ui_handlers(
 async def test_extension_bridge_keeps_persistent_surfaces_alive_after_command_returns(
     tmp_path: Path,
 ) -> None:
-    extension_root_holder: dict[str, Path] = {}
     background_tasks: set[asyncio.Future[Any]] = set()
 
     def track(awaitable: Awaitable[Any]) -> None:
         task = asyncio.ensure_future(awaitable)
         background_tasks.add(task)
         task.add_done_callback(background_tasks.discard)
-
-    def spawn(_command: str, _args: Sequence[str], options: SpawnOptions) -> FakeACPProcess:
-        env = options.get("env") or {}
-        config = json.loads(Path(env["KODELET_CONFIG_FILE"]).read_text(encoding="utf-8"))
-        extension_root_holder["path"] = Path(config["extensions"]["local_dir"])
-        return FakeACPProcess(session_id="conv-persistent-ui")
 
     def extension_entrypoint(ext: Extension) -> None:
         @ext.command("game", description="Open a persistent surface")
@@ -928,12 +881,10 @@ async def test_extension_bridge_keeps_persistent_surfaces_alive_after_command_re
             surface.on_input(input_event)
             return {"action": "respond", "response": "opened"}
 
-    client = Client(cwd=tmp_path, spawn=spawn)
-    session = await client.create_session(
-        extensions=[define_extension(extension_entrypoint)],
-        extension_transport="tcp",
+    session = await InMemoryExtensionBridge.create(
+        [define_extension(extension_entrypoint)], {"transport": "tcp"},
     )
-    executable = next(extension_root_holder["path"].glob("kodelet-extension-*"))
+    executable = next(iter(await _iterdir(Path(session.config()["local_dir"]))))
     process = await asyncio.create_subprocess_exec(
         str(executable),
         stdin=asyncio.subprocess.PIPE,
@@ -1073,14 +1024,6 @@ async def test_extension_bridge_keeps_persistent_surfaces_alive_after_command_re
 
 @pytest.mark.asyncio
 async def test_extension_bridge_cancellation_is_connection_scoped(tmp_path: Path) -> None:
-    extension_root_holder: dict[str, Path] = {}
-
-    def spawn(_command: str, _args: Sequence[str], options: SpawnOptions) -> FakeACPProcess:
-        env = options.get("env") or {}
-        config = json.loads(Path(env["KODELET_CONFIG_FILE"]).read_text(encoding="utf-8"))
-        extension_root_holder["path"] = Path(config["extensions"]["local_dir"])
-        return FakeACPProcess(session_id="conv-cancel")
-
     started = {"cancel": asyncio.Event(), "disconnect": asyncio.Event()}
     aborted = {"cancel": asyncio.Event(), "disconnect": asyncio.Event()}
     stale_blocked = {"cancel": asyncio.Event(), "disconnect": asyncio.Event()}
@@ -1136,13 +1079,10 @@ async def test_extension_bridge_cancellation_is_connection_scoped(tmp_path: Path
             ui_cancelled.set()
             raise
 
-    client = Client(cwd=tmp_path, spawn=spawn)
-    session = await client.create_session(
-        extensions=[define_extension(extension_entrypoint)],
-        extension_transport="tcp",
-        ui={"notify": notify},
+    session = await InMemoryExtensionBridge.create(
+        [define_extension(extension_entrypoint)], {"transport": "tcp", "ui": {"notify": notify}},
     )
-    executable = next(extension_root_holder["path"].glob("kodelet-extension-*"))
+    executable = next(iter(await _iterdir(Path(session.config()["local_dir"]))))
 
     process = await asyncio.create_subprocess_exec(
         str(executable),

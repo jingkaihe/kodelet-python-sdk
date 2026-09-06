@@ -34,7 +34,7 @@ if __name__ == "__main__":
 
 ### Agent sessions
 
-Use `Client` to launch Kodelet and drive an agent session from Python. The client speaks to `kodelet acp` over stdio JSON-RPC, so normal profile resolution, conversation persistence, tools, skills, MCP, and extensions still come from the Kodelet executable.
+Use `Client` to launch the thin `kodelet acp` daemon client over stdio JSON-RPC. Set `server` and `runner` on `Client`, or use normal daemon selection. Standalone clients authenticate with client credentials such as `KODELET_AUTH_TOKEN`; provider credentials stay on the daemon. Session `cwd` is interpreted on the runner, not used as the local subprocess directory.
 
 ```python
 from kodelet_sdk import Client
@@ -58,7 +58,6 @@ session = await client.create_session(
         {
             "provider": "openai",
             "model": "gpt-5.5",
-            "openai": {"api_mode": "responses", "service_tier": "fast"},
         }
     ),
     max_turns=4,
@@ -85,25 +84,38 @@ await client.close()
 
 Each `tool.update` contains the latest accumulated output snapshot, not a new delta. Listeners receive every snapshot. To keep completed responses bounded, `response.events` retains only the latest `tool.update` for each `toolCallId`, followed by the authoritative `tool.result`.
 
-An extension tool can create a child session that inherits the caller's live context. `inherit_context` asks the host to snapshot the in-memory conversation into an isolated fork, excluding the unresolved trailing tool call, and then loads that fork in the child ACP process:
+`create_session(options=ExecutionOptions(...), environment_profile="workspace")` accepts typed per-session execution settings and a runner-owned environment profile. Named `profile` values select daemon model profiles; inline profiles accept only typed model/resource/restriction options, not arbitrary provider configuration, credentials, endpoints, or local prompt paths. Explicit false, permitted zero, and empty lists are preserved. Temporary config files and inline executable extensions no longer configure remote execution. `session.close()` detaches; explicit `session.cancel()` targets the active turn.
+
+### Extension-owned presets and delegated children
+
+Use `ctx.children`, not a nested `Client` or `inherit_context`, for model work from an extension tool. Register a preset on the parent extension; its name is scoped to that extension/environment and need not exist in daemon YAML. System-prompt paths are resolved relative to the extension directory on the runner and frozen for the child, including later conversation resume.
 
 ```python
-@ext.tool("delegate", description="Delegate work", input_schema=TaskInput)
-async def delegate(input: TaskInput, ctx: ToolContext) -> str:
-    client = Client()
-    try:
-        session = await client.create_session(
-            inherit_context=ctx,
-            cwd=ctx.cwd,
-            streaming=True,
-        )
-        response = await session.run_and_wait(message=input.task)
-        return response.content
-    finally:
-        await client.close()
+ext.register_profile({
+    "name": "code_search",
+    "systemPromptPath": "search-prompt.md",
+    "options": {
+        "model": "gpt-4o-mini",
+        "allowedTools": ["file_read", "grep_tool", "glob_tool"],
+        "noExtensions": True, "noSkills": True,
+        "enableFSSearchTools": True, "maxTurns": 3,
+    },
+})
+
+@ext.tool("code_search", description="Search the repository", input_schema=TaskInput)
+async def search(input: TaskInput, ctx: ToolContext) -> str:
+    child = await ctx.children.start(
+        profile="code_search", message=input.task, request_id="this-tool-call-search-1",
+    )
+    result = await child.wait(on_event=lambda event: ctx.update(event.get("text") or event["kind"]))
+    return result["output"]
 ```
 
-The fork preserves provider-native history and the persisted model/provider configuration while leaving the parent conversation unchanged. `inherit_context` is mutually exclusive with both `resume` and `profile`; the inherited conversation's stored profile and provider configuration are loaded by ACP. For lower-level control, `await ctx.fork_conversation(name="Delegated task")` returns a named forked conversation ID, which can be passed to `create_session(resume=...)`; omit `name` to preserve the source conversation name.
+`ExecutionProfile` and `ExecutionOptions` accept Python field names as well as camelCase wire names; registration snapshots them. `child.conversation_id` and `child.run_id` are separate durable identities with parent metadata. `read()` returns status/progress; `cancel()` targets only that child. Cancelling `wait()` cancels that child. Child options cannot widen the parent's effective permissions or resource limits, and model selection is validated centrally. `system_prompt` can supply per-invocation content and `cwd` can select a descendant workspace directory. No administrative token, subprocess model loop, or local-provider fallback is used.
+
+Foreground children end with the owning tool handler. For work that outlives it, acquire an activated runner lease with `await ctx.acquire_background_task(...)`, pass `lease=lease` on the first child submission inside the tool, and release it only after all child work finishes. Retained authority has a non-renewing one-hour maximum lifetime and is revoked on release, cancellation, runner/extension loss, or shutdown. Provisional initialization leases are not authority. Stable `request_id` values reconcile repeated submissions within the same live capability; changed input is rejected. Capabilities and bounded progress caches are not restart-replay credentials. Foreground usage aggregates into the parent; retained child usage remains in its own conversation.
+
+`await ctx.fork_conversation(name="Snapshot")` remains available for taking a history snapshot, but does not authorize execution. `inherit_context` is rejected before spawning; migrate execution to registered presets and `ctx.children`.
 
 Live forks require a persistent in-memory conversation. `fork_conversation()` raises `ConversationForkUnavailableError` when unavailable; other host RPC errors should be surfaced.
 
@@ -125,10 +137,10 @@ response = await run_task
 
 `steer()` uses the ACP `_session/steering` extension and returns an outcome such as `{"outcome": "injected"}`. It rejects calls when no run is active or the ACP server does not advertise `_meta.steering.supported`. The SDK requests `idleBehavior: "promptRequired"`, so an end-of-turn race returns `{"outcome": "promptRequired", "reason": "noRunningTurn"}` rather than silently starting another turn. `injected` means Kodelet queued the message, not that the model consumed it before the prompt ended; guidance left unconsumed remains on the conversation for a later run. Blank steering messages are rejected locally.
 
-Agent sessions can expose in-process Python extensions for that session. Inline extensions are served through a temporary JSON-RPC bridge and are removed when the session closes.
+Install executable extensions on the selected runner, where tools, skills, and lifecycle handlers execute. Inline `create_session(extensions=..., extension_transport=..., ui=...)` callbacks are explicitly rejected before spawning rather than silently ignored.
 
 ```python
-from kodelet_sdk import BaseModel, Client, Extension
+from kodelet_sdk import BaseModel, Extension
 
 
 ext = Extension(name="workspace", version="0.1.0")
@@ -145,29 +157,13 @@ async def ask_user_question(input: AskInput, ctx):
     return choice or "dismissed"
 
 
-client = Client()
-session = await client.create_session(
-    extensions=[ext],
-    ui={"select": lambda request: request["options"][0]},
-)
-response = await session.run_and_wait(message="ask me to choose")
-await client.close()
-```
-
-`create_session` accepts either ready-to-use `Extension` instances or entrypoint callables that receive a fresh `Extension`. Prefer passing an `Extension` directly for simple scripts and examples; use an entrypoint callable when each session should build an isolated extension host.
-
-Inline extension bridges use Unix domain sockets by default. If your environment blocks Unix sockets, use a loopback TCP bridge instead:
-
-```python
-session = await client.create_session(
-    extensions=[ext],
-    extension_transport="tcp",  # binds an ephemeral 127.0.0.1 port
-)
+ext.run_sync()  # Invoke from a runner-installed kodelet-extension-* executable.
 ```
 
 ### Extension registration
 
 - `Extension(name=None, version=None)` creates an extension host.
+- `ext.register_profile(ExecutionProfile(...))` or `ext.register_profile({...})` registers an extension-owned child execution preset.
 - `@ext.tool(name=None, description=None, input_schema=None, timeout_in_sec=None)` registers a tool.
 - `@ext.command(name=None, description=None, input_schema=None, aliases=None, kind=None, timeout_in_sec=None)` registers a command.
 - `@ext.shortcut(shortcut, description=None)` registers a native TUI keyboard shortcut handler; `ext.register_shortcut(shortcut, handler=..., description=None)` is the explicit form.

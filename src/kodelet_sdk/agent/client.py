@@ -7,14 +7,11 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, Unpack, cast
 
-from ..api import Entrypoint, Extension
-from ..context import ToolContext
+from ..execution import ExecutionOptions, execution_args
 from .bridge import InMemoryExtensionBridge, TempConfig
 from .rpc import ACPRPCClient
 from .session import Session
-from .transport import _normalize_bridge_transport
 from .types import (
-    AgentUIHandlers,
     ClientOptions,
     CreateSessionOptions,
     Profile,
@@ -35,8 +32,18 @@ class Client:
         cwd: str | os.PathLike[str] | None = None,
         env: Mapping[str, str | None] | None = None,
         spawn: SpawnFunction | None = None,
+        server: str | None = None,
+        runner: str | None = None,
     ) -> None:
         resolved_options: dict[str, Any] = dict(options or {})
+        if server is not None:
+            resolved_options["server"] = server
+        if runner is not None:
+            resolved_options["runner"] = runner
+        self._endpoint_args: list[str] = []
+        for flag in ("server", "runner"):
+            if value := resolved_options.get(flag):
+                self._endpoint_args.extend([f"--{flag}", str(value)])
         if command is not None:
             resolved_options["command"] = command
         if cwd is not None:
@@ -47,7 +54,7 @@ class Client:
             resolved_options["spawn"] = spawn
 
         self._command = str(resolved_options.get("command") or "kodelet")
-        self._cwd = _resolve_path(str(resolved_options.get("cwd") or os.getcwd()))
+        self._cwd = str(resolved_options.get("cwd") or os.getcwd())
         self._env = dict(cast(Mapping[str, str | None], resolved_options.get("env") or {}))
         self._spawn = (
             cast(SpawnFunction | None, resolved_options.get("spawn")) or self._default_spawn
@@ -56,7 +63,7 @@ class Client:
 
     async def create_session(
         self,
-        options: CreateSessionOptions | None = None,
+        session_options: CreateSessionOptions | None = None,
         **kwargs: Unpack[CreateSessionOptions],
     ) -> Session:
         """Create a new Kodelet ACP session.
@@ -65,48 +72,41 @@ class Client:
         as the first argument is also accepted for parity with the TypeScript SDK.
         """
 
-        merged_options: dict[str, Any] = {**dict(options or {}), **kwargs}
+        merged_options: dict[str, Any] = {**dict(session_options or {}), **kwargs}
+        if merged_options.get("extensions") or "extension_transport" in merged_options:
+            raise ValueError("Inline executable extensions are unsupported remotely; install on "
+                             "the runner and use ctx.children for delegated execution")
+        if merged_options.get("ui") is not None:
+            raise ValueError("Inline extension UI handlers are unsupported by this ACP adapter")
+        if merged_options.get("inherit_context") is not None:
+            raise ValueError("Use ctx.children for scoped execution; live forking remains "
+                             "available separately through ctx.fork_conversation")
         resume = merged_options.get("resume")
-        inherit_context = cast(ToolContext | None, merged_options.get("inherit_context"))
-        if isinstance(resume, str) and resume and inherit_context is not None:
-            raise ValueError("resume and inherit_context cannot be used together")
-        if merged_options.get("profile") is not None and inherit_context is not None:
-            raise ValueError("profile and inherit_context cannot be used together")
-        extensions = cast(
-            Sequence[Entrypoint | Extension] | None,
-            merged_options.get("extensions"),
-        )
-        ui = cast(AgentUIHandlers | None, merged_options.get("ui"))
-        extension_transport = _normalize_bridge_transport(merged_options.get("extension_transport"))
-        bridge = (
-            await InMemoryExtensionBridge.create(
-                extensions,
-                {"ui": ui, "transport": extension_transport},
-            )
-            if extensions
-            else None
-        )
-        cwd = _resolve_path(str(merged_options.get("cwd") or self._cwd))
+        cwd = str(merged_options.get("cwd") or self._cwd)
         profile = _normalize_profile(merged_options.get("profile"))
-        launch: LaunchConfig | None = None
+        inline = {key: value for key, value in (profile.config if profile else {}).items()
+                  if key != "name"}
+        execution = ExecutionOptions.model_validate(inline).to_wire()
+        if "options" in merged_options:
+            execution.update(ExecutionOptions.model_validate(merged_options["options"]).to_wire())
+        if "max_turns" in merged_options:
+            execution["maxTurns"] = merged_options["max_turns"]
+        execution = ExecutionOptions.model_validate(execution).to_wire()
+        args = ["acp", *self._endpoint_args,
+                *execution_args(ExecutionOptions.model_validate(execution))]
+        if profile and profile.name and profile.is_named_only():
+            args.append(f"--profile={profile.name}")
+        if merged_options.get("environment_profile"):
+            args.append(f"--runner-profile={merged_options['environment_profile']}")
         rpc: ACPRPCClient | None = None
         try:
-            launch = await _build_launch_config(profile, bridge)
-            env = _clean_env(
-                {
-                    **self._base_env(isolate_kodelet_env=launch.config_file_mode == "isolated"),
-                    **launch.env,
-                }
-            )
-            args = [*launch.args, "acp", *_acp_server_args(merged_options)]
+            env = _clean_env(self._base_env())
             process = await self._spawn_process(
                 args,
-                {"cwd": cwd, "env": env, "stdio": ["pipe"] * 3},
+                {"cwd": os.getcwd(), "env": env, "stdio": ["pipe"] * 3},
             )
             rpc = ACPRPCClient(process)
             await rpc.initialize()
-            if inherit_context is not None:
-                resume = await inherit_context.fork_conversation()
             session_id = (
                 await rpc.load_session(str(resume), cwd)
                 if isinstance(resume, str) and resume
@@ -118,18 +118,12 @@ class Client:
                 session_id=session_id,
                 rpc=rpc,
                 max_turns=cast(int | None, merged_options.get("max_turns")),
-                extension_bridge=bridge,
-                temp_config=launch.temp_config,
             )
             self._sessions.add(session)
             return session
         except BaseException:
             if rpc is not None:
                 await rpc.close()
-            if bridge is not None:
-                await bridge.close()
-            if launch is not None and launch.temp_config is not None:
-                await launch.temp_config.close()
             raise
 
     async def createSession(self, *args: Any, **kwargs: Any) -> Session:
@@ -143,12 +137,8 @@ class Client:
         await asyncio.gather(*(session.close() for session in list(self._sessions)))
         self._sessions.clear()
 
-    def _base_env(self, *, isolate_kodelet_env: bool = False) -> dict[str, str | None]:
+    def _base_env(self) -> dict[str, str | None]:
         env: dict[str, str | None] = dict(os.environ)
-        if isolate_kodelet_env:
-            for key in list(env):
-                if key.startswith("KODELET_"):
-                    del env[key]
         env.update(self._env)
         return env
 

@@ -23,6 +23,65 @@ from kodelet_sdk import (
 
 
 @pytest.mark.asyncio
+async def test_native_takeover_and_closed_handles_are_client_and_opening_scoped() -> None:
+    class Host:
+        def __init__(self) -> None:
+            self.handlers: set[Callable[[str, Any], None]] = set()
+            self.requests: list[tuple[str, Any]] = []
+
+        async def request(self, method: str, params: Any | None = None) -> Any:
+            self.requests.append((method, params))
+            return {"accepted": True}
+
+        def on_notification(self, handler: Callable[[str, Any], None]) -> Callable[[], None]:
+            self.handlers.add(handler)
+            return lambda: self.handlers.discard(handler)
+
+        def notify(self, method: str, params: Any) -> None:
+            for handler in self.handlers:
+                handler(method, params)
+
+    first, second = Host(), Host()
+    init = {"capabilities": {"ui": {"surfaces": False, "widgets": False}}}
+    ui, other = UIContext(init, first, "conversation"), UIContext(init, second, "conversation")
+    with pytest.raises(RuntimeError, match="not available"):
+        await ui.open_surface({"id": "canvas"})
+    first.notify("kodelet.ui.capabilities", {"surfaces": True, "widgets": True})
+    with pytest.raises(RuntimeError, match="not available"):
+        await other.open_surface({"id": "canvas"})
+    assert init["capabilities"]["ui"]["surfaces"] is False
+    surface = await ui.open_surface({"id": "canvas"})
+    open_sequence = first.requests[-1][1]["frame"]["sequence"]
+    first.notify(
+        "extension.ui.surface.closed",
+        {"id": "canvas", "scopeId": "other", "openSequence": open_sequence},
+    )
+    with pytest.raises(RuntimeError, match="already open"):
+        await ui.open_surface({"id": "canvas"})
+    first.notify(
+        "extension.ui.surface.closed",
+        {"id": "canvas", "scopeId": "conversation", "openSequence": open_sequence},
+    )
+    previous = len(first.requests)
+    surface.update(["late frame"])
+    await surface.close()
+    assert len(first.requests) == previous
+    replacement = await ui.open_surface({"id": "canvas"})
+    first.notify(
+        "extension.ui.surface.closed",
+        {"id": "canvas", "scopeId": "conversation", "openSequence": open_sequence},
+    )
+    with pytest.raises(RuntimeError, match="already open"):
+        await ui.open_surface({"id": "canvas"})
+    await replacement.close()
+    first.notify("kodelet.ui.capabilities", {"surfaces": False, "widgets": True})
+    with pytest.raises(RuntimeError, match="not available"):
+        await ui.open_surface({"id": "canvas"})
+    await ui.set_widget("background", ["still active"])
+    assert first.requests[-1][0] == "kodelet.ui.widget.set"
+
+
+@pytest.mark.asyncio
 async def test_widgets_use_sequences_and_surfaces_route_host_events() -> None:
     opened_surface: UISurface | None = None
     input_events: list[UISurfaceInputEvent] = []

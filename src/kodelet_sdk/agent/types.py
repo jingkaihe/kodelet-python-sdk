@@ -13,6 +13,7 @@ from ..context import (
     UINotifyRequest,
     UISelectRequest,
 )
+from ..execution import ExecutionOptions
 
 ProfileInput: TypeAlias = Mapping[str, Any]
 BridgeTransport: TypeAlias = Literal["unix", "tcp"]
@@ -74,6 +75,8 @@ class CreateSessionOptions(TypedDict, total=False):
     """Options accepted by :meth:`Client.create_session`."""
 
     profile: str | Profile | ProfileInput
+    options: ExecutionOptions | Mapping[str, Any]
+    environment_profile: str
     extensions: Sequence[Entrypoint | Extension]
     streaming: bool
     cwd: str
@@ -177,6 +180,9 @@ SpawnFunction: TypeAlias = Callable[
 
 class ClientOptions(TypedDict, total=False):
     """Options accepted by :class:`Client`."""
+
+    server: str
+    runner: str
 
     command: str
     cwd: str | os.PathLike[str]
