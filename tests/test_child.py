@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any
 
 import pytest
@@ -98,6 +99,107 @@ async def test_children_use_scoped_rpc_and_explicit_retained_lease() -> None:
         await ChildClient(None).start(profile="search", message="query")
     with pytest.raises(RuntimeError, match="real runner background lease"):
         await client.start(profile="search", message="query", lease=BackgroundTaskLease(None, None))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retained", [False, True])
+async def test_child_progress_preserves_metadata_monotonic_callbacks_and_exact_run(
+    retained: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events: list[dict[str, Any]] = [
+        {
+            "sequence": 1,
+            "kind": "tool-call",
+            "toolName": "grep_tool",
+            "toolCallId": "search-1",
+            "input": '{ "pattern": "π.*", "path": "src" }\n',
+        },
+        {
+            "sequence": 2,
+            "kind": "tool-result",
+            "toolName": "grep_tool",
+            "toolCallId": "search-1",
+            "toolOutput": "src/parser.ts:2: π\n",
+            "success": True,
+        },
+        {
+            "sequence": 3,
+            "kind": "tool-call",
+            "toolName": "file_read",
+            "toolCallId": "read-1",
+            "input": '{"file_path":"missing.ts"',
+        },
+        {
+            "sequence": 4,
+            "kind": "tool-result",
+            "toolName": "file_read",
+            "toolCallId": "read-1",
+            "toolOutput": "",
+            "success": False,
+            "error": "missing.ts: not found",
+        },
+        {
+            "sequence": 130,
+            "kind": "tool-result",
+            "toolName": "glob_tool",
+            "toolCallId": "legacy-1",
+            "text": "legacy result without metadata",
+        },
+    ]
+    host = Host()
+    final = {**host.result, "done": True, "output": "summary", "events": events[2:]}
+    pages = [
+        {**host.result, "events": events[:1]},
+        {**host.result, "events": events[:3]},
+        final,
+    ]
+
+    async def request(method: str, params: Any = None) -> Any:
+        host.calls.append((method, params, False))
+        return json.loads(json.dumps(pages.pop(0)))
+
+    async def persistent(method: str, params: Any = None) -> Any:
+        host.calls.append((method, params, True))
+        return json.loads(json.dumps(pages.pop(0)))
+
+    monkeypatch.setattr(host, "request", request)
+    monkeypatch.setattr(host, "request_persistent", persistent)
+    lease = BackgroundTaskLease(host, "lease") if retained else None
+    child = await ChildClient(host).start(profile="search", message="query", lease=lease)
+    observed: list[dict[str, Any]] = []
+
+    async def on_event(event: dict[str, Any]) -> None:
+        await asyncio.sleep(0)
+        observed.append(event)
+
+    assert await child.wait(on_event=on_event) == final
+    assert observed == events
+    assert observed[3]["success"] is False
+    assert "success" not in observed[4]
+    assert host.calls[1:] == [
+        (
+            "kodelet.child.read",
+            {
+                "childId": "child",
+                "childRunId": "child-run",
+                "after": after,
+                **({"leaseId": "lease"} if retained else {}),
+            },
+            retained,
+        )
+        for after in (1, 3)
+    ]
+    # Direct reads keep the wire metadata too; a later run cannot replace it.
+    pages.append(final)
+    assert await child.read() == final
+    assert host.calls[-1][1]["after"] == 130
+    pages.append({**final, "runId": "later-run", "events": [{**events[3], "sequence": 131}]})
+    with pytest.raises(RuntimeError, match="does not match this execution"):
+        await child.read()
+    assert child.run_id == "child-run"
+    assert await child.wait(on_event=observed.append) == final
+    assert observed == events
+    assert pages == []
 
 
 @pytest.mark.asyncio
