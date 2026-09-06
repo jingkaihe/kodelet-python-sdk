@@ -4,8 +4,10 @@ import asyncio
 import inspect
 import json
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import suppress
 from typing import Any, cast
 
+from .transport import ACP_MESSAGE_LIMIT
 from .types import (
     AgentRunError,
     SessionSteeringOutcome,
@@ -27,8 +29,6 @@ class ACPRPCClient:
     """Line-oriented JSON-RPC client for the ``kodelet acp`` subprocess."""
 
     def __init__(self, process: SpawnedProcess) -> None:
-        if process.stdin is None:
-            raise RuntimeError("kodelet acp process did not expose stdin")
         self._process = process
         self._next_id = 0
         self._pending: dict[int, asyncio.Future[Any]] = {}
@@ -36,10 +36,15 @@ class ACPRPCClient:
         self._notification_handlers: set[Callable[[str, Any], None]] = set()
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._closed = False
+        self._terminal_error: Exception | None = None
+        self._close_task: asyncio.Task[None] | None = None
         self._steering_supported = False
         self._stdout_task = asyncio.create_task(self._read_stdout()) if process.stdout else None
         self._stderr_task = asyncio.create_task(self._read_stderr()) if process.stderr else None
         self._wait_task = asyncio.create_task(self._wait_for_process())
+        for name, stream in (("stdin", process.stdin), ("stdout", process.stdout)):
+            if stream is None:
+                self._fail_transport(RuntimeError(f"kodelet acp process did not expose {name}"))
 
     async def initialize(self) -> None:
         result = await self.request(
@@ -119,79 +124,155 @@ class ACPRPCClient:
         return unsubscribe
 
     async def close(self) -> None:
-        if self._closed:
-            return
         self._closed = True
         self._reject_pending(RuntimeError("kodelet acp process closed"))
-        self._process.terminate()
+        # Repeated caller cancellation must not cancel process ownership or
+        # interrupt SIGKILL/reaping. Failed cleanup remains explicitly retryable.
+        if self._close_task is None or (
+            self._close_task.done() and self._close_task.exception() is not None
+        ):
+            self._start_close()
+        assert self._close_task is not None
+        await asyncio.shield(self._close_task)
+
+    def _start_close(self) -> None:
+        self._close_task = asyncio.create_task(self._close_process())
+        # Transport failure can start cleanup without a waiting caller. Keep
+        # its error on the task for close(), without an unhandled-task warning.
+        self._close_task.add_done_callback(
+            lambda task: None if task.cancelled() else task.exception()
+        )
+
+    async def _close_process(self) -> None:
         try:
-            await asyncio.wait_for(self._process.wait(), timeout=1)
-        except TimeoutError:
-            self._process.kill()
-            await self._process.wait()
-        for task in (self._stdout_task, self._stderr_task, self._wait_task):
-            if task is not None and not task.done():
+            with suppress(ProcessLookupError):
+                self._process.terminate()
+            try:
+                await asyncio.wait_for(self._process.wait(), timeout=1)
+            except TimeoutError:
+                with suppress(ProcessLookupError):
+                    self._process.kill()
+                try:
+                    await asyncio.wait_for(self._process.wait(), timeout=1)
+                except TimeoutError as exc:
+                    raise RuntimeError(
+                        "kodelet acp process did not close after SIGKILL; cleanup is incomplete"
+                    ) from exc
+        finally:
+            tasks = [
+                task
+                for task in (
+                    self._stdout_task,
+                    self._stderr_task,
+                    self._wait_task,
+                    *self._background_tasks,
+                )
+                if task is not None
+            ]
+            for task in tasks:
                 task.cancel()
-        for task in list(self._background_tasks):
-            task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    def _fail_transport(self, error: Exception) -> None:
+        if self._closed:
+            return
+        self._closed, self._terminal_error = True, error
+        self._reject_pending(error)
+        with suppress(ProcessLookupError):
+            self._process.kill()
+        if self._close_task is None:
+            self._start_close()
 
     async def request(self, method: str, params: Any | None = None) -> Any:
         if self._closed:
-            raise RuntimeError("kodelet acp process is closed")
+            raise self._terminal_error or RuntimeError("kodelet acp process is closed")
         self._next_id += 1
         request_id = self._next_id
         future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
         self._pending[request_id] = future
+        writing = self._send(
+            {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
+        )
         try:
-            await self._write(
-                {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
-            )
             return await future
         finally:
             self._pending.pop(request_id, None)
+            writing.cancel()
+            await asyncio.gather(writing, return_exceptions=True)
 
     def notify(self, method: str, params: Any | None = None) -> None:
         if not self._closed:
-            task = asyncio.create_task(
-                self._write({"jsonrpc": "2.0", "method": method, "params": params})
-            )
-            self._background_tasks.add(task)
-            task.add_done_callback(self._background_tasks.discard)
+            self._send({"jsonrpc": "2.0", "method": method, "params": params})
+
+    def _send(self, message: Mapping[str, Any]) -> asyncio.Task[None]:
+        task = asyncio.create_task(self._write(message))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
 
     async def _write(self, message: Mapping[str, Any]) -> None:
-        stdin = self._process.stdin
-        if stdin is None:
-            raise RuntimeError("kodelet acp process stdin is closed")
-        payload = (json.dumps(message, separators=(",", ":")) + "\n").encode("utf-8")
-        stdin.write(payload)
-        drain = getattr(stdin, "drain", None)
-        if drain is not None:
-            result = drain()
-            if inspect.isawaitable(result):
-                await result
+        try:
+            if self._closed:
+                return
+            stdin = self._process.stdin
+            if stdin is None:
+                raise RuntimeError("kodelet acp process stdin is closed")
+            payload = (json.dumps(message, separators=(",", ":")) + "\n").encode("utf-8")
+            stdin.write(payload)
+            drain = getattr(stdin, "drain", None)
+            if drain is not None:
+                result = drain()
+                if inspect.isawaitable(result):
+                    await result
+        except Exception as exc:
+            self._fail_transport(RuntimeError(f"ACP stdin write failed: {exc}"))
 
     async def _read_stdout(self) -> None:
         stdout = self._process.stdout
         if stdout is None:
             return
-        while True:
-            line = await stdout.readline()
-            if not line:
-                return
-            await self._handle_line(line.decode("utf-8", errors="replace").rstrip("\r\n"))
+        try:
+            while not self._closed:
+                line = await stdout.readline()
+                if not line:
+                    self._fail_transport(
+                        RuntimeError("ACP stdout ended before the client closed the session")
+                    )
+                    return
+                self._check_line_limit(line)
+                await self._handle_line(line.decode("utf-8", errors="replace").rstrip("\r\n"))
+        except Exception as exc:
+            self._fail_transport(
+                RuntimeError(f"ACP stdout read failed (limit {ACP_MESSAGE_LIMIT} bytes): {exc}")
+            )
 
     async def _read_stderr(self) -> None:
         stderr = self._process.stderr
         if stderr is None:
             return
-        while True:
-            line = await stderr.readline()
-            if not line:
-                return
-            self._stderr_chunks.append(line.decode("utf-8", errors="replace"))
+        try:
+            while True:
+                line = await stderr.readline()
+                if not line:
+                    return
+                self._check_line_limit(line)
+                self._stderr_chunks.append(line.decode("utf-8", errors="replace"))
+        except Exception as exc:
+            self._fail_transport(
+                RuntimeError(f"ACP stderr read failed (limit {ACP_MESSAGE_LIMIT} bytes): {exc}")
+            )
+
+    @staticmethod
+    def _check_line_limit(line: bytes) -> None:
+        if len(line) - int(line.endswith(b"\n")) > ACP_MESSAGE_LIMIT:
+            raise ValueError(f"ACP message exceeds {ACP_MESSAGE_LIMIT} byte limit")
 
     async def _wait_for_process(self) -> None:
-        code = await self._process.wait()
+        try:
+            code = await self._process.wait()
+        except Exception as exc:
+            self._fail_transport(RuntimeError(f"ACP process wait failed: {exc}"))
+            return
         if self._closed and not self._pending:
             return
         self._closed = True

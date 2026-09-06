@@ -338,6 +338,34 @@ async def test_session_cancellation_while_loading_closes_spawned_process() -> No
 
 
 @pytest.mark.asyncio
+async def test_acp_close_reports_incomplete_cleanup_and_allows_session_retry() -> None:
+    class StubbornProcess(FakeACPProcess):
+        def __init__(self) -> None:
+            super().__init__()
+            self.signals: list[str] = []
+
+        def terminate(self) -> None:
+            self.signals.append("TERM")
+
+        def kill(self) -> None:
+            self.signals.append("KILL")
+
+    process = StubbornProcess()
+    client = Client(spawn=lambda _command, _args, _options: process)
+    session = await client.create_session()
+    with pytest.raises(RuntimeError, match="cleanup is incomplete"):
+        await asyncio.wait_for(session.close(), timeout=3)
+    assert process.signals == ["TERM", "KILL"]
+    assert session in client._sessions
+    assert session._rpc in client._rpcs
+    process._close(0)
+    await asyncio.wait_for(session.close(), timeout=1)
+    assert session not in client._sessions
+    assert not client._rpcs
+    await client.close()
+
+
+@pytest.mark.asyncio
 async def test_session_rejects_resume_with_inherited_context() -> None:
     class InheritedContext:
         async def fork_conversation(self) -> str:

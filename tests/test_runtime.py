@@ -10,7 +10,9 @@ from typing import Any, cast
 import pytest
 
 from kodelet_sdk import (
+    BackgroundTaskLease,
     BaseModel,
+    ChildClient,
     CommandContext,
     CommandResult,
     Extension,
@@ -549,6 +551,137 @@ async def test_stdio_persistent_request_is_not_replayed_after_request_ends(
             await client.request_persistent("kodelet.ui.transcript.append", {"message": "one"})
 
     assert calls == ["parented"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["read", "cancel", "steer", "followup"])
+async def test_retained_child_rpc_survives_originating_request_completion(operation: str) -> None:
+    writer = MemoryWriter()
+    transport = StdioHostRPCClient(writer)
+    state = _StdioRequestState(7)
+    scoped = _RequestScopedHostRPCClient(transport, state)
+    children = ChildClient(scoped)
+    lease = BackgroundTaskLease(scoped, "lease")
+    identity = {"conversationId": "child", "runId": "first-run", "done": False}
+    starting = asyncio.create_task(children.start(profile="search", message="query", lease=lease))
+    first = await writer.read_frame()
+    assert first["parentId"] == 7, "first admission requires live tool authority"
+    transport.handle_response({"jsonrpc": "2.0", "id": first["id"], "result": identity})
+    child = await starting
+
+    if operation == "followup":
+        call = children.start(
+            profile="search", message="next", resume=child.conversation_id, lease=lease
+        )
+        result: Any = {**identity, "runId": "next-run"}
+    elif operation == "steer":
+        call = child.steer("guidance", request_id="stable")
+        result = {"outcome": "injected"}
+    elif operation == "cancel":
+        call = child.cancel()
+        result = {**identity, "done": True, "cancelled": True}
+    else:
+        call = child.read()
+        result = {**identity, "done": True, "output": "completed after handler"}
+    pending = asyncio.create_task(call)
+    request = await writer.read_frame()
+    assert state.active, "the retained request starts before handler completion"
+    assert "parentId" not in request
+    assert request["params"]["leaseId"] == "lease"
+    if operation != "followup":
+        assert request["params"]["childRunId"] == "first-run"
+    await transport.finish_request(state)
+    assert transport.handle_response({"jsonrpc": "2.0", "id": request["id"], "result": result})
+    await asyncio.wait_for(pending, timeout=1)
+    await transport.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "late_response", [{"result": {}}, {"error": {"code": -1, "message": "late"}}]
+)
+async def test_late_reverse_response_cannot_cancel_colliding_forward_request(
+    late_response: dict[str, Any],
+) -> None:
+    ext = Extension(name="duplex-ids")
+    read_cancelled = asyncio.Event()
+    release = asyncio.Event()
+    driver_cancelled = asyncio.Event()
+    reading: asyncio.Task[Any] | None = None
+
+    @ext.tool("driver", description="Retain a handler across a late response", input_schema={})
+    async def driver(_input: Any, ctx: ToolContext) -> str:
+        nonlocal reading
+        try:
+            child = await ctx.children.start(profile="search", message="query")
+            reading = asyncio.create_task(child.read())
+            try:
+                await reading
+            except asyncio.CancelledError:
+                read_cancelled.set()
+            await release.wait()
+            return "driver remained active"
+        except asyncio.CancelledError:
+            driver_cancelled.set()
+            raise
+
+    @ext.tool("release", description="Barrier after processing a late response", input_schema={})
+    async def release_driver(_input: Any, _ctx: ToolContext) -> str:
+        release.set()
+        return "released"
+
+    reader, writer = MemoryReader(), MemoryWriter()
+    server = asyncio.create_task(run_stdio_server(ext, reader, writer))
+    try:
+        await RpcTestClient(reader, writer).call("extension.initialize", {})
+        reader.feed(
+            _frame(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "extension.tool.execute",
+                    "params": {"name": "driver", "input": {}},
+                }
+            )
+        )
+        start = await asyncio.wait_for(writer.read_frame(), timeout=1)
+        assert start["method"] == "kodelet.child.start"
+        reader.feed(
+            _frame(
+                {
+                    "jsonrpc": "2.0",
+                    "id": start["id"],
+                    "result": {"conversationId": "child", "runId": "run", "done": False},
+                }
+            )
+        )
+        request = await asyncio.wait_for(writer.read_frame(), timeout=1)
+        assert request["method"] == "kodelet.child.read"
+        assert request["id"] == 2, "opposite directions may use the same numeric ID"
+        assert reading is not None
+        reading.cancel()
+        await asyncio.wait_for(read_cancelled.wait(), timeout=1)
+        reader.feed(_frame({"jsonrpc": "2.0", "id": 2, **late_response}))
+        reader.feed(
+            _frame(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "extension.tool.execute",
+                    "params": {"name": "release", "input": {}},
+                }
+            )
+        )
+        responses = [await asyncio.wait_for(writer.read_frame(), timeout=1) for _ in range(2)]
+        assert not driver_cancelled.is_set()
+        assert {response["id"]: response.get("result") for response in responses} == {
+            2: {"content": "driver remained active"},
+            3: {"content": "released"},
+        }
+        assert all("error" not in response for response in responses)
+    finally:
+        reader.close()
+        await asyncio.wait_for(server, timeout=1)
 
 
 @pytest.mark.asyncio

@@ -293,7 +293,10 @@ async def run_stdio_server(
                 continue
             if not isinstance(message, Mapping):
                 continue
-            if not message.get("method") and host_client.handle_response(message):
+            if not message.get("method"):
+                # Opposite directions have independent ID spaces. A late or
+                # unknown response must never replace a live incoming request.
+                host_client.handle_response(message)
                 continue
 
             method = message.get("method")

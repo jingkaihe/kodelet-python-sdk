@@ -65,7 +65,7 @@ from .api import (
     define_extension,
     on,
 )
-from .child import ChildClient, ChildExecution
+from .child import ChildClient, ChildExecution, ChildSteerResult
 from .context import (
     BackgroundTaskLease,
     CommandContext,
@@ -155,6 +155,7 @@ __all__ = [
     "BridgeTransport",
     "ChildClient",
     "ChildExecution",
+    "ChildSteerResult",
     "Client",
     "ClientOptions",
     "CommandContext",

@@ -11,6 +11,7 @@ from ..execution import ExecutionOptions, execution_args
 from .bridge import InMemoryExtensionBridge, TempConfig
 from .rpc import ACPRPCClient
 from .session import Session
+from .transport import spawn_acp
 from .types import (
     ClientOptions,
     CreateSessionOptions,
@@ -60,6 +61,7 @@ class Client:
             cast(SpawnFunction | None, resolved_options.get("spawn")) or self._default_spawn
         )
         self._sessions: set[Session] = set()
+        self._rpcs: set[ACPRPCClient] = set()
 
     async def create_session(
         self,
@@ -106,6 +108,7 @@ class Client:
                 {"cwd": os.getcwd(), "env": env, "stdio": ["pipe"] * 3},
             )
             rpc = ACPRPCClient(process)
+            self._rpcs.add(rpc)
             await rpc.initialize()
             session_id = (
                 await rpc.load_session(str(resume), cwd)
@@ -124,6 +127,7 @@ class Client:
         except BaseException:
             if rpc is not None:
                 await rpc.close()
+                self._rpcs.discard(rpc)
             raise
 
     async def createSession(self, *args: Any, **kwargs: Any) -> Session:
@@ -134,8 +138,14 @@ class Client:
     async def close(self) -> None:
         """Close all sessions owned by this client."""
 
-        await asyncio.gather(*(session.close() for session in list(self._sessions)))
+        # Include initializing sessions whose caller was cancelled during
+        # cleanup. Their shielded RPC cleanup remains owned until confirmed.
+        await asyncio.gather(
+            *(session.close() for session in list(self._sessions)),
+            *(rpc.close() for rpc in list(self._rpcs)),
+        )
         self._sessions.clear()
+        self._rpcs.clear()
 
     def _base_env(self) -> dict[str, str | None]:
         env: dict[str, str | None] = dict(os.environ)
@@ -154,19 +164,11 @@ class Client:
         args: Sequence[str],
         options: SpawnOptions,
     ) -> SpawnedProcess:
-        process = await asyncio.create_subprocess_exec(
-            command,
-            *args,
-            cwd=options.get("cwd"),
-            env=dict(options.get("env") or {}),
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        return cast(SpawnedProcess, process)
+        return await spawn_acp(command, args, options)
 
     def _delete_session(self, session: Session) -> None:
         self._sessions.discard(session)
+        self._rpcs.discard(session._rpc)
 
 
 class LaunchConfig:

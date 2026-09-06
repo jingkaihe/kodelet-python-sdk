@@ -3,11 +3,56 @@ from __future__ import annotations
 import asyncio
 import json
 import stat
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from contextlib import suppress
 from pathlib import Path
 from typing import Any, cast
 
-from .types import BridgeTransport
+from .types import BridgeTransport, SpawnedProcess, SpawnOptions
+
+ACP_MESSAGE_LIMIT = 64 * 1024 * 1024
+
+
+class _ACPProcess:
+    def __init__(
+        self, process: asyncio.subprocess.Process, transport: asyncio.SubprocessTransport
+    ) -> None:
+        self._process = process
+        self._transport = transport
+        self.stdin, self.stdout, self.stderr = process.stdin, process.stdout, process.stderr
+
+    def terminate(self) -> None:
+        with suppress(ProcessLookupError):
+            self._transport.terminate()
+
+    def kill(self) -> None:
+        with suppress(ProcessLookupError):
+            self._transport.kill()
+        # Process.wait also waits for pipe disconnection. A failed reader can
+        # leave a paused/full pipe after SIGKILL; close it to permit reaping.
+        for fd in (0, 1, 2):
+            pipe = self._transport.get_pipe_transport(fd)
+            if pipe is not None:
+                pipe.close()
+
+    async def wait(self) -> int:
+        return await self._process.wait()
+
+
+async def spawn_acp(command: str, args: Sequence[str], options: SpawnOptions) -> SpawnedProcess:
+    loop = asyncio.get_running_loop()
+    transport, protocol = await loop.subprocess_exec(
+        lambda: asyncio.subprocess.SubprocessStreamProtocol(limit=ACP_MESSAGE_LIMIT, loop=loop),
+        command,
+        *args,
+        cwd=options.get("cwd"),
+        env=dict(options.get("env") or {}),
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    process = asyncio.subprocess.Process(transport, protocol, loop)
+    return cast(SpawnedProcess, _ACPProcess(process, transport))
 
 
 class BridgeEndpoint:
@@ -91,7 +136,7 @@ def _extension_bridge_executable(endpoint: BridgeEndpoint) -> str:
             raise RuntimeError("TCP extension bridge endpoint is missing host/port")
         endpoint_config = {"transport": "tcp", "host": endpoint.host, "port": endpoint.port}
 
-    return f'''#!/usr/bin/env python3
+    return f"""#!/usr/bin/env python3
 from __future__ import annotations
 
 import json
@@ -190,7 +235,7 @@ def main():
 
 if __name__ == "__main__":
     raise SystemExit(main())
-'''
+"""
 
 
 __all__ = ["BridgeEndpoint"]

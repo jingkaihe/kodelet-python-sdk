@@ -165,8 +165,8 @@ class Session:
     async def close(self) -> None:
         """Close the underlying ACP process and temporary session resources."""
 
-        if self._closed:
-            return
+        # Mark unusable immediately, but retry cleanup after cancellation or an
+        # unconfirmed process exit instead of treating it as already complete.
         self._closed = True
         await self._rpc.close()
         if self._extension_bridge is not None:

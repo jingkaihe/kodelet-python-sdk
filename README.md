@@ -113,6 +113,17 @@ async def search(input: TaskInput, ctx: ToolContext) -> str:
 
 `ExecutionProfile` and `ExecutionOptions` accept Python field names as well as camelCase wire names; registration snapshots them. `child.conversation_id` and `child.run_id` are separate durable identities with parent metadata. `read()` returns status/progress; `cancel()` targets only that child. Cancelling `wait()` cancels that child. Child options cannot widen the parent's effective permissions or resource limits, and model selection is validated centrally. `system_prompt` can supply per-invocation content and `cwd` can select a descendant workspace directory. No administrative token, subprocess model loop, or local-provider fallback is used.
 
+With SDK 0.2.1 and a matching daemon/runner, `context_mode="fork"` snapshots the active parent's history; omitted context is fresh. Forking must begin inside the originating tool handler, even with a retained lease. `resume=child.conversation_id` submits a follow-up to that owned conversation with a new run ID and request ID; it cannot be combined with fork or loosen the saved policy. Old handles remain bound to their original run and cannot cancel or steer the follow-up.
+
+```python
+child = await ctx.children.start(profile="review", message="Review changes", context_mode="fork")
+steered = await child.steer("Also check cancellation", request_id="guidance-1")
+await child.wait()
+followup = await ctx.children.start(profile="review", message="Check the fix", resume=child.conversation_id)
+```
+
+`steer(message, request_id=...)` returns `{"outcome": "injected"}` when guidance is queued, or `{"outcome": "promptRequired", "reason": "noRunningTurn"}` when no turn is active. It never starts a turn automatically. Optional stable steering IDs deduplicate repeated guidance; omitted IDs are generated. Start/steer failures are never retried automatically. A cancelled or disconnected start may already be admitted: retain its request ID and background lease until exact child cancellation or acknowledged lease cleanup. After restart, resuming requires fresh tool authority; saved IDs alone are not credentials.
+
 Foreground children end with the owning tool handler. For work that outlives it, acquire an activated runner lease with `await ctx.acquire_background_task(...)`, pass `lease=lease` on the first child submission inside the tool, and release it only after all child work finishes. Retained authority has a non-renewing one-hour maximum lifetime and is revoked on release, cancellation, runner/extension loss, or shutdown. Provisional initialization leases are not authority. Stable `request_id` values reconcile repeated submissions within the same live capability; changed input is rejected. Capabilities and bounded progress caches are not restart-replay credentials. Foreground usage aggregates into the parent; retained child usage remains in its own conversation.
 
 `await ctx.fork_conversation(name="Snapshot")` remains available for taking a history snapshot, but does not authorize execution. `inherit_context` is rejected before spawning; migrate execution to registered presets and `ctx.children`.
@@ -138,6 +149,8 @@ response = await run_task
 `steer()` uses the ACP `_session/steering` extension and returns an outcome such as `{"outcome": "injected"}`. It rejects calls when no run is active or the ACP server does not advertise `_meta.steering.supported`. The SDK requests `idleBehavior: "promptRequired"`, so an end-of-turn race returns `{"outcome": "promptRequired", "reason": "noRunningTurn"}` rather than silently starting another turn. `injected` means Kodelet queued the message, not that the model consumed it before the prompt ended; guidance left unconsumed remains on the conversation for a later run. Blank steering messages are rejected locally.
 
 Install executable extensions on the selected runner, where tools, skills, and lifecycle handlers execute. Inline `create_session(extensions=..., extension_transport=..., ui=...)` callbacks are explicitly rejected before spawning rather than silently ignored.
+
+The standalone `Client` ACP adapter accepts subprocess lines up to 64 MiB each. Oversized messages, pipe failures, and unexpected stdout closure fail pending requests and stop the subprocess; cleanup is bounded and retryable. This is a per-message ACP limit, not a conversation-history or scoped-child transport limit.
 
 ```python
 from kodelet_sdk import BaseModel, Extension
