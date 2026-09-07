@@ -11,7 +11,6 @@ from .rpc import ACPRPCClient
 from .types import AgentResponse, AgentStreamEvent, RunOptions, SessionSteerResult
 
 if TYPE_CHECKING:
-    from .bridge import InMemoryExtensionBridge, TempConfig
     from .client import Client
 
 
@@ -29,16 +28,12 @@ class Session:
         session_id: str,
         rpc: ACPRPCClient,
         max_turns: int | None = None,
-        extension_bridge: InMemoryExtensionBridge | None = None,
-        temp_config: TempConfig | None = None,
     ) -> None:
         self.cwd = cwd
         self._client = client
         self._rpc = rpc
         self._max_turns = max_turns
         self._conversation_id = session_id
-        self._extension_bridge = extension_bridge
-        self._temp_config = temp_config
         self._closed = False
         self._running = False
         self._listeners: dict[str, list[EventListener]] = {}
@@ -163,16 +158,12 @@ class Session:
         return await self._rpc.steer_session(self._conversation_id, message)
 
     async def close(self) -> None:
-        """Close the underlying ACP process and temporary session resources."""
+        """Close the underlying ACP process and cancel listener tasks."""
 
         # Mark unusable immediately, but retry cleanup after cancellation or an
         # unconfirmed process exit instead of treating it as already complete.
         self._closed = True
         await self._rpc.close()
-        if self._extension_bridge is not None:
-            await self._extension_bridge.close()
-        if self._temp_config is not None:
-            await self._temp_config.close()
         for task in list(self._listener_tasks):
             task.cancel()
         self._client._delete_session(self)

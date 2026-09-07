@@ -4,34 +4,25 @@ import asyncio
 import json
 import os
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, cast
 
 import pytest
 
 import kodelet_sdk
 from kodelet_sdk import (
+    AgentUIHandlers,
     BaseModel,
+    BridgeTransport,
     Client,
-    CommandContext,
-    CommandResult,
+    CreateSessionOptions,
     Extension,
+    HostRPCError,
     Profile,
     SessionSteerResult,
-    ShortcutContext,
-    ShortcutResult,
+    ToolContext,
     ToolUpdateData,
-    UISurfaceInputEvent,
-    UISurfaceResizeEvent,
-    define_extension,
 )
-from kodelet_sdk.agent import BridgeTransport, SpawnedProcess, SpawnOptions
-from kodelet_sdk.agent.bridge import (
-    InMemoryExtensionBridge,
-    _BridgeConnection,
-    _BridgeRequestState,
-    _ConnectionHostRPCClient,
-)
+from kodelet_sdk.agent import SpawnedProcess, SpawnOptions
 from kodelet_sdk.agent.rpc import ACPRPCClient
 
 _DEFAULT_RESPONSE = object()
@@ -46,6 +37,7 @@ class FakeACPProcess(SpawnedProcess):
         | None = None,
         steer_result: Any = _DEFAULT_RESPONSE,
         steering_supported: bool = True,
+        extension_version: Any = None,
     ) -> None:
         self.stdout = _QueueLineReader()
         self.stderr = _QueueLineReader()
@@ -59,6 +51,15 @@ class FakeACPProcess(SpawnedProcess):
             else steer_result
         )
         self._steering_supported = steering_supported
+        self._extension_version = extension_version
+        self._server_id = 0
+        self._server_pending: dict[int, asyncio.Future[dict[str, Any]]] = {}
+        self.server_responses: list[dict[str, Any]] = []
+        self._extension_pending: dict[
+            tuple[str, str, int | str], asyncio.Future[dict[str, Any]]
+        ] = {}
+        self.extension_frames: list[dict[str, Any]] = []
+        self.host_frames: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         self._closed = asyncio.Event()
         self._returncode = 0
         self._tasks: set[asyncio.Task[Any]] = set()
@@ -81,6 +82,77 @@ class FakeACPProcess(SpawnedProcess):
         assert isinstance(stdout, _QueueLineReader)
         stdout.feed(f"{json.dumps(message)}\n".encode())
 
+    async def extension_frame(
+        self,
+        message: Mapping[str, Any] | None = None,
+        *,
+        session_id: str | None = None,
+        run_id: str = "run-1",
+        extension_id: str = "inline-1",
+        close: bool = False,
+    ) -> dict[str, Any]:
+        """Send a reverse ACP request and wait only for its acceptance ACK."""
+
+        self._server_id += 1
+        request_id = self._server_id
+        pending: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+        self._server_pending[request_id] = pending
+        self.write({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "kodelet/extensionFrame",
+            "params": {
+                "sessionId": session_id or self._session_id,
+                "runId": run_id,
+                "extensionId": extension_id,
+                **({"close": True} if close else {"message": message}),
+            },
+        })
+        try:
+            return await asyncio.wait_for(pending, timeout=2)
+        finally:
+            self._server_pending.pop(request_id, None)
+
+    async def extension_call(
+        self,
+        method: str,
+        params: Mapping[str, Any] | None = None,
+        *,
+        request_id: int | str = 1,
+        run_id: str = "run-1",
+        extension_id: str = "inline-1",
+    ) -> dict[str, Any]:
+        """Wait for the raw extension response separately from the ACP ACK."""
+
+        key = (run_id, extension_id, request_id)
+        pending: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+        assert key not in self._extension_pending
+        self._extension_pending[key] = pending
+        try:
+            ack = await self.extension_frame(
+                {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params or {}},
+                run_id=run_id,
+                extension_id=extension_id,
+            )
+            assert ack.get("result") == {}, ack
+            return await asyncio.wait_for(pending, timeout=2)
+        finally:
+            self._extension_pending.pop(key, None)
+
+    async def respond_to_host(
+        self, frame: Mapping[str, Any], result: Any = None, *, error: Any = None
+    ) -> None:
+        ack = await self.extension_frame(
+            {
+                "jsonrpc": "2.0",
+                "id": frame["message"]["id"],
+                **({"error": error} if error is not None else {"result": result}),
+            },
+            run_id=frame["runId"],
+            extension_id=frame["extensionId"],
+        )
+        assert ack.get("result") == {}, ack
+
     def handle_input(self, chunk: bytes) -> None:
         for line in chunk.decode("utf-8").splitlines():
             if not line.strip():
@@ -88,7 +160,13 @@ class FakeACPProcess(SpawnedProcess):
             request = json.loads(line)
             if not isinstance(request, dict):
                 continue
-            if not request.get("method") or request.get("id") is None:
+            if not request.get("method"):
+                self.server_responses.append(request)
+                pending = self._server_pending.get(request.get("id"))
+                if pending is not None and not pending.done():
+                    pending.set_result(request)
+                continue
+            if request.get("id") is None:
                 continue
             self.requests.append(request)
             task = asyncio.create_task(self._handle_request(request))
@@ -105,11 +183,11 @@ class FakeACPProcess(SpawnedProcess):
                     "protocolVersion": 1,
                     "agentCapabilities": {},
                     "authMethods": [],
-                    "_meta": (
-                        {"steering": {"supported": True}}
-                        if self._steering_supported
-                        else None
-                    ),
+                    "_meta": {
+                        **({"steering": {"supported": True}} if self._steering_supported else {}),
+                        **({"sessionExtensions": {"version": self._extension_version}}
+                           if self._extension_version is not None else {}),
+                    },
                 },
             )
             return
@@ -117,7 +195,21 @@ class FakeACPProcess(SpawnedProcess):
             self._respond(request_id, {"sessionId": self._session_id})
             return
         if method == "session/load":
+            self._session_id = request["params"]["sessionId"]
             self._respond(request_id, {})
+            return
+        if method == "kodelet/extensionFrame":
+            self._respond(request_id, {})
+            frame = dict(request["params"])
+            self.extension_frames.append(frame)
+            message = frame.get("message") or {}
+            if message.get("method") or frame.get("close"):
+                self.host_frames.put_nowait(frame)
+            else:
+                key = (frame["runId"], frame["extensionId"], message["id"])
+                pending = self._extension_pending.get(key)
+                if pending is not None and not pending.done():
+                    pending.set_result(message)
             return
         if method == "session/prompt":
             try:
@@ -195,6 +287,9 @@ def test_agent_package_preserves_public_reexports() -> None:
     assert agent.Client is Client
     assert agent.Profile is Profile
     assert agent.SessionSteerResult is SessionSteerResult
+    assert agent.CreateSessionOptions is CreateSessionOptions
+    assert agent.AgentUIHandlers is AgentUIHandlers
+    assert agent.BridgeTransport is BridgeTransport
     assert kodelet_sdk.Client is Client
     assert kodelet_sdk.SessionSteerResult is SessionSteerResult
     assert client_module.Client is Client
@@ -235,6 +330,14 @@ def test_profile_maps_early_profiler_spelling_and_nested_config() -> None:
             },
         },
     }
+    assert profile.toLaunchConfig() == profile.to_launch_config()
+
+
+def test_named_profile_preserves_launch_config() -> None:
+    profile = Profile.named("work")
+
+    assert profile.to_launch_config() == {"args": ["--profile", "work"]}
+    assert profile.toLaunchConfig() == profile.to_launch_config()
 
 
 @pytest.mark.asyncio
@@ -363,6 +466,876 @@ async def test_acp_close_reports_incomplete_cleanup_and_allows_session_retry() -
     assert session not in client._sessions
     assert not client._rpcs
     await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("as_mapping", [False, True], ids=["kwargs", "mapping"])
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"extension_transport": "unix"},
+        {"extension_transport": "tcp"},
+        {"extension_transport": None},
+        {"extensions": [], "extension_transport": "tcp"},
+        {"ui": {}},
+        {"ui": {"select": lambda _request: pytest.fail("unexpected UI call")}},
+    ],
+)
+async def test_inline_compatibility_options_without_extensions_do_not_require_relay(
+    options: CreateSessionOptions, as_mapping: bool
+) -> None:
+    process = FakeACPProcess()
+    client = Client(spawn=lambda _command, _args, _options: process)
+    try:
+        session = (
+            await client.create_session(options)
+            if as_mapping else await client.create_session(**options)
+        )
+        assert session.id == "conv-1"
+        assert process.requests[1]["params"] == {"cwd": os.getcwd()}
+        assert process.extension_frames == []
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("version", [None, 0, 2, "1", True])
+@pytest.mark.parametrize("resume", ["", "saved-session"])
+async def test_inline_extensions_require_negotiated_version_before_new_or_load(
+    version: Any, resume: str
+) -> None:
+    process = FakeACPProcess(extension_version=version)
+    client = Client(spawn=lambda _command, _args, _options: process)
+
+    def entrypoint(_ext: Extension) -> None:
+        pytest.fail("capability failure must not invoke entrypoints")
+
+    try:
+        with pytest.raises(RuntimeError, match=r"sessionExtensions.*version 1"):
+            await client.create_session(extensions=[entrypoint], resume=resume)
+        assert [request["method"] for request in process.requests] == ["initialize"]
+        capabilities = process.requests[0]["params"]["clientCapabilities"]
+        assert capabilities["_meta"]["sessionExtensions"] == {"version": 1}
+        assert process._closed.is_set()
+        assert not client._sessions
+        assert not client._rpcs
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resume", ["", "saved-session"])
+@pytest.mark.parametrize("transport", ["unix", "tcp"])
+async def test_inline_attachment_metadata_is_deterministic_and_callbacks_stay_live(
+    resume: str, transport: BridgeTransport
+) -> None:
+    process = FakeACPProcess(extension_version=1)
+    spawned: list[list[str]] = []
+
+    def spawn(_command: str, args: Sequence[str], _options: SpawnOptions) -> FakeACPProcess:
+        spawned.append(list(args))
+        return process
+
+    client = Client(spawn=spawn, server="https://daemon.example", runner="selected")
+    original = Extension(name="live")
+    state = {"prefix": "before"}
+    entrypoints: list[Extension] = []
+
+    @original.tool("read_state", description="Read the original Python closure")
+    async def read_state() -> str:
+        return state["prefix"]
+
+    def entrypoint(ext: Extension) -> None:
+        entrypoints.append(ext)
+        ext.tool("other", description="Second extension")(lambda: "other result")
+
+    try:
+        session = await client.create_session({
+            "extensions": [original, entrypoint],
+            "resume": resume,
+            "extension_transport": transport,
+            "ui": {},
+        })
+        assert spawned == [["acp", "--server", "https://daemon.example", "--runner", "selected"]]
+        attachment = process.requests[1]
+        assert attachment["method"] == ("session/load" if resume else "session/new")
+        assert attachment["params"]["_meta"] == {
+            "sessionExtensions": {"version": 1, "extensionIds": ["inline-1", "inline-2"]}
+        }
+        assert entrypoints == []
+        for extension_id in ("inline-1", "inline-2"):
+            initialized = await process.extension_call(
+                "extension.initialize", {"extension": {"id": extension_id}},
+                extension_id=extension_id,
+            )
+            assert len(initialized["result"]["tools"]) == 1
+        assert len(entrypoints) == 1
+        state["prefix"] = "changed after attachment"
+        result = await process.extension_call("extension.tool.execute", {"name": "read_state"})
+        assert result["result"] == {"content": "changed after attachment"}
+        other = await process.extension_call(
+            "extension.tool.execute", {"name": "other"}, extension_id="inline-2"
+        )
+        assert other["result"] == {"content": "other result"}
+        assert session.id == (resume or "conv-1")
+        assert original._init_params is None
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_inline_prompt_streams_updates_and_nested_host_rpc_with_colliding_ids() -> None:
+    ext = Extension(name="streaming")
+    results: list[dict[str, Any]] = []
+
+    @ext.tool("stream", description="Publish snapshots and fork on the runner")
+    async def stream(_input: Any, ctx: ToolContext) -> str:
+        await ctx.update("first", {"count": 1})
+        await ctx.update("first and second", {"count": 2})
+        return await ctx.fork_conversation("snapshot")
+
+    async def on_prompt(_request: Mapping[str, Any], process: FakeACPProcess) -> None:
+        result = await process.extension_call(
+            "extension.tool.execute", {"name": "stream"}, request_id=1
+        )
+        results.append(result)
+        process.notify("session/update", {
+            "sessionId": "conv-1",
+            "update": {"sessionUpdate": "agent_message_chunk",
+                       "content": {"type": "text", "text": result["result"]["content"]}},
+        })
+
+    process = FakeACPProcess(extension_version=1, on_prompt=on_prompt)
+    client = Client(spawn=lambda _command, _args, _options: process)
+    try:
+        session = await client.create_session(extensions=[ext], streaming=True)
+        await process.extension_call("extension.initialize", {
+            "capabilities": {"tools": {"updates": True}, "conversations": {"fork": True}}
+        })
+        snapshots: list[str] = []
+        session.on("tool.update", lambda event: snapshots.append(event.data.result))
+        run = asyncio.create_task(session.run_and_wait("stream it"))
+        for reverse_id, content in enumerate(("first", "first and second"), start=1):
+            frame = await asyncio.wait_for(process.host_frames.get(), timeout=2)
+            message = frame["message"]
+            assert message == {
+                "jsonrpc": "2.0", "id": reverse_id, "parentId": 1,
+                "method": "kodelet.tool.update",
+                "params": {"content": content, "data": {"count": reverse_id}},
+            }
+            assert frame["sessionId"] == session.id
+            assert process.server_responses[-1]["result"] == {}
+            assert not run.done()  # ACK was not delayed until the callback completed.
+            process.notify("session/update", {
+                "sessionId": session.id,
+                "update": {
+                    "sessionUpdate": "tool_call_update", "toolCallId": "call-1",
+                    "status": "in_progress",
+                    "content": [{"type": "content", "content": {"type": "text", "text": content}}],
+                },
+            })
+            await process.respond_to_host(frame, {})
+        fork = await asyncio.wait_for(process.host_frames.get(), timeout=2)
+        assert fork["message"]["method"] == "kodelet.conversation.fork"
+        assert fork["message"]["parentId"] == 1
+        assert fork["message"]["params"] == {"name": "snapshot"}
+        await process.respond_to_host(fork, {"conversationId": "runner-fork"})
+        response = await asyncio.wait_for(run, timeout=2)
+        assert response.content == "runner-fork"
+        assert results == [{"jsonrpc": "2.0", "id": 1, "result": {"content": "runner-fork"}}]
+        assert snapshots == ["first", "first and second"]
+        assert [event.data.result for event in response.events if event.type == "tool.update"] == [
+            "first and second"
+        ]
+    finally:
+        await client.close()
+
+
+class _RelayInput(BaseModel):
+    value: int
+
+
+@pytest.mark.asyncio
+async def test_inline_callback_validation_dispatch_and_host_errors_stay_protocol_errors() -> None:
+    ext = Extension()
+    calls: list[int] = []
+
+    @ext.tool("fail", description="Validate input then fail", input_schema=_RelayInput)
+    async def fail(input: _RelayInput) -> str:
+        calls.append(input.value)
+        raise ValueError("callback exploded")
+
+    @ext.tool("host_error", description="Preserve host error codes")
+    async def host_error(_input: Any, ctx: ToolContext) -> dict[str, Any]:
+        try:
+            await ctx.fork_conversation()
+        except HostRPCError as exc:
+            return {"content": str(exc), "data": {"code": exc.code, "data": exc.data}}
+        raise AssertionError("expected a host error")
+
+    process = FakeACPProcess(extension_version=1)
+    client = Client(spawn=lambda _command, _args, _options: process)
+    try:
+        await client.create_session(extensions=[ext])
+        await process.extension_call("extension.initialize", {
+            "capabilities": {"conversations": {"fork": True}}
+        })
+        cases = [
+            ("extension.tool.execute", {"name": "fail", "input": {"value": "bad"}}, "validation"),
+            ("extension.tool.execute", {"name": "fail", "input": {"value": 4}}, "exploded"),
+            ("extension.tool.execute", {"name": "missing"}, "Unknown extension tool"),
+            ("extension.unknown", {}, "Unknown JSON-RPC method"),
+        ]
+        for method, params, error in cases:
+            response = await process.extension_call(method, params)
+            assert response["error"]["code"] == -32000
+            assert error in response["error"]["message"]
+        assert calls == [4]
+        calling = asyncio.create_task(process.extension_call(
+            "extension.tool.execute", {"name": "host_error"}
+        ))
+        frame = await asyncio.wait_for(process.host_frames.get(), timeout=2)
+        await process.respond_to_host(frame, error={
+            "code": -32123, "message": "runner rejected", "data": {"runner": "selected"}
+        })
+        response = await calling
+        assert response["result"] == {
+            "content": "runner rejected", "data": {"code": -32123, "data": {"runner": "selected"}}
+        }
+        assert not process._closed.is_set()
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dismissed", [False, True])
+async def test_inline_ui_handlers_convert_local_results_and_dismissal(dismissed: bool) -> None:
+    ext = Extension()
+    requests: list[tuple[str, Any]] = []
+
+    async def input_handler(request: Any) -> str | None:
+        requests.append(("input", request))
+        return None if dismissed else "typed"
+
+    def confirm_handler(request: Any) -> bool:
+        requests.append(("confirm", request))
+        return not dismissed
+
+    def select_handler(request: Any) -> str | None:
+        requests.append(("select", request))
+        return None if dismissed else "B"
+
+    def notify_handler(request: Any) -> None:
+        requests.append(("notify", request))
+
+    @ext.tool("ask", description="Request user input locally")
+    async def ask(_input: Any, ctx: ToolContext) -> dict[str, Any]:
+        values = {
+            "input": await ctx.ui.input({"title": "Text", "secret": True}),
+            "confirm": await ctx.ui.confirm({"title": "Confirm"}),
+            "select": await ctx.ui.select({"title": "Select", "options": ["A", "B"]}),
+        }
+        assert values == {
+            "input": None if dismissed else "typed",
+            "confirm": not dismissed,
+            "select": None if dismissed else "B",
+        }
+        await ctx.ui.notify("Done")
+        return {"content": "asked", "data": values}
+
+    process = FakeACPProcess(extension_version=1)
+    client = Client(spawn=lambda _command, _args, _options: process)
+    try:
+        await client.create_session(extensions=[ext], ui={
+            "input": input_handler, "confirm": confirm_handler,
+            "select": select_handler, "notify": notify_handler,
+        })
+        await process.extension_call("extension.initialize")
+        response = await process.extension_call("extension.tool.execute", {"name": "ask"})
+        assert response["result"] == {
+            "content": "asked",
+            "data": {"confirm": False} if dismissed else {
+                "input": "typed", "confirm": True, "select": "B",
+            },
+        }
+        assert requests == [
+            ("input", {"title": "Text", "secret": True}),
+            ("confirm", {"title": "Confirm"}),
+            ("select", {"title": "Select", "options": ["A", "B"]}),
+            ("notify", {"message": "Done"}),
+        ]
+        assert process.host_frames.empty()
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provide_input", [False, True])
+async def test_inline_ui_overrides_only_provided_capabilities_and_forwards_the_rest(
+    provide_input: bool,
+) -> None:
+    initialized: list[Mapping[str, Any]] = []
+
+    class ObservedExtension(Extension):
+        def initialize(self, params: Mapping[str, Any]) -> dict[str, Any]:
+            initialized.append(params)
+            return super().initialize(params)
+
+    ext = ObservedExtension()
+
+    @ext.tool("ask", description="Use runner UI where no local handler exists")
+    async def ask(_input: Any, ctx: ToolContext) -> str | None:
+        return await ctx.ui.select({"title": "Runner selection", "options": ["runner"]})
+
+    process = FakeACPProcess(extension_version=1)
+    client = Client(spawn=lambda _command, _args, _options: process)
+    ui: AgentUIHandlers = {"input": lambda _request: "local"} if provide_input else {}
+    try:
+        await client.create_session(extensions=[ext], ui=ui)
+        capabilities = {
+            "ui": {"input": False, "select": False, "surfaces": True},
+            "tools": {"updates": False},
+        }
+        await process.extension_call("extension.initialize", {"capabilities": capabilities})
+        assert initialized == [{"capabilities": {
+            **capabilities,
+            "ui": {**capabilities["ui"], "input": provide_input},
+        }}]
+        assert capabilities["ui"]["input"] is False
+        calling = asyncio.create_task(process.extension_call(
+            "extension.tool.execute", {"name": "ask"}, request_id="ui-parent"
+        ))
+        frame = await asyncio.wait_for(process.host_frames.get(), timeout=2)
+        assert frame["message"]["method"] == "kodelet.ui.select"
+        assert frame["message"]["parentId"] == "ui-parent"
+        await process.respond_to_host(frame, {"status": "submitted", "value": "runner"})
+        assert (await calling)["result"] == {"content": "runner"}
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_inline_ui_handler_errors_are_returned_without_closing_channel() -> None:
+    ext = Extension()
+    count = 0
+
+    async def input_handler(_request: Any) -> str:
+        nonlocal count
+        count += 1
+        if count == 1:
+            raise ValueError("local UI failed")
+        return "recovered"
+
+    @ext.tool("ask", description="Ask UI")
+    async def ask(_input: Any, ctx: ToolContext) -> str | None:
+        return await ctx.ui.input({"title": "Question"})
+
+    process = FakeACPProcess(extension_version=1)
+    client = Client(spawn=lambda _command, _args, _options: process)
+    try:
+        await client.create_session(extensions=[ext], ui={"input": input_handler})
+        await process.extension_call("extension.initialize")
+        first = await process.extension_call("extension.tool.execute", {"name": "ask"})
+        assert first["error"] == {"code": -32000, "message": "local UI failed"}
+        second = await process.extension_call("extension.tool.execute", {"name": "ask"})
+        assert second["result"] == {"content": "recovered"}
+        assert process.host_frames.empty()
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_inline_ui_handler_cancellation_is_a_dismissed_response() -> None:
+    ext = Extension()
+
+    async def input_handler(_request: Any) -> str:
+        raise asyncio.CancelledError
+
+    @ext.tool("ask", description="Handle dismissed input without cancelling the tool")
+    async def ask(_input: Any, ctx: ToolContext) -> str:
+        assert await ctx.ui.input({"title": "Dismiss"}) is None
+        return "dismissed, tool completed"
+
+    process = FakeACPProcess(extension_version=1)
+    client = Client(spawn=lambda _command, _args, _options: process)
+    try:
+        await client.create_session(extensions=[ext], ui={"input": input_handler})
+        await process.extension_call("extension.initialize")
+        response = await process.extension_call("extension.tool.execute", {"name": "ask"})
+        assert response["result"] == {"content": "dismissed, tool completed"}
+        assert process.host_frames.empty()
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_inline_ui_caller_timeout_cancels_handler_before_tool_completion() -> None:
+    ext = Extension()
+    ui_started, ui_cancelled = asyncio.Event(), asyncio.Event()
+    timed_out, finish_tool = asyncio.Event(), asyncio.Event()
+
+    async def input_handler(_request: Any) -> str:
+        ui_started.set()
+        try:
+            await asyncio.Event().wait()
+            return "unreachable"
+        finally:
+            ui_cancelled.set()
+
+    @ext.tool("ask", description="Time out UI but continue running the tool")
+    async def ask(_input: Any, ctx: ToolContext) -> str:
+        try:
+            await asyncio.wait_for(ctx.ui.input({"title": "Timeout"}), timeout=0.02)
+        except TimeoutError:
+            timed_out.set()
+        await finish_tool.wait()
+        return "continued after timeout"
+
+    process = FakeACPProcess(extension_version=1)
+    client = Client(spawn=lambda _command, _args, _options: process)
+    calling: asyncio.Task[dict[str, Any]] | None = None
+    try:
+        await client.create_session(extensions=[ext], ui={"input": input_handler})
+        await process.extension_call("extension.initialize")
+        calling = asyncio.create_task(process.extension_call(
+            "extension.tool.execute", {"name": "ask"}
+        ))
+        await asyncio.wait_for(ui_started.wait(), timeout=2)
+        await asyncio.wait_for(timed_out.wait(), timeout=2)
+        await asyncio.wait_for(ui_cancelled.wait(), timeout=1)
+        assert not calling.done()
+        finish_tool.set()
+        assert (await calling)["result"] == {"content": "continued after timeout"}
+    finally:
+        finish_tool.set()
+        await client.close()
+        if calling is not None:
+            calling.cancel()
+            await asyncio.gather(calling, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("scope", ["channel", "session", "client"])
+async def test_inline_close_cancels_tool_before_joining_dependent_ui_cleanup(scope: str) -> None:
+    ext = Extension()
+    ui_started, tool_finally, ui_finally = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def input_handler(_request: Any) -> str:
+        ui_started.set()
+        try:
+            await asyncio.Event().wait()
+            return "unreachable"
+        finally:
+            await tool_finally.wait()
+            ui_finally.set()
+
+    @ext.tool("ask", description="UI cleanup depends on originating tool cancellation")
+    async def ask(_input: Any, ctx: ToolContext) -> str | None:
+        try:
+            return await ctx.ui.input({"title": "Wait for tool cleanup"})
+        finally:
+            tool_finally.set()
+
+    process = FakeACPProcess(extension_version=1)
+    client = Client(spawn=lambda _command, _args, _options: process)
+    try:
+        session = await client.create_session(extensions=[ext], ui={"input": input_handler})
+        await process.extension_call("extension.initialize")
+        ack = await process.extension_frame({
+            "jsonrpc": "2.0", "id": 42, "method": "extension.tool.execute",
+            "params": {"name": "ask"},
+        })
+        assert ack["result"] == {}
+        await asyncio.wait_for(ui_started.wait(), timeout=2)
+        assert not tool_finally.is_set()
+        relay = session._rpc._extension_relay
+        assert relay is not None
+        channel = relay._channels[("run-1", "inline-1")]
+        if scope == "channel":
+            assert (await process.extension_frame(close=True))["result"] == {}
+            await asyncio.wait_for(asyncio.gather(*relay._closing), timeout=2)
+        elif scope == "session":
+            await asyncio.wait_for(session.close(), timeout=2)
+        else:
+            await asyncio.wait_for(client.close(), timeout=2)
+        assert tool_finally.is_set()
+        assert ui_finally.is_set()
+        assert channel._worker.done()
+        assert not channel._ui_tasks
+        assert not relay._channels
+    finally:
+        # Unblock cleanup even if the ordering regresses, so failure is bounded.
+        tool_finally.set()
+        await asyncio.wait_for(client.close(), timeout=2)
+
+
+@pytest.mark.asyncio
+async def test_inline_reverse_ack_blocked_drain_does_not_block_acp_reader() -> None:
+    ext = Extension()
+
+    @ext.tool("fork", description="Nested RPC must complete while reverse ACK drain blocks")
+    async def fork(_input: Any, ctx: ToolContext) -> str:
+        return await ctx.fork_conversation()
+
+    draining, drain_cancelled, release_drain = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    class BlockedACKStdin(_FakeStdin):
+        def __init__(self, process: FakeACPProcess) -> None:
+            super().__init__(process)
+            self._block_next_drain = False
+
+        def write(self, data: bytes) -> object:
+            message = json.loads(data)
+            if not message.get("method") and not draining.is_set():
+                self._block_next_drain = True
+            return super().write(data)
+
+        async def drain(self) -> None:
+            if self._block_next_drain:
+                self._block_next_drain = False
+                draining.set()
+                try:
+                    await release_drain.wait()
+                except asyncio.CancelledError:
+                    drain_cancelled.set()
+                    raise
+            else:
+                await super().drain()
+
+    process = FakeACPProcess(extension_version=1)
+    client = Client(spawn=lambda _command, _args, _options: process)
+    calling: asyncio.Task[dict[str, Any]] | None = None
+    try:
+        session = await client.create_session(extensions=[ext])
+        await process.extension_call("extension.initialize", {
+            "capabilities": {"conversations": {"fork": True}}
+        })
+        process.stdin = BlockedACKStdin(process)
+        calling = asyncio.create_task(process.extension_call(
+            "extension.tool.execute", {"name": "fork"}, request_id=42
+        ))
+        await asyncio.wait_for(draining.wait(), timeout=2)
+        assert process.server_responses[-1]["result"] == {}
+        assert not drain_cancelled.is_set()
+        frame = await asyncio.wait_for(process.host_frames.get(), timeout=2)
+        assert frame["message"]["parentId"] == 42
+        await process.respond_to_host(frame, {"conversationId": "nested response arrived"})
+        assert (await calling)["result"] == {"content": "nested response arrived"}
+        response = await asyncio.wait_for(session.run_and_wait("reader still active"), timeout=2)
+        assert response.stop_reason == "end_turn"
+        assert not drain_cancelled.is_set()
+        assert not release_drain.is_set()
+        await asyncio.wait_for(client.close(), timeout=2)
+        assert drain_cancelled.is_set()
+        assert not session._rpc._background_tasks
+    finally:
+        release_drain.set()
+        await asyncio.wait_for(client.close(), timeout=2)
+        if calling is not None:
+            calling.cancel()
+            await asyncio.gather(calling, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_inline_outbound_acp_rejection_retires_channel_without_replay_or_restart() -> None:
+    ext = Extension()
+    invoked: list[str] = []
+    tool_finally = asyncio.Event()
+
+    @ext.tool("fork", description="A rejected relay frame must not be retried")
+    async def fork(_input: Any, ctx: ToolContext) -> str:
+        invoked.append("fork")
+        try:
+            return await ctx.fork_conversation()
+        finally:
+            tool_finally.set()
+
+    rejected: list[Mapping[str, Any]] = []
+
+    class RejectingProcess(FakeACPProcess):
+        async def _handle_request(self, request: Mapping[str, Any]) -> None:
+            params = request.get("params") or {}
+            message = params.get("message") or {}
+            if request.get("method") == "kodelet/extensionFrame" and message.get("method"):
+                rejected.append(request)
+                self._respond_error(request["id"], "runner rejected relay frame")
+                return
+            await super()._handle_request(request)
+
+    process = RejectingProcess(extension_version=1)
+    client = Client(spawn=lambda _command, _args, _options: process)
+    try:
+        session = await client.create_session(extensions=[ext])
+        await process.extension_call("extension.initialize", {
+            "capabilities": {"conversations": {"fork": True}}
+        })
+        relay = session._rpc._extension_relay
+        assert relay is not None
+        channel = relay._channels[("run-1", "inline-1")]
+        ack = await process.extension_frame({
+            "jsonrpc": "2.0", "id": 42, "method": "extension.tool.execute",
+            "params": {"name": "fork"},
+        })
+        assert ack["result"] == {}
+        close_frame = await asyncio.wait_for(process.host_frames.get(), timeout=2)
+        assert close_frame == {
+            "sessionId": session.id, "runId": "run-1", "extensionId": "inline-1", "close": True,
+        }
+        assert tool_finally.is_set()
+        assert channel.closed and channel._host_client._closed
+        assert not channel._host_client._pending
+        assert not relay._channels
+        for method in ("extension.initialize", "extension.tool.execute"):
+            response = await process.extension_frame({
+                "jsonrpc": "2.0", "id": 43, "method": method, "params": {"name": "fork"},
+            })
+            assert "closed" in response["error"]["message"]
+        response = await session.run_and_wait("the ACP connection remains usable")
+        assert response.stop_reason == "end_turn"
+        assert len(rejected) == 1
+        assert invoked == ["fork"]
+        assert not process._closed.is_set()
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("destination", ["host", "ui"])
+@pytest.mark.parametrize("termination", ["cancel", "reuse", "close", "failure"])
+async def test_inline_cancellation_and_teardown_cancel_pending_callbacks(
+    destination: str, termination: str
+) -> None:
+    ext = Extension()
+    callback_started, callback_cancelled = asyncio.Event(), asyncio.Event()
+    ui_started, ui_cancelled = asyncio.Event(), asyncio.Event()
+
+    async def input_handler(_request: Any) -> str:
+        ui_started.set()
+        try:
+            await asyncio.Event().wait()
+            return "unreachable"
+        except asyncio.CancelledError:
+            ui_cancelled.set()
+            raise
+
+    @ext.tool("wait", description="Wait for a pending host or local UI RPC")
+    async def wait(_input: Any, ctx: ToolContext) -> str | None:
+        callback_started.set()
+        try:
+            if destination == "ui":
+                return await ctx.ui.input({"title": "Blocked"})
+            return await ctx.fork_conversation()
+        except asyncio.CancelledError:
+            callback_cancelled.set()
+            raise
+
+    @ext.tool("ping", description="Confirm the channel still dispatches")
+    async def ping() -> str:
+        return "pong"
+
+    process = FakeACPProcess(extension_version=1)
+    client = Client(spawn=lambda _command, _args, _options: process)
+    try:
+        session = await client.create_session(extensions=[ext], ui={"input": input_handler})
+        await process.extension_call("extension.initialize", {
+            "capabilities": {"conversations": {"fork": True}}
+        })
+        ack = await process.extension_frame({
+            "jsonrpc": "2.0", "id": 42, "method": "extension.tool.execute",
+            "params": {"name": "wait"},
+        })
+        assert ack["result"] == {}
+        await asyncio.wait_for(callback_started.wait(), timeout=2)
+        host_frame = None
+        if destination == "ui":
+            await asyncio.wait_for(ui_started.wait(), timeout=2)
+        else:
+            host_frame = await asyncio.wait_for(process.host_frames.get(), timeout=2)
+        relay = session._rpc._extension_relay
+        assert relay is not None
+        channel = relay._channels[("run-1", "inline-1")]
+        if termination == "cancel":
+            ack = await process.extension_frame({
+                "jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 42}
+            })
+            assert ack["result"] == {}
+        elif termination == "reuse":
+            result = await process.extension_call(
+                "extension.tool.execute", {"name": "ping"}, request_id=42
+            )
+            assert result["result"] == {"content": "pong"}
+        elif termination == "close":
+            ack = await process.extension_frame(close=True)
+            assert ack["result"] == {}
+        else:
+            assert isinstance(process.stdout, _QueueLineReader)
+            process.stdout.feed_eof()
+        await asyncio.wait_for(callback_cancelled.wait(), timeout=2)
+        if destination == "ui":
+            await asyncio.wait_for(ui_cancelled.wait(), timeout=2)
+        if termination in {"cancel", "reuse"}:
+            if host_frame is not None:
+                await process.respond_to_host(host_frame, {"conversationId": "late"})
+            ping_result = await process.extension_call(
+                "extension.tool.execute", {"name": "ping"}, request_id=43
+            )
+            assert ping_result["result"] == {"content": "pong"}
+            terminals = [
+                frame["message"] for frame in process.extension_frames
+                if frame.get("message", {}).get("id") == 42
+                and not frame["message"].get("method")
+            ]
+            assert terminals == (
+                [{"jsonrpc": "2.0", "id": 42, "result": {"content": "pong"}}]
+                if termination == "reuse" else []
+            )
+        await client.close()
+        assert channel._host_client._closed
+        assert not channel._host_client._pending
+        assert not relay._channels
+        assert channel._worker.done()
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_same_inline_object_has_isolated_initialization_in_concurrent_sessions() -> None:
+    ext = Extension()
+    seen: list[tuple[str, str | None]] = []
+
+    @ext.tool("context", description="Read channel initialization and runner RPC")
+    async def context(_input: Any, ctx: ToolContext) -> str:
+        seen.append((ctx.cwd, ctx.conversation_id))
+        return f"{ctx.cwd}:{await ctx.fork_conversation()}"
+
+    processes = [FakeACPProcess(session_id=name, extension_version=1) for name in ("one", "two")]
+    spawning = iter(processes)
+    client = Client(spawn=lambda _command, _args, _options: next(spawning))
+    calls: list[asyncio.Task[dict[str, Any]]] = []
+    try:
+        sessions = await asyncio.gather(
+            client.create_session(extensions=[ext]), client.create_session(extensions=[ext])
+        )
+        for process in processes:
+            await process.extension_call("extension.initialize", {
+                "extension": {"cwd": f"/runner/{process._session_id}"},
+                "capabilities": {"conversations": {"fork": True}},
+            })
+        for process in processes:
+            calls.append(asyncio.create_task(process.extension_call(
+                "extension.tool.execute",
+                {"name": "context", "context": {"conversationId": process._session_id}},
+            )))
+        frames = await asyncio.wait_for(
+            asyncio.gather(*(process.host_frames.get() for process in processes)), timeout=2
+        )
+        assert all(frame["message"]["id"] == frame["message"]["parentId"] == 1 for frame in frames)
+        await processes[1].respond_to_host(frames[1], {"conversationId": "fork-two"})
+        assert (await calls[1])["result"] == {"content": "/runner/two:fork-two"}
+        assert not calls[0].done()
+        await sessions[1].close()
+        await processes[0].respond_to_host(frames[0], {"conversationId": "fork-one"})
+        assert (await calls[0])["result"] == {"content": "/runner/one:fork-one"}
+        assert sorted(seen) == [("/runner/one", "one"), ("/runner/two", "two")]
+        assert ext._init_params is None
+    finally:
+        await client.close()
+        for call in calls:
+            call.cancel()
+        await asyncio.gather(*calls, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_run_and_extension_ids_have_independent_host_rpc_state() -> None:
+    ext = Extension()
+
+    @ext.tool("fork", description="Use the channel's independent RPC client")
+    async def fork(_input: Any, ctx: ToolContext) -> str:
+        return await ctx.fork_conversation()
+
+    process = FakeACPProcess(extension_version=1)
+    client = Client(spawn=lambda _command, _args, _options: process)
+    calls: dict[tuple[str, str], asyncio.Task[dict[str, Any]]] = {}
+    try:
+        await client.create_session(extensions=[ext, ext])
+        for run_id in ("run-1", "run-2"):
+            for extension_id in ("inline-1", "inline-2"):
+                await process.extension_call(
+                    "extension.initialize", {"capabilities": {"conversations": {"fork": True}}},
+                    run_id=run_id, extension_id=extension_id,
+                )
+                calls[(run_id, extension_id)] = asyncio.create_task(process.extension_call(
+                    "extension.tool.execute", {"name": "fork"},
+                    run_id=run_id, extension_id=extension_id,
+                ))
+        frames = [await asyncio.wait_for(process.host_frames.get(), timeout=2) for _ in calls]
+        assert all(frame["message"]["id"] == frame["message"]["parentId"] == 1 for frame in frames)
+        for frame in reversed(frames):
+            key = (frame["runId"], frame["extensionId"])
+            result = ":".join(key)
+            await process.respond_to_host(frame, {"conversationId": result})
+            assert (await calls[key])["result"] == {"content": result}
+        assert ext._init_params is None
+    finally:
+        await client.close()
+        for call in calls.values():
+            call.cancel()
+        await asyncio.gather(*calls.values(), return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_inline_unknown_frames_do_not_initialize_and_closed_channels_cannot_restart() -> None:
+    created: list[Extension] = []
+
+    def entrypoint(ext: Extension) -> None:
+        created.append(ext)
+        ext.tool("ping", description="An actual callback")(lambda: "pong")
+
+    process = FakeACPProcess(extension_version=1)
+    client = Client(spawn=lambda _command, _args, _options: process)
+    initialize = {"jsonrpc": "2.0", "id": 1, "method": "extension.initialize", "params": {}}
+    try:
+        session = await client.create_session(extensions=[entrypoint])
+        frames = [
+            {"message": initialize, "session_id": "unknown"},
+            {"message": initialize, "extension_id": "unknown"},
+            {"message": {"jsonrpc": "2.0", "id": 1, "result": {}}},
+            {"message": {"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 1}}},
+            {"message": {"jsonrpc": "2.0", "id": 1, "method": "extension.tool.execute"}},
+            {"message": {"jsonrpc": "2.0", "method": "extension.initialize"}},
+            {"close": True},
+        ]
+        for params in frames:
+            ack = await process.extension_frame(**cast(Any, params))
+            assert ack["error"]["code"] == -32602
+        assert created == []
+        relay = session._rpc._extension_relay
+        assert relay is not None and not relay._channels
+        await process.extension_call("extension.initialize")
+        assert len(created) == 1
+        duplicate = await process.extension_frame(initialize)
+        assert duplicate["error"]["code"] == -32602
+        for _ in range(2):
+            closed = await process.extension_frame(close=True)
+            assert closed["result"] == {}
+        assert not relay._channels
+        for message in (initialize, {"jsonrpc": "2.0", "id": 1, "result": {}}):
+            rejected = await process.extension_frame(message)
+            assert "closed" in rejected["error"]["message"]
+        assert len(created) == 1
+        await process.extension_call("extension.initialize", run_id="run-2")
+        assert len(created) == 2
+        await session.close()
+        assert not relay._channels
+        assert process._closed.is_set()
+        with pytest.raises(ValueError, match="closed"):
+            relay.accept({
+                "sessionId": session.id, "runId": "run-3", "extensionId": "inline-1",
+                "message": initialize,
+            })
+        assert len(created) == 2
+    finally:
+        await client.close()
 
 
 @pytest.mark.asyncio
@@ -698,726 +1671,32 @@ async def test_session_runs_kodelet_acp_json_rpc_and_emits_stream_events() -> No
 
 
 @pytest.mark.asyncio
-async def test_session_rejects_inline_extensions_before_spawning(
-    tmp_path: Path,
+@pytest.mark.parametrize("as_mapping", [False, True], ids=["kwargs", "mapping"])
+@pytest.mark.parametrize(
+    ("options", "error_match"),
+    [
+        pytest.param(
+            {"profile": {"openai": {"api_key": "must-not-forward"}}},
+            None,
+            id="provider-config",
+        ),
+        pytest.param({"options": None}, None, id="null-options"),
+    ],
+)
+async def test_session_rejects_unsupported_options_before_spawning(
+    options: CreateSessionOptions,
+    error_match: str | None,
+    as_mapping: bool,
 ) -> None:
-    calls: list[dict[str, Any]] = []
+    def spawn(_command: str, _args: Sequence[str], _options: SpawnOptions) -> FakeACPProcess:
+        pytest.fail("unsupported options must be rejected before spawning")
 
-    def spawn(_command: str, args: Sequence[str], options: SpawnOptions) -> FakeACPProcess:
-        calls.append({"args": list(args), "env": options.get("env")})
-        return FakeACPProcess(
-            session_id="conv-ext",
-            on_prompt=lambda _request, child: child.notify(
-                "session/update",
-                {
-                    "sessionId": "conv-ext",
-                    "update": {
-                        "sessionUpdate": "agent_message_chunk",
-                        "content": {"type": "text", "text": "done"},
-                    },
-                },
-            ),
-        )
-
-    ext = Extension(name="workspace")
-
-    class AskInput(BaseModel):
-        question: str
-        options: list[str]
-
-    @ext.tool("ask_user_question", description="Ask a question", input_schema=AskInput)
-    async def ask_user_question(input: AskInput, ctx: Any) -> str:
-        selected = await ctx.ui.select({"title": input.question, "options": input.options})
-        return selected or "dismissed"
-
-    client = Client(cwd=tmp_path, spawn=spawn)
-    with pytest.raises(ValueError, match=r"ctx\.children"):
-        await client.create_session(extensions=[ext])
-    with pytest.raises(ValueError, match="Inline extension UI"):
-        await client.create_session(ui={"select": lambda request: request["options"][0]})
-    with pytest.raises(ValueError):
-        await client.create_session(profile={"openai": {"api_key": "must-not-forward"}})
-    with pytest.raises(ValueError):
-        await client.create_session(options=cast(Any, None))
-    assert calls == []
+    client = Client(spawn=spawn)
+    with pytest.raises(ValueError, match=error_match):
+        if as_mapping:
+            await client.create_session(options)
+        else:
+            await client.create_session(**options)
+    assert not client._sessions
+    assert not client._rpcs
     await client.close()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("extension_transport", ["unix", "tcp"])
-async def test_extension_bridge_routes_local_ui_handlers(
-    tmp_path: Path,
-    extension_transport: BridgeTransport,
-) -> None:
-    selected_values: list[str] = []
-    shortcut_contexts: list[tuple[str | None, str | None]] = []
-
-    def extension_entrypoint(ext: Extension) -> None:
-        ext.set_metadata(name="workspace")
-
-        class AskInput(BaseModel):
-            question: str
-            options: list[str]
-
-        @ext.tool("ask_user_question", description="Ask a question", input_schema=AskInput)
-        async def ask_user_question(input: AskInput, ctx: Any) -> str:
-            await ctx.update("Waiting for selection", {"step": 1})
-            selected = await ctx.ui.select({"title": input.question, "options": input.options})
-            selected_values.append(selected or "")
-            return selected or "dismissed"
-
-        @ext.shortcut("ctrl+alt+r", description="Refresh project context")
-        async def refresh(ctx: ShortcutContext) -> ShortcutResult:
-            shortcut_contexts.append((ctx.conversation_id, ctx.recipe_name))
-            return {"action": "submit", "message": "/refresh"}
-
-    # Exercise the legacy bridge in isolation, not via daemon session execution.
-    session = await InMemoryExtensionBridge.create(
-        [define_extension(extension_entrypoint)],
-        {"transport": extension_transport, "ui": {"select": lambda request: request["options"][1]}},
-    )
-
-    executable = next(iter(await _iterdir(Path(session.config()["local_dir"]))))
-    assert f"'transport': '{extension_transport}'" in await _read_text(executable)
-    process = await asyncio.create_subprocess_exec(
-        str(executable),
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    assert process.stdin is not None
-    assert process.stdout is not None
-    await _write_frame(
-        process.stdin,
-        {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "extension.initialize",
-            "params": {
-                "extension": {"id": "workspace", "cwd": str(tmp_path)},
-                "capabilities": {
-                    "toolUpdates": True,
-                    "shortcuts": {"submit": True},
-                },
-            },
-        },
-    )
-    init_response = await _read_frame(process.stdout)
-    assert init_response["result"]["name"] == "workspace"
-    assert init_response["result"]["shortcuts"] == [
-        {"key": "ctrl+alt+r", "description": "Refresh project context"}
-    ]
-
-    await _write_frame(
-        process.stdin,
-        {
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "extension.tool.execute",
-            "params": {
-                "name": "ask_user_question",
-                "input": {"question": "Pick", "options": ["A", "B"]},
-            },
-        },
-    )
-    update_request = await _read_frame(process.stdout)
-    assert update_request == {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "parentId": 2,
-        "method": "kodelet.tool.update",
-        "params": {"content": "Waiting for selection", "data": {"step": 1}},
-    }
-    await _write_frame(
-        process.stdin,
-        {"jsonrpc": "2.0", "id": update_request["id"], "result": {"accepted": True}},
-    )
-    tool_response = await _read_frame(process.stdout)
-    assert tool_response["result"] == {"content": "B"}
-    assert selected_values == ["B"]
-
-    await _write_frame(
-        process.stdin,
-        {
-            "jsonrpc": "2.0",
-            "id": 3,
-            "method": "extension.shortcut.execute",
-            "params": {
-                "key": "alt+control+r",
-                "context": {
-                    "conversationId": "conv-shortcut",
-                    "recipeName": "review",
-                },
-            },
-        },
-    )
-    shortcut_response = await _read_frame(process.stdout)
-    assert shortcut_response["result"] == {"action": "submit", "message": "/refresh"}
-    assert shortcut_contexts == [("conv-shortcut", "review")]
-
-    process.terminate()
-    await process.wait()
-    await session.close()
-
-
-@pytest.mark.asyncio
-async def test_extension_bridge_keeps_persistent_surfaces_alive_after_command_returns(
-    tmp_path: Path,
-) -> None:
-    background_tasks: set[asyncio.Future[Any]] = set()
-
-    def track(awaitable: Awaitable[Any]) -> None:
-        task = asyncio.ensure_future(awaitable)
-        background_tasks.add(task)
-        task.add_done_callback(background_tasks.discard)
-
-    def extension_entrypoint(ext: Extension) -> None:
-        @ext.command("game", description="Open a persistent surface")
-        async def game(_input: Any, ctx: CommandContext) -> CommandResult:
-            surface = await ctx.ui.open_surface(
-                {"id": "game", "initialLines": ["loading"], "width": "50%"}
-            )
-
-            def resize(event: UISurfaceResizeEvent) -> None:
-                surface.update([f"size={event['width']}x{event['height']}"])
-                track(
-                    ctx.ui.append_transcript(
-                        {
-                            "title": "Resized",
-                            "message": f"{event['width']}x{event['height']}",
-                        }
-                    )
-                )
-
-            def input_event(event: UISurfaceInputEvent) -> None:
-                size = surface.size
-                surface.update(
-                    [
-                        f"key={event.get('key')};size="
-                        f"{size['width'] if size else None}x{size['height'] if size else None}"
-                    ]
-                )
-                if event.get("key") == "q":
-
-                    async def close_later() -> None:
-                        await asyncio.sleep(0)
-                        await surface.close()
-
-                    track(close_later())
-
-            surface.on_resize(resize)
-            surface.on_input(input_event)
-            return {"action": "respond", "response": "opened"}
-
-    session = await InMemoryExtensionBridge.create(
-        [define_extension(extension_entrypoint)], {"transport": "tcp"},
-    )
-    executable = next(iter(await _iterdir(Path(session.config()["local_dir"]))))
-    process = await asyncio.create_subprocess_exec(
-        str(executable),
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    assert process.stdin is not None
-    assert process.stdout is not None
-
-    await _write_frame(
-        process.stdin,
-        {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "extension.initialize",
-            "params": {
-                "extension": {"id": "surface", "cwd": str(tmp_path)},
-                "capabilities": {"ui": {"surfaces": True, "transcript": True}},
-            },
-        },
-    )
-    await _read_frame(process.stdout)
-    await _write_frame(
-        process.stdin,
-        {
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "extension.command.execute",
-            "params": {
-                "name": "game",
-                "input": {},
-                "invocation": {
-                    "raw": "/game",
-                    "commandName": "game",
-                    "args": [],
-                    "flags": {},
-                },
-            },
-        },
-    )
-    open_request = await _read_frame(process.stdout)
-    assert open_request == {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "parentId": 2,
-        "method": "kodelet.ui.surface.open",
-        "params": {
-            "id": "game",
-            "scopeId": "",
-            "options": {"width": "50%"},
-            "frame": {"sequence": 1, "lines": ["loading"]},
-        },
-    }
-    await _write_frame(
-        process.stdin,
-        {"jsonrpc": "2.0", "id": open_request["id"], "result": {"accepted": True}},
-    )
-    command_response = await _read_frame(process.stdout)
-    assert command_response == {
-        "jsonrpc": "2.0",
-        "id": 2,
-        "result": {"action": "respond", "response": "opened"},
-    }
-
-    await _write_frame(
-        process.stdin,
-        {
-            "jsonrpc": "2.0",
-            "method": "extension.ui.surface.resize",
-            "params": {"id": "game", "sequence": 1, "width": 60, "height": 18},
-        },
-    )
-    resize_messages = await _read_and_ack_bridge_host_messages(process, 2)
-    frame_notification = next(
-        message for message in resize_messages if message["method"] == "kodelet.ui.surface.frame"
-    )
-    transcript_request = next(
-        message
-        for message in resize_messages
-        if message["method"] == "kodelet.ui.transcript.append"
-    )
-    assert frame_notification == {
-        "jsonrpc": "2.0",
-        "method": "kodelet.ui.surface.frame",
-        "params": {
-            "id": "game",
-            "scopeId": "",
-            "frame": {"sequence": 2, "lines": ["size=60x18"]},
-        },
-    }
-    assert "parentId" not in transcript_request
-    assert transcript_request["params"] == {
-        "scopeId": "",
-        "title": "Resized",
-        "message": "60x18",
-    }
-
-    await _write_frame(
-        process.stdin,
-        {
-            "jsonrpc": "2.0",
-            "method": "extension.ui.surface.input",
-            "params": {
-                "id": "game",
-                "sequence": 2,
-                "kind": "key",
-                "key": "q",
-                "text": "q",
-            },
-        },
-    )
-    input_messages = await _read_and_ack_bridge_host_messages(process, 2)
-    input_frame = next(
-        message for message in input_messages if message["method"] == "kodelet.ui.surface.frame"
-    )
-    close_request = next(
-        message for message in input_messages if message["method"] == "kodelet.ui.surface.close"
-    )
-    assert input_frame == {
-        "jsonrpc": "2.0",
-        "method": "kodelet.ui.surface.frame",
-        "params": {
-            "id": "game",
-            "scopeId": "",
-            "frame": {"sequence": 3, "lines": ["key=q;size=60x18"]},
-        },
-    }
-    assert "parentId" not in close_request
-    assert close_request["params"] == {"id": "game", "scopeId": "", "sequence": 4}
-
-    if background_tasks:
-        await asyncio.gather(*background_tasks)
-    process.terminate()
-    await process.wait()
-    await session.close()
-
-
-@pytest.mark.asyncio
-async def test_extension_bridge_cancellation_is_connection_scoped(tmp_path: Path) -> None:
-    started = {"cancel": asyncio.Event(), "disconnect": asyncio.Event()}
-    aborted = {"cancel": asyncio.Event(), "disconnect": asyncio.Event()}
-    stale_blocked = {"cancel": asyncio.Event(), "disconnect": asyncio.Event()}
-    ui_started = asyncio.Event()
-    ui_cancelled = asyncio.Event()
-    notifications: list[str] = []
-    detached_tasks: set[asyncio.Task[None]] = set()
-
-    class WaitInput(BaseModel):
-        mode: Literal["cancel", "detached", "disconnect", "quick", "ui"]
-
-    def extension_entrypoint(ext: Extension) -> None:
-        @ext.tool("wait_for_cancel", description="Wait for cancellation", input_schema=WaitInput)
-        async def wait_for_cancel(input: WaitInput, ctx: Any) -> str:
-            if input.mode == "quick":
-                return "quick result"
-            if input.mode == "detached":
-
-                async def notify_later() -> None:
-                    await asyncio.sleep(0.02)
-                    try:
-                        await ctx.ui.notify({"message": "late notification"})
-                    except (asyncio.CancelledError, RuntimeError):
-                        pass
-
-                task = asyncio.create_task(notify_later())
-                detached_tasks.add(task)
-                task.add_done_callback(detached_tasks.discard)
-                return "detached result"
-            if input.mode == "ui":
-                await ctx.ui.notify({"message": "blocking notification"})
-                return "ui result"
-            started[input.mode].set()
-            try:
-                await asyncio.Event().wait()
-            except asyncio.CancelledError:
-                aborted[input.mode].set()
-                try:
-                    await ctx.update(f"stale {input.mode}")
-                except (asyncio.CancelledError, RuntimeError):
-                    stale_blocked[input.mode].set()
-                return f"late {input.mode}"
-            raise AssertionError("wait completed without cancellation")
-
-    async def notify(request: Mapping[str, Any]) -> None:
-        if request["message"] != "blocking notification":
-            notifications.append(str(request["message"]))
-            return
-        ui_started.set()
-        try:
-            await asyncio.Event().wait()
-        except asyncio.CancelledError:
-            ui_cancelled.set()
-            raise
-
-    session = await InMemoryExtensionBridge.create(
-        [define_extension(extension_entrypoint)], {"transport": "tcp", "ui": {"notify": notify}},
-    )
-    executable = next(iter(await _iterdir(Path(session.config()["local_dir"]))))
-
-    process = await asyncio.create_subprocess_exec(
-        str(executable),
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    assert process.stdin is not None
-    assert process.stdout is not None
-    await _write_frame(
-        process.stdin,
-        {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "extension.initialize",
-            "params": {
-                "extension": {"id": "cancellable", "cwd": str(tmp_path)},
-                "capabilities": {"toolUpdates": True},
-            },
-        },
-    )
-    await _read_frame(process.stdout)
-
-    await _write_frame(
-        process.stdin,
-        {
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "extension.tool.execute",
-            "params": {"name": "wait_for_cancel", "input": {"mode": "detached"}},
-        },
-    )
-    detached_response = await _read_frame(process.stdout)
-    assert detached_response["result"] == {"content": "detached result"}
-    await asyncio.sleep(0.05)
-    assert notifications == []
-
-    await _write_frame(
-        process.stdin,
-        {
-            "jsonrpc": "2.0",
-            "id": 3,
-            "method": "extension.tool.execute",
-            "params": {"name": "wait_for_cancel", "input": {"mode": "ui"}},
-        },
-    )
-    await asyncio.wait_for(ui_started.wait(), timeout=2)
-    await _write_frame(
-        process.stdin,
-        {"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 3}},
-    )
-    await asyncio.wait_for(ui_cancelled.wait(), timeout=2)
-
-    await _write_frame(
-        process.stdin,
-        {
-            "jsonrpc": "2.0",
-            "id": 4,
-            "method": "extension.tool.execute",
-            "params": {"name": "wait_for_cancel", "input": {"mode": "cancel"}},
-        },
-    )
-    await asyncio.wait_for(started["cancel"].wait(), timeout=2)
-    await _write_frame(
-        process.stdin,
-        {"jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": 4}},
-    )
-    await asyncio.wait_for(aborted["cancel"].wait(), timeout=2)
-    await asyncio.wait_for(stale_blocked["cancel"].wait(), timeout=2)
-
-    await _write_frame(
-        process.stdin,
-        {
-            "jsonrpc": "2.0",
-            "id": 4,
-            "method": "extension.tool.execute",
-            "params": {"name": "wait_for_cancel", "input": {"mode": "quick"}},
-        },
-    )
-    reused_response = await _read_frame(process.stdout)
-    assert reused_response["result"] == {"content": "quick result"}
-
-    await _write_frame(
-        process.stdin,
-        {
-            "jsonrpc": "2.0",
-            "id": 5,
-            "method": "extension.tool.execute",
-            "params": {"name": "wait_for_cancel", "input": {"mode": "disconnect"}},
-        },
-    )
-    await asyncio.wait_for(started["disconnect"].wait(), timeout=2)
-    process.terminate()
-    await process.wait()
-    await asyncio.wait_for(aborted["disconnect"].wait(), timeout=2)
-    await asyncio.wait_for(stale_blocked["disconnect"].wait(), timeout=2)
-
-    replacement = await asyncio.create_subprocess_exec(
-        str(executable),
-        stdin=asyncio.subprocess.PIPE,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    assert replacement.stdin is not None
-    assert replacement.stdout is not None
-    await _write_frame(
-        replacement.stdin,
-        {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "extension.initialize",
-            "params": {
-                "extension": {"id": "cancellable", "cwd": str(tmp_path)},
-                "capabilities": {"toolUpdates": True},
-            },
-        },
-    )
-    await _read_frame(replacement.stdout)
-    await _write_frame(
-        replacement.stdin,
-        {
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "extension.tool.execute",
-            "params": {"name": "wait_for_cancel", "input": {"mode": "quick"}},
-        },
-    )
-    response = await _read_frame(replacement.stdout)
-    assert response["result"] == {"content": "quick result"}
-
-    replacement.terminate()
-    await replacement.wait()
-    await session.close()
-
-
-@pytest.mark.asyncio
-async def test_extension_bridge_rechecks_terminal_generation_inside_write_lock() -> None:
-    writer = _MemoryStreamWriter()
-    connection = _BridgeConnection(cast(asyncio.StreamWriter, writer))
-    state = _BridgeRequestState(7)
-    state.finish()
-    connection.requests[7] = state
-    await connection.write_lock.acquire()
-
-    task = asyncio.create_task(
-        connection.send(
-            {"jsonrpc": "2.0", "id": 7, "result": {"content": "old"}},
-            state,
-            terminal=True,
-        )
-    )
-    await asyncio.sleep(0)
-    state.cancel()
-    connection.requests[7] = _BridgeRequestState(7)
-    connection.write_lock.release()
-
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    assert writer.buffer == bytearray()
-
-
-@pytest.mark.asyncio
-async def test_extension_bridge_cancellation_leaves_persistent_rpc_pending() -> None:
-    writer = _MemoryStreamWriter()
-    connection = _BridgeConnection(cast(asyncio.StreamWriter, writer))
-    state = _BridgeRequestState(7)
-    connection.requests[7] = state
-    loop = asyncio.get_running_loop()
-    persistent: asyncio.Future[Any] = loop.create_future()
-    scoped: asyncio.Future[Any] = loop.create_future()
-    connection.pending[1] = (None, persistent)
-    connection.pending[2] = (state, scoped)
-
-    connection.cancel_request(7)
-
-    assert connection.pending[1] == (None, persistent)
-    assert not persistent.done()
-    assert 2 not in connection.pending
-    with pytest.raises(asyncio.CancelledError):
-        scoped.result()
-    connection.pending.pop(1)
-    persistent.set_result({"accepted": True})
-
-
-@pytest.mark.asyncio
-async def test_extension_bridge_persistent_request_is_not_replayed_after_completion() -> None:
-    calls: list[str] = []
-    writer = _MemoryStreamWriter()
-    connection = _BridgeConnection(cast(asyncio.StreamWriter, writer))
-    state = _BridgeRequestState(7)
-    connection.requests[7] = state
-
-    class FakeServer:
-        async def _request(
-            self,
-            request_connection: _BridgeConnection,
-            parent_id: int | str,
-            request_state: _BridgeRequestState,
-            method: str,
-            params: Any | None = None,
-        ) -> Any:
-            del method, params
-            assert request_connection is connection
-            assert parent_id == 7
-            assert request_state is state
-            calls.append("parented")
-            state.finish()
-            raise RuntimeError("Extension request completed")
-
-        async def _request_persistent(
-            self,
-            request_connection: _BridgeConnection,
-            method: str,
-            params: Any | None = None,
-        ) -> Any:
-            del method, params
-            assert request_connection is connection
-            calls.append("parentless")
-            return {"accepted": True}
-
-    client = _ConnectionHostRPCClient(cast(Any, FakeServer()), connection, 7, state)
-    with pytest.raises(RuntimeError, match="completed"):
-        await client.request_persistent(
-            "kodelet.ui.transcript.append",
-            {"scopeId": "conversation-a", "message": "once"},
-        )
-
-    assert calls == ["parented"]
-
-
-async def _read_and_ack_bridge_host_messages(
-    process: asyncio.subprocess.Process,
-    count: int,
-) -> list[dict[str, Any]]:
-    assert process.stdin is not None
-    assert process.stdout is not None
-    messages: list[dict[str, Any]] = []
-    while len(messages) < count:
-        message = await _read_frame(process.stdout)
-        messages.append(message)
-        if message.get("method") and message.get("id") is not None:
-            await _write_frame(
-                process.stdin,
-                {
-                    "jsonrpc": "2.0",
-                    "id": message["id"],
-                    "result": {"accepted": True},
-                },
-            )
-    return messages
-
-
-async def _write_frame(writer: asyncio.StreamWriter, message: Mapping[str, Any]) -> None:
-    payload = json.dumps(message, separators=(",", ":")).encode("utf-8")
-    writer.write(b"Content-Length: " + str(len(payload)).encode("ascii") + b"\r\n\r\n" + payload)
-    await writer.drain()
-
-
-class _MemoryStreamWriter:
-    def __init__(self) -> None:
-        self.buffer = bytearray()
-
-    def write(self, data: bytes) -> None:
-        self.buffer.extend(data)
-
-    async def drain(self) -> None:
-        await asyncio.sleep(0)
-
-    def close(self) -> None:
-        return None
-
-    async def wait_closed(self) -> None:
-        await asyncio.sleep(0)
-
-
-async def _read_frame(reader: asyncio.StreamReader) -> dict[str, Any]:
-    header_lines: list[bytes] = []
-    while True:
-        line = await reader.readline()
-        assert line != b""
-        if line in (b"\r\n", b"\n"):
-            break
-        header_lines.append(line)
-    content_length = _content_length(b"".join(header_lines).decode("ascii"))
-    payload = await reader.readexactly(content_length)
-    return json.loads(payload.decode("utf-8"))
-
-
-def _content_length(header: str) -> int:
-    for line in header.splitlines():
-        key, _, value = line.partition(":")
-        if key.strip().lower() == "content-length":
-            return int(value.strip())
-    raise AssertionError("missing content length")
-
-
-async def _read_text(path: Path) -> str:
-    return await asyncio.to_thread(path.read_text, encoding="utf-8")
-
-
-async def _exists(path: Path) -> bool:
-    return await asyncio.to_thread(path.exists)
-
-
-async def _is_dir(path: Path) -> bool:
-    return await asyncio.to_thread(path.is_dir)
-
-
-async def _iterdir(path: Path) -> list[Path]:
-    return await asyncio.to_thread(lambda: list(path.iterdir()))

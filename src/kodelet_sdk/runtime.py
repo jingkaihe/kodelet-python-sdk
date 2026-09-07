@@ -4,7 +4,7 @@ import asyncio
 import json
 import sys
 import threading
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from typing import Any, Protocol, cast
 
 from .api import Entrypoint, Extension, create_extension_host
@@ -66,10 +66,24 @@ class BinaryWriter(Protocol):
 
 
 class StdioHostRPCClient(HostRPCClient):
-    """Reverse-RPC client that sends extension-initiated requests to stdout."""
+    """Reverse-RPC client using framed stdio or an async raw-message transport.
 
-    def __init__(self, writer: BinaryWriter) -> None:
+    Args:
+        writer: Binary stream receiving Content-Length framed messages.
+        send_message: Async transport receiving raw JSON-RPC mappings unchanged.
+            Provide exactly one of ``writer`` or ``send_message``.
+    """
+
+    def __init__(
+        self,
+        writer: BinaryWriter | None = None,
+        *,
+        send_message: Callable[[Mapping[str, Any]], Awaitable[None]] | None = None,
+    ) -> None:
+        if (writer is None) == (send_message is None):
+            raise ValueError("Provide exactly one of writer or send_message")
         self._writer = writer
+        self._send_message = send_message
         self._write_lock = asyncio.Lock()
         self._next_id = 0
         self._pending: dict[int, tuple[_StdioRequestState | None, asyncio.Future[Any]]] = {}
@@ -83,14 +97,22 @@ class StdioHostRPCClient(HostRPCClient):
         *,
         terminal: bool = False,
     ) -> None:
-        """Write one framed message without interleaving concurrent writes."""
+        """Send one message without interleaving concurrent writes."""
 
         if self._closed:
             raise RuntimeError("Extension host connection is closed")
         async with self._write_lock:
             if self._closed:
                 raise RuntimeError("Extension host connection is closed")
-            await write_message(self._writer, message, state, terminal=terminal)
+            if self._send_message is not None:
+                if state is not None:
+                    valid = state.terminal_valid if terminal else state.active
+                    if not valid:
+                        raise asyncio.CancelledError
+                await self._send_message(message)
+            else:
+                assert self._writer is not None
+                await write_message(self._writer, message, state, terminal=terminal)
 
     async def request(self, method: str, params: Any | None = None) -> Any:
         """Send a connection-scoped JSON-RPC request without a parent ID.
@@ -143,6 +165,13 @@ class StdioHostRPCClient(HostRPCClient):
             return await future
         finally:
             self._pending.pop(request_id, None)
+            # Sending may still be awaiting a transport ACK when cancellation
+            # or close rejects this future. Preserve the send error, but do not
+            # abandon an unobserved exception on the response we never awaited.
+            if not future.done():
+                future.cancel()
+            elif not future.cancelled():
+                future.exception()
 
     async def notify(self, method: str, params: Any | None = None) -> None:
         """Send a connection-scoped JSON-RPC notification."""
@@ -244,6 +273,127 @@ class _RequestScopedHostRPCClient:
         return await self._client.request(method, params)
 
 
+class ExtensionMessageDispatcher:
+    """Dispatch raw extension JSON-RPC messages on one host connection.
+
+    Requests run in independent tasks so reverse RPC can be serviced while a
+    handler is waiting. Responses, cancellation, and notifications are routed
+    before :meth:`handle_message` returns. The owner must call :meth:`close`
+    when the connection ends.
+
+    Args:
+        host: Extension instance owned by this connection.
+        host_client: Reverse-RPC client and response transport for the connection.
+        on_error: Optional synchronous callback for asynchronous dispatch/send
+            failures. Handler exceptions become JSON-RPC error responses instead.
+            Without a callback, failures go to the event loop exception handler.
+    """
+
+    def __init__(
+        self,
+        host: Extension,
+        host_client: StdioHostRPCClient,
+        *,
+        on_error: Callable[[Exception], None] | None = None,
+    ) -> None:
+        self._host = host
+        self._host_client = host_client
+        self._on_error = on_error
+        self._pending_tasks: set[asyncio.Task[None]] = set()
+        self._request_states: dict[int | str, _StdioRequestState] = {}
+        self._closed = False
+        self._close_task: asyncio.Task[None] | None = None
+
+    async def handle_message(self, message: Mapping[str, Any]) -> None:
+        """Accept a raw message without waiting for a request handler to finish.
+
+        Raises:
+            RuntimeError: If this dispatcher is closed.
+        """
+
+        if self._closed:
+            raise RuntimeError("Extension message dispatcher is closed")
+        if not message.get("method"):
+            # Opposite directions have independent ID spaces. A late or
+            # unknown response must never replace a live incoming request.
+            self._host_client.handle_response(message)
+            return
+
+        method = message.get("method")
+        request_id = message.get("id")
+        if method == "$/cancelRequest" and request_id is None:
+            params = message.get("params")
+            if isinstance(params, Mapping) and isinstance(params.get("id"), int | str):
+                state = self._request_states.get(params["id"])
+                if state is not None:
+                    await state.cancel()
+                    await self._host_client.finish_request(state, asyncio.CancelledError())
+            return
+        if isinstance(method, str) and request_id is None:
+            self._host_client.handle_notification(method, message.get("params"))
+            return
+        if not isinstance(request_id, int | str):
+            return
+
+        previous = self._request_states.get(request_id)
+        if previous is not None:
+            await previous.cancel()
+            await self._host_client.finish_request(
+                previous,
+                RuntimeError("Extension request id was reused"),
+            )
+            if self._closed:
+                raise RuntimeError("Extension message dispatcher is closed")
+        state = _StdioRequestState(request_id)
+        task = asyncio.create_task(
+            _dispatch_request(self._host, self._host_client, message, state)
+        )
+        state.task = task
+        self._request_states[request_id] = state
+        self._pending_tasks.add(task)
+
+        def request_done(completed: asyncio.Task[None]) -> None:
+            self._pending_tasks.discard(completed)
+            if self._request_states.get(request_id) is state:
+                self._request_states.pop(request_id, None)
+            if completed.cancelled():
+                return
+            error = completed.exception()
+            if error is not None:
+                if self._on_error is not None and isinstance(error, Exception):
+                    self._on_error(error)
+                else:
+                    completed.get_loop().call_exception_handler(
+                        {
+                            "message": "Extension message dispatch failed",
+                            "exception": error,
+                            "task": completed,
+                        }
+                    )
+
+        task.add_done_callback(request_done)
+
+    async def close(self) -> None:
+        """Cancel handlers, reject pending reverse RPC, and release host state.
+
+        Cleanup is shared by concurrent callers and continues if a caller is
+        cancelled; calling ``close()`` again waits for that same cleanup.
+        """
+
+        self._closed = True
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(self._close())
+        await asyncio.shield(self._close_task)
+
+    async def _close(self) -> None:
+        for state in list(self._request_states.values()):
+            await state.cancel()
+            await self._host_client.finish_request(state, asyncio.CancelledError())
+        await self._host_client.close()
+        if self._pending_tasks:
+            await asyncio.gather(*self._pending_tasks, return_exceptions=True)
+
+
 async def run_extension(entrypoint: Extension | Entrypoint) -> None:
     """Run an extension entrypoint over stdio.
 
@@ -272,8 +422,7 @@ async def run_stdio_server(
     resolved_reader: BinaryReader = reader or cast(BinaryReader, sys.stdin.buffer)
     resolved_writer: BinaryWriter = writer or cast(BinaryWriter, sys.stdout.buffer)
     host_client = StdioHostRPCClient(resolved_writer)
-    pending_tasks: set[asyncio.Task[None]] = set()
-    request_states: dict[int | str, _StdioRequestState] = {}
+    dispatcher = ExtensionMessageDispatcher(host, host_client)
     try:
         while True:
             payload = await asyncio.to_thread(read_frame, resolved_reader)
@@ -293,61 +442,9 @@ async def run_stdio_server(
                 continue
             if not isinstance(message, Mapping):
                 continue
-            if not message.get("method"):
-                # Opposite directions have independent ID spaces. A late or
-                # unknown response must never replace a live incoming request.
-                host_client.handle_response(message)
-                continue
-
-            method = message.get("method")
-            request_id = message.get("id")
-            if method == "$/cancelRequest" and request_id is None:
-                params = message.get("params")
-                if isinstance(params, Mapping) and isinstance(params.get("id"), int | str):
-                    cancelled_id = params["id"]
-                    state = request_states.get(cancelled_id)
-                    if state is not None:
-                        await state.cancel()
-                        await host_client.finish_request(state, asyncio.CancelledError())
-                continue
-            if isinstance(method, str) and request_id is None:
-                host_client.handle_notification(method, message.get("params"))
-                continue
-            if not isinstance(request_id, int | str):
-                continue
-
-            previous = request_states.get(request_id)
-            if previous is not None:
-                await previous.cancel()
-                await host_client.finish_request(
-                    previous,
-                    RuntimeError("Extension request id was reused"),
-                )
-            state = _StdioRequestState(request_id)
-            task = asyncio.create_task(_dispatch_request(host, host_client, message, state))
-            state.task = task
-            request_states[request_id] = state
-            pending_tasks.add(task)
-            task.add_done_callback(pending_tasks.discard)
-
-            def remove_request(
-                completed: asyncio.Task[None],
-                *,
-                active_id: int | str = request_id,
-                active_state: _StdioRequestState = state,
-            ) -> None:
-                current = request_states.get(active_id)
-                if current is active_state and current.task is completed:
-                    request_states.pop(active_id, None)
-
-            task.add_done_callback(remove_request)
+            await dispatcher.handle_message(message)
     finally:
-        for state in list(request_states.values()):
-            await state.cancel()
-            await host_client.finish_request(state, asyncio.CancelledError())
-        await host_client.close()
-        if pending_tasks:
-            await asyncio.gather(*pending_tasks, return_exceptions=True)
+        await dispatcher.close()
 
 
 async def _dispatch_request(
@@ -358,33 +455,22 @@ async def _dispatch_request(
 ) -> None:
     request_client = _RequestScopedHostRPCClient(host_client, state)
     try:
-        result = await run_with_host_rpc_client(
-            request_client,
-            lambda: _dispatch(host, message),
-        )
+        response: dict[str, Any] = {"jsonrpc": "2.0", "id": state.request_id}
+        try:
+            response["result"] = await run_with_host_rpc_client(
+                request_client,
+                lambda: _dispatch(host, message),
+            )
+        except Exception as exc:
+            response["error"] = {"code": -32000, "message": str(exc)}
         should_respond = state.active
         await host_client.finish_request(state)
         if should_respond:
-            await host_client.send(
-                {"jsonrpc": "2.0", "id": state.request_id, "result": result},
-                state,
-                terminal=True,
-            )
+            # Transport failures must reach the dispatcher owner, not trigger a
+            # second terminal write on the same failing connection.
+            await host_client.send(response, state, terminal=True)
     except asyncio.CancelledError:
         return
-    except Exception as exc:
-        should_respond = state.active
-        await host_client.finish_request(state)
-        if should_respond:
-            await host_client.send(
-                {
-                    "jsonrpc": "2.0",
-                    "id": state.request_id,
-                    "error": {"code": -32000, "message": str(exc)},
-                },
-                state,
-                terminal=True,
-            )
     finally:
         await host_client.finish_request(state)
         await state.finish_terminal()

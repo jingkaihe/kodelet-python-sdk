@@ -88,6 +88,23 @@ def test_sdk_agent_examples_are_import_safe_and_executable() -> None:
 
 
 @pytest.mark.asyncio
+async def test_inline_calculator_example_executes_locally(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    module = load_module(
+        "inline_calculator_example", ROOT / "examples" / "sdk" / "inline-extension-session"
+    )
+    harness = await create_test_harness(module.ext)
+    init = harness.initialize()
+
+    assert init["name"] == "calculator"
+    assert [tool["name"] for tool in init["tools"]] == ["calculator"]
+    result = await harness.execute_tool({"name": "calculator", "input": {"a": 123, "b": 456}})
+    assert result == {"content": "579"}
+    assert capsys.readouterr().err == "Local calculator called: 123 + 456\n"
+
+
+@pytest.mark.asyncio
 async def test_review_example_registers_recipe_command(tmp_path: Path) -> None:
     entrypoint = ROOT / "examples" / "review" / "kodelet-extension-review"
     assert_executable(entrypoint)

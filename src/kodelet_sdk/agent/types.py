@@ -72,7 +72,14 @@ class AgentUIHandlers(TypedDict, total=False):
 
 
 class CreateSessionOptions(TypedDict, total=False):
-    """Options accepted by :meth:`Client.create_session`."""
+    """Options accepted by :meth:`Client.create_session`.
+
+    ``extensions`` attach local callbacks through the ACP session extension
+    protocol; supply them again on resume in the same order. ``ui`` services
+    input, confirm, select and notify requests locally when handlers are supplied.
+    ``extension_transport`` accepts legacy unix/tcp values but is now a no-op.
+    ``inherit_context`` remains unsupported; use ``ctx.children`` instead.
+    """
 
     profile: str | Profile | ProfileInput
     options: ExecutionOptions | Mapping[str, Any]

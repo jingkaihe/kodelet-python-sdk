@@ -4,15 +4,15 @@ import asyncio
 import inspect
 import os
 from collections.abc import Mapping, Sequence
-from pathlib import Path
 from typing import Any, Unpack, cast
 
+from ..api import Entrypoint, Extension
 from ..execution import ExecutionOptions, execution_args
-from .bridge import InMemoryExtensionBridge, TempConfig
 from .rpc import ACPRPCClient
 from .session import Session
 from .transport import spawn_acp
 from .types import (
+    AgentUIHandlers,
     ClientOptions,
     CreateSessionOptions,
     Profile,
@@ -72,17 +72,20 @@ class Client:
 
         Keyword arguments mirror :class:`CreateSessionOptions`; passing a mapping
         as the first argument is also accepted for parity with the TypeScript SDK.
+        Inline ``extensions`` keep callbacks in this Python process and relay
+        host RPC through the selected runner. ``extension_transport`` is a
+        compatibility no-op; ACP owns transport. ``ui`` handles local UI requests.
         """
 
         merged_options: dict[str, Any] = {**dict(session_options or {}), **kwargs}
-        if merged_options.get("extensions") or "extension_transport" in merged_options:
-            raise ValueError("Inline executable extensions are unsupported remotely; install on "
-                             "the runner and use ctx.children for delegated execution")
-        if merged_options.get("ui") is not None:
-            raise ValueError("Inline extension UI handlers are unsupported by this ACP adapter")
         if merged_options.get("inherit_context") is not None:
             raise ValueError("Use ctx.children for scoped execution; live forking remains "
                              "available separately through ctx.fork_conversation")
+        extensions = tuple(
+            cast(Sequence[Entrypoint | Extension], merged_options.get("extensions") or ())
+        )
+        if any(not isinstance(ext, Extension) and not callable(ext) for ext in extensions):
+            raise TypeError("extensions must contain Extension objects or extension entrypoints")
         resume = merged_options.get("resume")
         cwd = str(merged_options.get("cwd") or self._cwd)
         profile = _normalize_profile(merged_options.get("profile"))
@@ -107,7 +110,11 @@ class Client:
                 args,
                 {"cwd": os.getcwd(), "env": env, "stdio": ["pipe"] * 3},
             )
-            rpc = ACPRPCClient(process)
+            rpc = ACPRPCClient(
+                process,
+                extensions=extensions,
+                ui=cast(AgentUIHandlers | None, merged_options.get("ui")),
+            )
             self._rpcs.add(rpc)
             await rpc.initialize()
             session_id = (
@@ -171,21 +178,6 @@ class Client:
         self._rpcs.discard(session._rpc)
 
 
-class LaunchConfig:
-    def __init__(
-        self,
-        *,
-        args: Sequence[str],
-        env: Mapping[str, str],
-        temp_config: TempConfig | None = None,
-        config_file_mode: str | None = None,
-    ) -> None:
-        self.args = list(args)
-        self.env = dict(env)
-        self.temp_config = temp_config
-        self.config_file_mode = config_file_mode
-
-
 def _normalize_profile(profile: Any) -> Profile | None:
     if profile is None:
         return None
@@ -196,63 +188,8 @@ def _normalize_profile(profile: Any) -> Profile | None:
     raise TypeError("profile must be a profile name, Profile, or mapping")
 
 
-def _option_int(options: Mapping[str, Any], key: str) -> int | None:
-    value = options.get(key)
-    return value if isinstance(value, int) else None
-
-
-def _acp_server_args(options: Mapping[str, Any]) -> list[str]:
-    max_turns = _option_int(options, "max_turns")
-    if max_turns is not None and max_turns > 0:
-        return ["--max-turns", str(max_turns)]
-    return []
-
-
-async def _build_launch_config(
-    profile: Profile | None,
-    bridge: InMemoryExtensionBridge | None,
-) -> LaunchConfig:
-    resolved = profile.to_launch_config() if profile is not None else None
-    profile_config = resolved.get("config") if resolved else None
-    config: dict[str, Any] = {}
-    if isinstance(profile_config, Mapping):
-        config.update(profile_config)
-        if profile_config.get("profile") is None:
-            config["profile"] = "default"
-    if bridge is not None:
-        config["extensions"] = bridge.config()
-    config = _prune_none(config)
-    if not config:
-        return LaunchConfig(args=cast(Sequence[str], (resolved or {}).get("args") or []), env={})
-
-    temp_config = await TempConfig.create(config)
-    config_file_mode = "isolated" if isinstance(profile_config, Mapping) else "merge"
-    return LaunchConfig(
-        args=cast(Sequence[str], (resolved or {}).get("args") or []),
-        env={"KODELET_CONFIG_FILE": temp_config.path, "KODELET_CONFIG_FILE_MODE": config_file_mode},
-        temp_config=temp_config,
-        config_file_mode=config_file_mode,
-    )
-
-
-def _prune_none(value: Mapping[str, Any]) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    for key, item in value.items():
-        if item is None:
-            continue
-        if isinstance(item, Mapping):
-            result[str(key)] = _prune_none(item)
-        else:
-            result[str(key)] = item
-    return result
-
-
 def _clean_env(env: Mapping[str, str | None]) -> dict[str, str]:
     return {key: str(value) for key, value in env.items() if value is not None}
 
 
-def _resolve_path(path: str) -> str:
-    return str(Path(path).resolve(strict=False))
-
-
-__all__ = ["Client", "LaunchConfig"]
+__all__ = ["Client"]

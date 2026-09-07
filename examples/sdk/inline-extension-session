@@ -10,60 +10,36 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
-from collections.abc import Mapping
-from typing import Any
 
-from kodelet_sdk import BaseModel, Client, Extension, ToolContext
+from kodelet_sdk import BaseModel, Client, Extension
 
-DEFAULT_MESSAGE = (
-    "Use the sdk_echo tool with text 'hello from the Python SDK example', "
-    "then summarize the tool result in one sentence."
-)
+DEFAULT_MESSAGE = "Use calculator to add 123 and 456"
 
 
-class EchoInput(BaseModel):
-    text: str
+class CalculatorInput(BaseModel):
+    a: int
+    b: int
 
 
-ext = Extension(name="sdk-agent-example", version="0.1.0")
+ext = Extension(name="calculator", version="0.1.0")
 
 
-@ext.tool(
-    "sdk_echo",
-    description="Echo input text back to test the Python Agent SDK inline extension bridge.",
-    input_schema=EchoInput,
-)
-async def sdk_echo(input: EchoInput, ctx: ToolContext) -> str:
-    await ctx.ui.notify({"title": "sdk_echo called", "message": input.text})
-    return f"sdk_echo received: {input.text}"
-
-
-async def notify(request: Mapping[str, Any]) -> None:
-    title = request.get("title") or "notification"
-    message = request.get("message") or ""
-    print(f"[{title}] {message}", file=sys.stderr)
+@ext.tool("calculator", description="Add two integers", input_schema=CalculatorInput)
+async def calculator(input: CalculatorInput) -> str:
+    print(f"Local calculator called: {input.a} + {input.b}", file=sys.stderr)
+    return str(input.a + input.b)
 
 
 async def main() -> None:
     message = " ".join(sys.argv[1:]).strip() or DEFAULT_MESSAGE
     command = os.environ.get("KODELET_BIN", "kodelet")
-    client = Client(command=command, cwd=os.getcwd())
+    client = Client(command=command)
 
     try:
-        session = await client.create_session(
-            extensions=[ext],
-            streaming=True,
-            ui={"notify": notify},
-        )
-        session.on(
-            "assistant.message_delta",
-            lambda event: print(event.data.deltaContent, end="", flush=True),
-        )
-
+        session = await client.create_session(extensions=[ext])
         response = await session.run_and_wait(message=message)
-        if not response.content:
-            print("(no assistant content)")
-        print(f"\n\nConversation: {response.conversation_id or session.id}")
+        print(response.content)
+        print(f"\nConversation: {response.conversation_id or session.id}", file=sys.stderr)
     finally:
         await client.close()
 

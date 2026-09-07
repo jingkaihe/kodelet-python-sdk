@@ -7,9 +7,12 @@ from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from typing import Any, cast
 
+from ..api import Entrypoint, Extension
+from .relay import EXTENSION_FRAME_METHOD, SESSION_EXTENSIONS_VERSION, SessionExtensionRelay
 from .transport import ACP_MESSAGE_LIMIT
 from .types import (
     AgentRunError,
+    AgentUIHandlers,
     SessionSteeringOutcome,
     SessionSteerResult,
     SpawnedProcess,
@@ -28,7 +31,13 @@ class RPCError(RuntimeError):
 class ACPRPCClient:
     """Line-oriented JSON-RPC client for the ``kodelet acp`` subprocess."""
 
-    def __init__(self, process: SpawnedProcess) -> None:
+    def __init__(
+        self,
+        process: SpawnedProcess,
+        *,
+        extensions: Sequence[Entrypoint | Extension] = (),
+        ui: AgentUIHandlers | None = None,
+    ) -> None:
         self._process = process
         self._next_id = 0
         self._pending: dict[int, asyncio.Future[Any]] = {}
@@ -39,6 +48,11 @@ class ACPRPCClient:
         self._terminal_error: Exception | None = None
         self._close_task: asyncio.Task[None] | None = None
         self._steering_supported = False
+        self._extensions_supported = False
+        self._extension_relay = (
+            SessionExtensionRelay(extensions, self.request, ui) if extensions else None
+        )
+        self._session_started = False
         self._stdout_task = asyncio.create_task(self._read_stdout()) if process.stdout else None
         self._stderr_task = asyncio.create_task(self._read_stderr()) if process.stderr else None
         self._wait_task = asyncio.create_task(self._wait_for_process())
@@ -54,6 +68,7 @@ class ACPRPCClient:
                 "clientCapabilities": {
                     "terminal": True,
                     "fs": {"readTextFile": False, "writeTextFile": False},
+                    "_meta": {"sessionExtensions": {"version": SESSION_EXTENSIONS_VERSION}},
                 },
                 "clientInfo": {"name": "kodelet-sdk", "title": "Kodelet SDK"},
             },
@@ -63,16 +78,38 @@ class ACPRPCClient:
         self._steering_supported = (
             isinstance(steering, Mapping) and steering.get("supported") is True
         )
+        extensions = metadata.get("sessionExtensions") if isinstance(metadata, Mapping) else None
+        self._extensions_supported = (
+            isinstance(extensions, Mapping)
+            and type(extensions.get("version")) is int
+            and extensions["version"] == SESSION_EXTENSIONS_VERSION
+        )
+        if self._extension_relay is not None and not self._extensions_supported:
+            raise RuntimeError(
+                "Inline extensions require kodelet acp sessionExtensions version 1 support; "
+                "upgrade the selected daemon/runner and ACP client"
+            )
 
     async def create_session(self, cwd: str) -> str:
-        result = await self.request("session/new", {"cwd": cwd})
+        self._session_started = True
+        result = await self.request("session/new", {"cwd": cwd, **self._extension_params()})
         if not isinstance(result, Mapping) or not isinstance(result.get("sessionId"), str):
             raise RuntimeError("Invalid session/new response from kodelet acp")
+        if self._extension_relay is not None:
+            self._extension_relay.bind_session(result["sessionId"])
         return str(result["sessionId"])
 
     async def load_session(self, session_id: str, cwd: str) -> str:
-        await self.request("session/load", {"sessionId": session_id, "cwd": cwd})
+        if self._extension_relay is not None:
+            self._extension_relay.bind_session(session_id)
+        self._session_started = True
+        await self.request(
+            "session/load", {"sessionId": session_id, "cwd": cwd, **self._extension_params()}
+        )
         return session_id
+
+    def _extension_params(self) -> dict[str, Any]:
+        return {"_meta": self._extension_relay.metadata} if self._extension_relay else {}
 
     async def prompt(self, session_id: str, prompt: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         result = await self.request(
@@ -159,6 +196,8 @@ class ACPRPCClient:
                         "kodelet acp process did not close after SIGKILL; cleanup is incomplete"
                     ) from exc
         finally:
+            if self._extension_relay is not None:
+                await self._extension_relay.close()
             tasks = [
                 task
                 for task in (
@@ -275,11 +314,10 @@ class ACPRPCClient:
             return
         if self._closed and not self._pending:
             return
-        self._closed = True
         stderr = "".join(self._stderr_chunks)
         status = code if code is not None else "unknown"
         message = stderr.strip() or f"kodelet acp exited with status {status}"
-        self._reject_pending(AgentRunError(message, code=code, signal=None, stderr=stderr))
+        self._fail_transport(AgentRunError(message, code=code, signal=None, stderr=stderr))
 
     async def _handle_line(self, line: str) -> None:
         trimmed = line.strip()
@@ -315,6 +353,21 @@ class ACPRPCClient:
             pending.set_result(message.get("result"))
 
     async def _respond_to_server_request(self, message: Mapping[str, Any]) -> None:
+        if message.get("method") == EXTENSION_FRAME_METHOD:
+            response: dict[str, Any] = {"jsonrpc": "2.0", "id": message.get("id")}
+            try:
+                if not self._extensions_supported or not self._session_started:
+                    raise ValueError("Inline extension session is not attached")
+                if self._extension_relay is None:
+                    raise ValueError("Unknown inline extensionId; no inline extensions attached")
+                self._extension_relay.accept(message.get("params"))
+                response["result"] = {}
+            except ValueError as exc:
+                response["error"] = {"code": -32602, "message": str(exc)}
+            # Acceptance only: callbacks run off the reader, which must remain
+            # available to receive their nested host RPC responses and ACKs.
+            self._send(response)
+            return
         await self._write(
             {
                 "jsonrpc": "2.0",

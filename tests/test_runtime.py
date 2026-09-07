@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 import os
 import queue
@@ -28,6 +29,7 @@ from kodelet_sdk import (
     UISurfaceResizeEvent,
 )
 from kodelet_sdk.runtime import (
+    ExtensionMessageDispatcher,
     StdioHostRPCClient,
     _RequestScopedHostRPCClient,
     _StdioRequestState,
@@ -860,9 +862,15 @@ async def test_runtime_shutdown_rejects_persistent_rpc_started_during_cancellati
 
 
 @pytest.mark.asyncio
-async def test_runtime_rechecks_request_generation_inside_write_lock() -> None:
+@pytest.mark.parametrize("raw_transport", [False, True], ids=["stdio", "raw"])
+async def test_runtime_rechecks_request_generation_inside_write_lock(raw_transport: bool) -> None:
     writer = MemoryWriter()
-    client = StdioHostRPCClient(writer)
+    messages: asyncio.Queue[Mapping[str, Any]] = asyncio.Queue()
+    client = (
+        StdioHostRPCClient(send_message=messages.put)
+        if raw_transport
+        else StdioHostRPCClient(writer)
+    )
     state = _StdioRequestState(7)
     await client._write_lock.acquire()
 
@@ -882,12 +890,20 @@ async def test_runtime_rechecks_request_generation_inside_write_lock() -> None:
     with pytest.raises(asyncio.CancelledError):
         await task
     assert writer._buffer == bytearray()
+    assert messages.empty()
+    await client.close()
 
 
 @pytest.mark.asyncio
-async def test_runtime_rechecks_terminal_generation_inside_write_lock() -> None:
+@pytest.mark.parametrize("raw_transport", [False, True], ids=["stdio", "raw"])
+async def test_runtime_rechecks_terminal_generation_inside_write_lock(raw_transport: bool) -> None:
     writer = MemoryWriter()
-    client = StdioHostRPCClient(writer)
+    messages: asyncio.Queue[Mapping[str, Any]] = asyncio.Queue()
+    client = (
+        StdioHostRPCClient(send_message=messages.put)
+        if raw_transport
+        else StdioHostRPCClient(writer)
+    )
     state = _StdioRequestState(7)
     await state.finish()
     await client._write_lock.acquire()
@@ -906,6 +922,387 @@ async def test_runtime_rechecks_terminal_generation_inside_write_lock() -> None:
     with pytest.raises(asyncio.CancelledError):
         await task
     assert writer._buffer == bytearray()
+    assert messages.empty()
+    await client.close()
+
+
+def test_stdio_client_requires_exactly_one_transport() -> None:
+    messages: asyncio.Queue[Mapping[str, Any]] = asyncio.Queue()
+    with pytest.raises(ValueError, match="exactly one"):
+        StdioHostRPCClient()
+    with pytest.raises(ValueError, match="exactly one"):
+        StdioHostRPCClient(MemoryWriter(), send_message=messages.put)
+
+
+@pytest.mark.asyncio
+async def test_async_transport_preserves_raw_messages_and_serializes_sends() -> None:
+    messages: list[Mapping[str, Any]] = []
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def send(message: Mapping[str, Any]) -> None:
+        messages.append(message)
+        entered.set()
+        await release.wait()
+
+    client = StdioHostRPCClient(send_message=send)
+    raw = {
+        "jsonrpc": "2.0",
+        "id": "raw-id",
+        "parentId": "parent-id",
+        "method": "custom.request",
+        "params": {"nested": [1, None, "π"]},
+        "_meta": {"futureField": True},
+    }
+    first = asyncio.create_task(client.send(raw))
+    second: asyncio.Task[None] | None = None
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        second = asyncio.create_task(client.notify("custom.notification", {"value": 2}))
+        await _settle_event_loop()
+        assert messages == [raw]
+        assert messages[0] is raw
+        assert not second.done()
+        release.set()
+        await asyncio.wait_for(asyncio.gather(first, second), timeout=1)
+        assert messages[1] == {
+            "jsonrpc": "2.0", "method": "custom.notification", "params": {"value": 2}
+        }
+    finally:
+        release.set()
+        await asyncio.gather(first, *([second] if second is not None else []))
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_async_transport_rechecks_closed_connection_inside_write_lock() -> None:
+    messages: asyncio.Queue[Mapping[str, Any]] = asyncio.Queue()
+    client = StdioHostRPCClient(send_message=messages.put)
+    await client._write_lock.acquire()
+    pending = asyncio.create_task(client.notify("custom.notification"))
+    await _settle_event_loop()
+    await client.close()
+    client._write_lock.release()
+    with pytest.raises(RuntimeError, match="connection is closed"):
+        await pending
+    assert messages.empty()
+
+
+@pytest.mark.asyncio
+async def test_message_dispatcher_round_trip_with_updates_and_reverse_rpc() -> None:
+    ext = Extension(name="raw-rpc")
+
+    @ext.tool("echo", description="Exercise reverse RPC", input_schema={})
+    async def echo(input: Any, ctx: ToolContext) -> str:
+        await ctx.update("working", {"text": input["text"]})
+        answer = await ctx.ui.input({"title": input["text"]})
+        return f"{input['text']}:{answer}"
+
+    messages: asyncio.Queue[Mapping[str, Any]] = asyncio.Queue()
+    errors: list[Exception] = []
+    notifications: list[tuple[str, Any]] = []
+    client = StdioHostRPCClient(send_message=messages.put)
+    client.on_notification(lambda method, params: notifications.append((method, params)))
+    dispatcher = ExtensionMessageDispatcher(ext, client, on_error=errors.append)
+    try:
+        await dispatcher.handle_message({
+            "jsonrpc": "2.0", "id": "init", "method": "extension.initialize",
+            "params": {"capabilities": {"tools": {"updates": True}}},
+        })
+        init = await asyncio.wait_for(messages.get(), timeout=1)
+        assert init["result"]["name"] == "raw-rpc"
+        assert init["result"]["tools"][0]["name"] == "echo"
+        await asyncio.wait_for(dispatcher.handle_message({
+            "jsonrpc": "2.0", "id": 1, "method": "extension.tool.execute",
+            "params": {"name": "echo", "input": {"text": "local"}},
+        }), timeout=1)
+        update = await asyncio.wait_for(messages.get(), timeout=1)
+        assert update == {
+            "jsonrpc": "2.0", "id": 1, "parentId": 1,
+            "method": "kodelet.tool.update",
+            "params": {"content": "working", "data": {"text": "local"}},
+        }
+        await dispatcher.handle_message({"jsonrpc": "2.0", "id": 1, "result": {}})
+        reverse = await asyncio.wait_for(messages.get(), timeout=1)
+        assert reverse["method"] == "kodelet.ui.input"
+        assert reverse["parentId"] == 1
+        await dispatcher.handle_message({
+            "jsonrpc": "2.0", "method": "custom.notification", "params": {"raw": True}
+        })
+        assert notifications == [("custom.notification", {"raw": True})]
+        await dispatcher.handle_message({
+            "jsonrpc": "2.0", "id": reverse["id"],
+            "result": {"status": "submitted", "value": "host"},
+        })
+        assert await asyncio.wait_for(messages.get(), timeout=1) == {
+            "jsonrpc": "2.0", "id": 1, "result": {"content": "local:host"}
+        }
+        assert errors == []
+    finally:
+        await dispatcher.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["cancel", "reuse", "close"])
+async def test_message_dispatcher_cancels_pending_callbacks_without_replay(operation: str) -> None:
+    ext = Extension(name="cancel-raw-rpc")
+    cancelled = asyncio.Event()
+
+    @ext.tool("wait", description="Wait for reverse RPC", input_schema={})
+    async def wait(input: Any, ctx: ToolContext) -> str:
+        if input.get("quick"):
+            return "fresh"
+        try:
+            return str(await ctx.ui.input({"title": "blocked"}))
+        except asyncio.CancelledError:
+            cancelled.set()
+            return "stale"
+
+    messages: asyncio.Queue[Mapping[str, Any]] = asyncio.Queue()
+    errors: list[Exception] = []
+    client = StdioHostRPCClient(send_message=messages.put)
+    dispatcher = ExtensionMessageDispatcher(ext, client, on_error=errors.append)
+    request = {
+        "jsonrpc": "2.0", "id": "tool", "method": "extension.tool.execute",
+        "params": {"name": "wait", "input": {}},
+    }
+    try:
+        await dispatcher.handle_message(request)
+        reverse = await asyncio.wait_for(messages.get(), timeout=1)
+        assert reverse["parentId"] == "tool"
+        assert client._pending
+        if operation == "close":
+            await asyncio.wait_for(dispatcher.close(), timeout=1)
+        else:
+            if operation == "cancel":
+                await dispatcher.handle_message({
+                    "jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": "tool"}
+                })
+            await dispatcher.handle_message({
+                **request, "params": {"name": "wait", "input": {"quick": True}}
+            })
+            await dispatcher.handle_message({
+                "jsonrpc": "2.0", "id": reverse["id"],
+                "result": {"status": "submitted", "value": "late"},
+            })
+            assert await asyncio.wait_for(messages.get(), timeout=1) == {
+                "jsonrpc": "2.0", "id": "tool", "result": {"content": "fresh"}
+            }
+        await asyncio.wait_for(cancelled.wait(), timeout=1)
+    finally:
+        await dispatcher.close()
+    assert messages.empty()
+    assert not client._pending
+    assert not dispatcher._pending_tasks
+    assert not dispatcher._request_states
+    assert errors == []
+    with pytest.raises(RuntimeError, match="dispatcher is closed"):
+        await dispatcher.handle_message(request)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["cancel", "close"])
+async def test_message_dispatcher_consumes_failed_future_during_blocked_send(
+    operation: str,
+) -> None:
+    ext = Extension(name="blocked-send")
+    sending = asyncio.Event()
+    cleaning = asyncio.Event()
+    release = asyncio.Event()
+
+    @ext.tool("wait", description="Wait for transport acknowledgement", input_schema={})
+    async def wait(_input: Any, ctx: ToolContext) -> str:
+        return str(await ctx.ui.input({"title": "blocked"}))
+
+    async def send(_message: Mapping[str, Any]) -> None:
+        sending.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cleaning.set()
+            await release.wait()
+
+    loop = asyncio.get_running_loop()
+    loop_errors: list[dict[str, Any]] = []
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: loop_errors.append(context))
+    client = StdioHostRPCClient(send_message=send)
+    dispatcher = ExtensionMessageDispatcher(ext, client)
+    stopping: asyncio.Task[None] | None = None
+    try:
+        await dispatcher.handle_message({
+            "jsonrpc": "2.0", "id": "tool", "method": "extension.tool.execute",
+            "params": {"name": "wait", "input": {}},
+        })
+        await asyncio.wait_for(sending.wait(), timeout=1)
+        future = next(iter(client._pending.values()))[1]
+        future_done = asyncio.Event()
+        future.add_done_callback(lambda _future: future_done.set())
+        stopping = asyncio.create_task(
+            dispatcher.close() if operation == "close" else dispatcher.handle_message({
+                "jsonrpc": "2.0", "method": "$/cancelRequest", "params": {"id": "tool"}
+            })
+        )
+        await asyncio.wait_for(cleaning.wait(), timeout=1)
+        await asyncio.wait_for(future_done.wait(), timeout=1)
+        assert not future.cancelled(), "finish_request rejected the future while send was yielding"
+        release.set()
+        await asyncio.wait_for(stopping, timeout=1)
+        await asyncio.wait_for(dispatcher.close(), timeout=1)
+        assert not client._pending
+        del future
+        gc.collect()
+        assert loop_errors == []
+    finally:
+        release.set()
+        await asyncio.wait_for(dispatcher.close(), timeout=1)
+        if stopping is not None:
+            await asyncio.gather(stopping, return_exceptions=True)
+        loop.set_exception_handler(previous_handler)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("response_fails", [False, True], ids=["unanswered", "closed"])
+async def test_async_transport_failure_keeps_send_error_and_cleans_response_future(
+    response_fails: bool,
+) -> None:
+    sending = asyncio.Event()
+    release = asyncio.Event()
+    failure = OSError("transport acknowledgement failed")
+
+    async def send(_message: Mapping[str, Any]) -> None:
+        sending.set()
+        await release.wait()
+        raise failure
+
+    client = StdioHostRPCClient(send_message=send)
+    pending = asyncio.create_task(client.request("kodelet.ui.input"))
+    try:
+        await asyncio.wait_for(sending.wait(), timeout=1)
+        future = next(iter(client._pending.values()))[1]
+        if response_fails:
+            await client.close()
+        release.set()
+        with pytest.raises(OSError, match="transport acknowledgement failed") as caught:
+            await asyncio.wait_for(pending, timeout=1)
+        assert caught.value is failure
+        assert not client._pending
+        if response_fails:
+            # Checking the logging flag does not itself retrieve the exception.
+            assert not cast(Any, future)._log_traceback
+        else:
+            assert future.cancelled()
+    finally:
+        release.set()
+        await asyncio.gather(pending, return_exceptions=True)
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_message_dispatcher_close_survives_caller_cancellation() -> None:
+    ext = Extension(name="close-raw-rpc")
+    started = asyncio.Event()
+    cleaning = asyncio.Event()
+    release = asyncio.Event()
+
+    @ext.tool("wait", description="Wait during shutdown", input_schema={})
+    async def wait(_input: Any, _ctx: ToolContext) -> str:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cleaning.set()
+            await release.wait()
+        return "done"
+
+    messages: asyncio.Queue[Mapping[str, Any]] = asyncio.Queue()
+    client = StdioHostRPCClient(send_message=messages.put)
+    dispatcher = ExtensionMessageDispatcher(ext, client)
+    await dispatcher.handle_message({
+        "jsonrpc": "2.0", "id": 1, "method": "extension.tool.execute",
+        "params": {"name": "wait", "input": {}},
+    })
+    await asyncio.wait_for(started.wait(), timeout=1)
+    pending = asyncio.create_task(client.request("persistent.request"))
+    assert "parentId" not in await asyncio.wait_for(messages.get(), timeout=1)
+    closing = asyncio.create_task(dispatcher.close())
+    try:
+        await asyncio.wait_for(cleaning.wait(), timeout=1)
+        closing.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await closing
+        with pytest.raises(RuntimeError, match="connection closed"):
+            await asyncio.wait_for(pending, timeout=1)
+        assert dispatcher._close_task is not None
+        assert not dispatcher._close_task.done()
+    finally:
+        release.set()
+        await asyncio.wait_for(dispatcher.close(), timeout=1)
+        await asyncio.gather(pending, closing, return_exceptions=True)
+    assert not dispatcher._pending_tasks
+    assert not dispatcher._request_states
+    assert not client._pending
+    assert messages.empty()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("handler_fails", [False, True], ids=["result", "error"])
+async def test_message_dispatcher_reports_send_failure_without_retry(handler_fails: bool) -> None:
+    ext = Extension(name="broken-raw-rpc")
+
+    @ext.tool("test", description="Return or raise", input_schema={})
+    async def execute(_input: Any, _ctx: ToolContext) -> str:
+        if handler_fails:
+            raise ValueError("handler failed")
+        return "done"
+
+    sent: list[Mapping[str, Any]] = []
+    failure = OSError("transport failed")
+    reported: asyncio.Queue[Exception] = asyncio.Queue()
+
+    async def send(message: Mapping[str, Any]) -> None:
+        sent.append(message)
+        if len(sent) == 1:
+            raise failure
+
+    client = StdioHostRPCClient(send_message=send)
+    dispatcher = ExtensionMessageDispatcher(ext, client, on_error=reported.put_nowait)
+    try:
+        await dispatcher.handle_message({
+            "jsonrpc": "2.0", "id": "request", "method": "extension.tool.execute",
+            "params": {"name": "test", "input": {}},
+        })
+        assert await asyncio.wait_for(reported.get(), timeout=1) is failure
+        assert len(sent) == 1
+        assert sent[0]["id"] == "request"
+        if handler_fails:
+            assert sent[0]["error"] == {"code": -32000, "message": "handler failed"}
+        else:
+            assert sent[0]["result"] == {"content": "done"}
+        assert not dispatcher._pending_tasks
+        assert not dispatcher._request_states
+        assert reported.empty()
+    finally:
+        await dispatcher.close()
+
+
+@pytest.mark.asyncio
+async def test_message_dispatcher_returns_handler_errors_as_protocol_responses() -> None:
+    messages: asyncio.Queue[Mapping[str, Any]] = asyncio.Queue()
+    errors: list[Exception] = []
+    client = StdioHostRPCClient(send_message=messages.put)
+    dispatcher = ExtensionMessageDispatcher(Extension(), client, on_error=errors.append)
+    try:
+        await dispatcher.handle_message({
+            "jsonrpc": "2.0", "id": "unknown", "method": "extension.unknown", "params": {}
+        })
+        assert await asyncio.wait_for(messages.get(), timeout=1) == {
+            "jsonrpc": "2.0", "id": "unknown",
+            "error": {"code": -32000, "message": "Unknown JSON-RPC method: extension.unknown"},
+        }
+    finally:
+        await dispatcher.close()
+    assert errors == []
 
 
 class MemoryReader:

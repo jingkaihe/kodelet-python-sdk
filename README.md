@@ -1,10 +1,14 @@
 # kodelet-sdk
 
-Python SDK for authoring [Kodelet](https://github.com/jingkaihe/kodelet) extensions.
-
-The SDK speaks Kodelet's JSON-RPC extension protocol over stdio and provides an asyncio-first API for registering tools, commands, native TUI shortcuts, and event handlers.
+Run [Kodelet](https://github.com/jingkaihe/kodelet) sessions and write tools, commands, and event handlers in Python.
 
 ## Quick start
+
+```bash
+uv add kodelet-sdk
+```
+
+An executable extension registers handlers and serves them over stdio:
 
 ```python
 from kodelet_sdk import BaseModel, Extension, ToolContext, ToolExecutionResult
@@ -30,11 +34,11 @@ if __name__ == "__main__":
     ext.run_sync()
 ```
 
-## Public API
+## Agent sessions
 
-### Agent sessions
+`Client` uses your configured `kodelet` CLI to connect to a daemon and runner. Set `server` and `runner` on `Client` to select them explicitly. Provider credentials stay on the daemon; session `cwd` refers to the runner's workspace.
 
-Use `Client` to launch the thin `kodelet acp` daemon client over stdio JSON-RPC. Set `server` and `runner` on `Client`, or use normal daemon selection. Standalone clients authenticate with client credentials such as `KODELET_AUTH_TOKEN`; provider credentials stay on the daemon. Session `cwd` is interpreted on the runner, not used as the local subprocess directory.
+Run the following snippets inside an async function. The inline-extension example below includes a complete script.
 
 ```python
 from kodelet_sdk import Client
@@ -47,19 +51,16 @@ print(response.content)
 await client.close()
 ```
 
-Pass a named or inline `Profile` when creating a session, and listen for typed stream events while a run is active:
+### Streaming
+
+Choose a profile and subscribe to session events:
 
 ```python
-from kodelet_sdk import Client, Profile
+from kodelet_sdk import Client
 
-client = Client(command="kodelet")
+client = Client()
 session = await client.create_session(
-    profile=Profile(
-        {
-            "provider": "openai",
-            "model": "gpt-5.5",
-        }
-    ),
+    profile="work",  # A model profile configured on your daemon.
     max_turns=4,
     streaming=True,
 )
@@ -82,110 +83,95 @@ print("\nfinal:", response.content)
 await client.close()
 ```
 
-Each `tool.update` contains the latest accumulated output snapshot, not a new delta. Listeners receive every snapshot. To keep completed responses bounded, `response.events` retains only the latest `tool.update` for each `toolCallId`, followed by the authoritative `tool.result`.
+`tool.update` replaces the previous snapshot for that tool call; it is not a delta. Listeners receive every update, while `response.events` keeps only the latest snapshot and the final result.
 
-`create_session(options=ExecutionOptions(...), environment_profile="workspace")` accepts typed per-session execution settings and a runner-owned environment profile. Named `profile` values select daemon model profiles; inline profiles accept only typed model/resource/restriction options, not arbitrary provider configuration, credentials, endpoints, or local prompt paths. Explicit false, permitted zero, and empty lists are preserved. Temporary config files and inline executable extensions no longer configure remote execution. `session.close()` detaches; explicit `session.cancel()` targets the active turn.
+Session options include:
 
-### Extension-owned presets and delegated children
+| Option | Purpose |
+| --- | --- |
+| `profile` | A daemon profile name, `Profile`, or inline model settings |
+| `options` | An `ExecutionOptions` instance or mapping of execution limits and restrictions |
+| `environment_profile` | A runner-owned environment profile |
+| `cwd` | Working directory on the runner |
+| `resume` | An existing conversation ID |
 
-Use `ctx.children`, not a nested `Client` or `inherit_context`, for model work from an extension tool. Register a preset on the parent extension; its name is scoped to that extension/environment and need not exist in daemon YAML. System-prompt paths are resolved relative to the extension directory on the runner and frozen for the child, including later conversation resume.
+Inline settings cannot include provider secrets, endpoints, or local prompt paths.
 
-```python
-ext.register_profile({
-    "name": "code_search",
-    "systemPromptPath": "search-prompt.md",
-    "options": {
-        "model": "gpt-4o-mini",
-        "allowedTools": ["file_read", "grep_tool", "glob_tool"],
-        "noExtensions": True, "noSkills": True,
-        "enableFSSearchTools": True, "maxTurns": 3,
-    },
-})
+### Inline extensions
 
-@ext.tool("code_search", description="Search the repository", input_schema=TaskInput)
-async def search(input: TaskInput, ctx: ToolContext) -> str:
-    child = await ctx.children.start(
-        profile="code_search", message=input.task, request_id="this-tool-call-search-1",
-    )
-    result = await child.wait(on_event=lambda event: ctx.update(event.get("text") or event["kind"]))
-    return result["output"]
-```
-
-`ExecutionProfile` and `ExecutionOptions` accept Python field names as well as camelCase wire names; registration snapshots them. `child.conversation_id` and `child.run_id` are separate durable identities with parent metadata. `read()` returns status/progress; `cancel()` targets only that child. Cancelling `wait()` cancels that child. Child options cannot widen the parent's effective permissions or resource limits, and model selection is validated centrally. `system_prompt` can supply per-invocation content and `cwd` can select a descendant workspace directory. No administrative token, subprocess model loop, or local-provider fallback is used.
-
-With SDK 0.2.1 and a matching daemon/runner, `context_mode="fork"` snapshots the active parent's history; omitted context is fresh. Forking must begin inside the originating tool handler, even with a retained lease. `resume=child.conversation_id` submits a follow-up to that owned conversation with a new run ID and request ID; it cannot be combined with fork or loosen the saved policy. Old handles remain bound to their original run and cannot cancel or steer the follow-up.
+Pass `extensions=[ext]` to expose local Python callbacks as agent tools. This calculator runs in your Python process; the agent runs on the selected daemon and runner.
 
 ```python
-child = await ctx.children.start(profile="review", message="Review changes", context_mode="fork")
-steered = await child.steer("Also check cancellation", request_id="guidance-1")
-await child.wait()
-followup = await ctx.children.start(profile="review", message="Check the fix", resume=child.conversation_id)
+import asyncio
+
+from kodelet_sdk import BaseModel, Client, Extension
+
+
+ext = Extension(name="calculator", version="0.1.0")
+
+
+class CalculatorInput(BaseModel):
+    a: int
+    b: int
+
+
+@ext.tool("calculator", description="Add two integers", input_schema=CalculatorInput)
+async def calculator(input: CalculatorInput) -> str:
+    return str(input.a + input.b)
+
+
+async def main() -> None:
+    client = Client()
+    try:
+        session = await client.create_session(extensions=[ext])
+        response = await session.run_and_wait("Use calculator to add 123 and 456")
+        print(response.content)
+    finally:
+        await client.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
 ```
 
-`steer(message, request_id=...)` returns `{"outcome": "injected"}` when guidance is queued, or `{"outcome": "promptRequired", "reason": "noRunningTurn"}` when no turn is active. It never starts a turn automatically. Optional stable steering IDs deduplicate repeated guidance; omitted IDs are generated. Start/steer failures are never retried automatically. A cancelled or disconnected start may already be admitted: retain its request ID and background lease until exact child cancellation or acknowledged lease cleanup. After restart, resuming requires fresh tool authority; saved IDs alone are not credentials.
+Inline extensions require ACP session-extension protocol v1; older hosts fail with a clear error. On resume, reattach extensions in the same order. Callbacks are not saved or replayed, and pending work is cancelled when the channel or session closes.
 
-Foreground children end with the owning tool handler. For work that outlives it, acquire an activated runner lease with `await ctx.acquire_background_task(...)`, pass `lease=lease` on the first child submission inside the tool, and release it only after all child work finishes. Retained authority has a non-renewing one-hour maximum lifetime and is revoked on release, cancellation, runner/extension loss, or shutdown. Provisional initialization leases are not authority. Stable `request_id` values reconcile repeated submissions within the same live capability; changed input is rejected. Capabilities and bounded progress caches are not restart-replay credentials. Foreground usage aggregates into the parent; retained child usage remains in its own conversation.
+Host calls such as `ctx.update()` and `ctx.children` go to the runner. File, process, and storage helpers remain local. Legacy `extension_transport="unix"` and `"tcp"` options are accepted but ignored; ACP manages the connection.
 
-`await ctx.fork_conversation(name="Snapshot")` remains available for taking a history snapshot, but does not authorize execution. `inherit_context` is rejected before spawning; migrate execution to registered presets and `ctx.children`.
+### Steering
 
-Live forks require a persistent in-memory conversation. `fork_conversation()` raises `ConversationForkUnavailableError` when unavailable; other host RPC errors should be surfaced.
-
-An active session can receive additional guidance without starting another run. Call `steer()` only after a streaming event confirms that the run is active:
+Call `session.steer()` after an event confirms the run is active:
 
 ```python
 import asyncio
 
 run_active = asyncio.Event()
 session.once("assistant.thinking_start", lambda _event: run_active.set())
-run_task = asyncio.create_task(
-    session.run_and_wait(message="Review the persistence implementation")
-)
+run_task = asyncio.create_task(session.run_and_wait("Review the persistence implementation"))
 
 await run_active.wait()
 steered = await session.steer("Also check transaction boundaries")
 response = await run_task
 ```
 
-`steer()` uses the ACP `_session/steering` extension and returns an outcome such as `{"outcome": "injected"}`. It rejects calls when no run is active or the ACP server does not advertise `_meta.steering.supported`. The SDK requests `idleBehavior: "promptRequired"`, so an end-of-turn race returns `{"outcome": "promptRequired", "reason": "noRunningTurn"}` rather than silently starting another turn. `injected` means Kodelet queued the message, not that the model consumed it before the prompt ended; guidance left unconsumed remains on the conversation for a later run. Blank steering messages are rejected locally.
+Steering requires host support. `injected` means guidance was queued, not necessarily consumed. If the turn has just ended, the result is `promptRequired`; steering never starts a new turn automatically.
 
-Install executable extensions on the selected runner, where tools, skills, and lifecycle handlers execute. Inline `create_session(extensions=..., extension_transport=..., ui=...)` callbacks are explicitly rejected before spawning rather than silently ignored.
+## Extension registration
 
-The standalone `Client` ACP adapter accepts subprocess lines up to 64 MiB each. Oversized messages, pipe failures, and unexpected stdout closure fail pending requests and stop the subprocess; cleanup is bounded and retryable. This is a per-message ACP limit, not a conversation-history or scoped-child transport limit.
+Create an `Extension(name=..., version=...)`, then register synchronous or asynchronous handlers:
 
-```python
-from kodelet_sdk import BaseModel, Extension
+| API | Purpose |
+| --- | --- |
+| `@ext.tool(...)` | Model-callable tool with an input schema |
+| `@ext.command(...)` | Slash command or recipe, with optional aliases |
+| `@ext.on(event, ...)` | Lifecycle handler, such as `session.start`, `tool.call`, or `agent.end` |
+| `@ext.shortcut(...)` | Native TUI keyboard shortcut |
+| `ext.register_profile(...)` | Child execution preset |
+| `ext.run_sync()` / `await ext.run()` | Serve an executable extension over stdio |
 
+### Tool results and progress
 
-ext = Extension(name="workspace", version="0.1.0")
-
-
-class AskInput(BaseModel):
-    question: str
-    options: list[str]
-
-
-@ext.tool("ask_user_question", description="Ask the user", input_schema=AskInput)
-async def ask_user_question(input: AskInput, ctx):
-    choice = await ctx.ui.select({"title": input.question, "options": input.options})
-    return choice or "dismissed"
-
-
-ext.run_sync()  # Invoke from a runner-installed kodelet-extension-* executable.
-```
-
-### Extension registration
-
-- `Extension(name=None, version=None)` creates an extension host.
-- `ext.register_profile(ExecutionProfile(...))` or `ext.register_profile({...})` registers an extension-owned child execution preset.
-- `@ext.tool(name=None, description=None, input_schema=None, timeout_in_sec=None)` registers a tool.
-- `@ext.command(name=None, description=None, input_schema=None, aliases=None, kind=None, timeout_in_sec=None)` registers a command.
-- `@ext.shortcut(shortcut, description=None)` registers a native TUI keyboard shortcut handler; `ext.register_shortcut(shortcut, handler=..., description=None)` is the explicit form.
-- `@ext.on(event, priority=0, timeout_in_sec=None)` registers an event handler such as `session.start`, `tool.call`, `tool.update`, or `agent.end`.
-- `await ext.run()` starts the async stdio runtime; `ext.run_sync()` is a synchronous entrypoint convenience.
-
-Handlers may be synchronous or asynchronous. Tool handlers may return a string, which is converted to `{ "content": ... }`, or a protocol-shaped mapping. Command handlers return `{ "action": "pass" }`, `{ "action": "respond", "response": ... }`, or `{ "action": "runAgent", "prompt": ... }`. A `runAgent` result may include optional `display` text to replace the slash command in the visible and persisted user message while keeping `prompt` as the LLM input.
-
-Tool results may include host-facing presentation metadata under `data["presentation"]`:
+Return a string or a mapping with `content` and optional `data` and `error` fields. Use `data["presentation"]` to customize the displayed result without changing what the model receives:
 
 ```python
 from kodelet_sdk import ToolExecutionResult, ToolPresentation
@@ -201,57 +187,20 @@ result: ToolExecutionResult = {
 }
 ```
 
-`summary` is required and supplies the complete compact label. `body` optionally provides expanded details; only an omitted body falls back to the ordinary tool content. `format`, when present, declares the body as plain `text` or `markdown`. The SDK forwards this advisory object unchanged inside the generic `data` mapping, and it does not replace model-facing `content`, status, errors, or provenance. Hosts validate presentation metadata as untrusted input, sanitize Markdown, ignore malformed values, and may truncate bodies to their configured extension output limit.
+`summary` is required; `body` is optional and supports `text` or `markdown`. Hosts may sanitize or truncate display content.
 
-Shortcut handlers receive a `ShortcutContext` and may return `{"action": "submit", "message": "/dictate"}` when the host advertises `capabilities.shortcuts.submit`. Validated shortcuts appear in the native TUI's shortcut help.
-
-Supported shortcut identifiers are case-insensitive ASCII single chords: `ctrl+<ASCII letter>`, `alt+<ASCII letter-or-digit>`, `ctrl+alt+<ASCII letter>`, and unmodified `f1` through `f12`. `control` aliases `ctrl`, `option` aliases `alt`, and modifier order does not matter. `ctrl+i` and `ctrl+m`, including Ctrl+Alt variants, are rejected because terminals report them as Tab and Enter. Shift, Command/Meta/Super, modified function keys, punctuation, spaces, non-ASCII characters, and navigation-key combinations are unsupported. The native TUI skips reserved host bindings, reports overrides and extension-to-extension conflicts, and shows only effective registrations. Shortcuts currently execute only in local native `kodelet chat` sessions.
+For live progress, call `ctx.update()`. Updates replace earlier snapshots; only the final return value is persisted and sent to the model:
 
 ```python
-from kodelet_sdk import ShortcutContext
-
-
-@ext.shortcut("ctrl+alt+r", description="Refresh project context")
-async def refresh(ctx: ShortcutContext) -> None:
-    await ctx.ui.notify("Project context refreshed")
+@ext.tool("search", description="Search a project")
+async def search(input, ctx: ToolContext) -> str:
+    await ctx.update("Searching code", {"filesScanned": 12})
+    return "Search complete"
 ```
 
-Long-running tool handlers can publish transient accumulated snapshots through their context. Each update replaces the previous snapshot for that tool call; only the handler's return value is persisted or sent back to the model:
+`ctx.update()` is a no-op on hosts without progress support. For multi-step tasks, `TaskProgress` tracks activities and can attach to session events; `await progress.finish(...)` ends tracking and detaches listeners.
 
-```python
-@ext.tool("search", description="Search a project", input_schema=SearchInput)
-async def search(input: SearchInput, ctx: ToolContext) -> ToolExecutionResult:
-    await ctx.update(
-        "Searching code",
-        {"filesScanned": 12},
-    )
-    return {"content": "Search complete"}
-```
-
-`ctx.update(...)` is capability-gated and is a no-op when the connected Kodelet host does not support live extension-tool updates.
-
-When the host cancels an active request or disconnects, async handlers receive `asyncio.CancelledError`. Any late `ctx.update(...)` or transient `ctx.ui.input/confirm/select/notify(...)` call from that cancelled request is rejected rather than being routed to a later call. Persistent transcript, widget, and surface APIs retain the originating conversation's opaque UI scope and remain usable after their opening handler returns.
-
-For long-running tasks with multiple activities, `TaskProgress` publishes a bounded `taskRun` snapshot and can either be updated directly or attached to a child Kodelet session:
-
-```python
-progress = TaskProgress(
-    ctx,
-    kind="code_search",
-    task=input.query,
-    cwd=ctx.cwd,
-    running_title="Searching code",
-    completed_title="Searched code",
-    failed_title="Code search failed",
-    responding_detail="writing summary",
-)
-await progress.start()
-progress.attach(session)
-```
-
-Calling `await progress.finish(...)` returns the terminal snapshot and detaches the child-session listeners automatically.
-
-The decorators preserve concrete function signatures for type checkers, so handlers can annotate their inputs and contexts directly:
+### Commands and events
 
 ```python
 from kodelet_sdk import (
@@ -278,14 +227,37 @@ def sanitize_partial_output(event: ToolUpdateEvent, ctx: EventContext):
     return {"output": event.tool.output}
 ```
 
-`tool.update` handlers receive transient accumulated structured-result snapshots and may replace the snapshot by returning `{"output": ...}`. An extension that sanitizes `tool.result` should apply the same policy in `tool.update`; Kodelet suppresses partial snapshots when a result-subscribing extension does not also subscribe to updates.
+Commands return one of:
 
-### Pydantic and Jinja2 bridge dependencies
+- `{"action": "pass"}` — let another route handle the command.
+- `{"action": "respond", "response": "..."}` — respond directly to the user.
+- `{"action": "runAgent", "prompt": "..."}` — run the agent with a replacement prompt; optional `display` controls the visible user message.
 
-`kodelet-sdk` depends on Pydantic and Jinja2 and re-exports common entry points so extensions can be self-contained:
+If you sanitize `tool.result`, apply the same policy to `tool.update` so partial output is also safe to display. Without an update handler, Kodelet suppresses partial output for result-subscribing extensions.
+
+### Keyboard shortcuts
+
+Shortcuts run in local native `kodelet chat` sessions:
 
 ```python
-from kodelet_sdk import BaseModel, Field, Jinja2, Pydantic, render_template
+from kodelet_sdk import ShortcutContext
+
+
+@ext.shortcut("ctrl+alt+r", description="Refresh project context")
+async def refresh(ctx: ShortcutContext) -> None:
+    await ctx.ui.notify("Project context refreshed")
+```
+
+Supported chords are `ctrl+<letter>`, `alt+<letter-or-digit>`, `ctrl+alt+<letter>`, and `f1`–`f12` (ASCII, case-insensitive). `ctrl+i` and `ctrl+m` are excluded because terminals treat them as Tab and Enter. Reserved host bindings take precedence.
+
+Handlers can return `{"action": "submit", "message": "/dictate"}` when the host supports shortcut submission.
+
+## Schemas and templates
+
+The SDK re-exports Pydantic types and provides Jinja2 rendering:
+
+```python
+from kodelet_sdk import BaseModel, Field, render_template
 
 
 class ReviewInput(BaseModel):
@@ -293,17 +265,13 @@ class ReviewInput(BaseModel):
 
 
 assert render_template("Review {{ target }}", {"target": "main"}) == "Review main"
-assert Jinja2.Template("Hello {{ name }}").render(name="Kodelet") == "Hello Kodelet"
-assert Pydantic.TypeAdapter(int).validate_python("1") == 1
 ```
 
-Pydantic input schemas are converted to JSON Schema during initialization and validate incoming tool/command inputs before handlers run. Commands with validation failures return `{"action": "pass"}` so another command route can handle the invocation.
+Pydantic schemas validate inputs before handlers run and generate JSON Schema for the host. Invalid command inputs return `{"action": "pass"}`. Raw JSON Schema mappings are also accepted, but do not perform local input validation.
 
-Tools also accept arbitrary raw `JSONSchema` mappings. Raw schemas are forwarded unchanged to Kodelet and inputs are passed directly to the handler; use a Pydantic schema when the Python extension should perform local validation.
+## Context helpers
 
-### Context helpers
-
-Handlers receive `ctx` with Kodelet call metadata and helper namespaces:
+Handlers receive `ctx` with call metadata and these helpers:
 
 - `ctx.storage.read_text/write_text/read_json/write_json(...)` for extension data files.
 - `ctx.path.resolve_workspace_path(...)` and `ctx.path.relative_to_workspace(...)`.
@@ -311,11 +279,58 @@ Handlers receive `ctx` with Kodelet call metadata and helper namespaces:
 - `ctx.process.exec(...)` and `ctx.process.spawn(...)` for async process execution.
 - `ctx.env.get(...)` for environment access.
 - `ctx.log.debug/info/warn/error(...)` for JSON logs to stderr.
-- `await ctx.acquire_background_task(...)` for a host lifetime lease around work that may outlive the current handler.
+- `ctx.children.start(...)` for delegated agent work.
+- `await ctx.acquire_background_task(...)` to keep runtime resources alive after a handler returns.
 - `ctx.ui.input/confirm/select/notify(...)` for host UI reverse-RPC calls.
 - `ctx.ui.append_transcript(...)`, `ctx.ui.set_widget(...)`, and `ctx.ui.open_surface(...)` for capability-gated persistent native-TUI content.
 
-UI helpers accept protocol-shaped typed requests: `UIInputRequest`, `UIConfirmRequest`, `UISelectRequest`, and `UINotifyRequest`. The stdio runtime dispatches independent extension requests concurrently and includes the originating request's `parentId` on reverse-RPC calls so Kodelet can route UI interactions to the correct call context.
+### Child agents
+
+Use `ctx.children` for agent work inside a tool, rather than creating a nested `Client`. Register a preset on the extension, then start a child with that preset:
+
+```python
+class TaskInput(BaseModel):
+    task: str
+
+
+ext.register_profile({
+    "name": "code_search",
+    "options": {
+        "allowed_tools": ["file_read", "grep_tool", "glob_tool"],
+        "no_extensions": True,
+        "no_skills": True,
+        "enable_fs_search_tools": True,
+        "max_turns": 3,
+    },
+})
+
+
+@ext.tool("code_search", description="Search the repository", input_schema=TaskInput)
+async def code_search(input: TaskInput, ctx: ToolContext) -> str:
+    child = await ctx.children.start(profile="code_search", message=input.task)
+    result = await child.wait(on_event=lambda event: ctx.update(event.get("text") or event["kind"]))
+    return result["output"]
+```
+
+- `read()` checks progress; `cancel()` cancels only that child. Cancelling `wait()` also cancels the child.
+- Children start with fresh context. Use `context_mode="fork"` inside the active tool handler to copy the parent's history.
+- Use `resume=child.conversation_id` for a follow-up. It creates a new run; old handles still target the old run. Resume cannot be combined with fork.
+- `child.steer(message)` queues guidance without starting a turn. Like session steering, it returns `injected` or `promptRequired`.
+- Child settings cannot expand the parent's permissions or limits. `system_prompt_path` in a preset is resolved on the runner.
+
+Start and steer calls do not retry automatically. Supply a stable `request_id` when you need to reconcile an uncertain submission; reuse it only for the same input. A disconnected start may already be running, so keep its ID and any lease until cancellation or cleanup is confirmed.
+
+For a history snapshot without execution, use `ctx.fork_conversation()`. It raises `ConversationForkUnavailableError` when unavailable. `Client.create_session(inherit_context=...)` is unsupported.
+
+### Background work
+
+Children normally end with their tool handler. To let work outlive it, acquire a lease with `await ctx.acquire_background_task(...)` and pass `lease=lease` when first starting the child inside the tool. Close the lease after the work and final updates finish.
+
+Runner leases last at most one hour and end on release, cancellation, or runner/extension shutdown. They keep resources alive, not Python task state. Resuming after a restart requires a new authorized tool call; saved IDs alone are insufficient.
+
+### User input
+
+Executable extensions use the host's UI. For inline extensions, pass `ui={"select": handler, ...}` to `create_session()` to handle requests locally. A local handler needs no terminal unless it uses one; requests without a handler depend on the runner's UI support.
 
 ```python
 from kodelet_sdk import UIInputRequest, UISelectRequest
@@ -327,63 +342,43 @@ branch = await ctx.ui.input(input_request)
 mode = await ctx.ui.select(select_request)
 ```
 
-Background leases retain host runtime resources; they do not persist extension-specific task state. Acquire the lease before returning from the originating handler and close it after the worker and its final state or UI updates complete. Persistent local hosts return a no-op lease, while runner-backed hosts retain the conversation's extension runtime and execution instance until the last lease is released.
+### Persistent TUI content
+
+Use transcript entries, widgets, and surfaces for longer-lived UI. Widget and surface IDs are scoped to the originating conversation.
 
 ```python
-lease = await ctx.acquire_background_task("index repository")
-try:
-    await run_background_worker()
-finally:
-    await lease.close()
-```
-
-The native Kodelet TUI can advertise persistent transcript, widget, and interactive-surface support. `append_transcript(...)` and `set_widget(...)` are no-ops when unavailable; `open_surface(...)` raises `RuntimeError` when surfaces are unavailable. Persistent UI requests retain the originating request's `parentId` while a tool, command, or event handler is active and always carry `ctx.ui_scope_id` as an opaque durable scope, including an explicit empty string for host-global UI. This lets one extension reuse the same widget or surface ID independently in multiple conversations while returned surface handles continue receiving correctly scoped events and publishing frames through the persistent connection.
-
-```python
-import asyncio
-
-
 await ctx.ui.append_transcript({"title": "Drawing saved", "message": "./drawing.png"})
-
-await ctx.ui.set_widget(
-    "status",
-    [
-        "Extension state",
-        {"spans": [{"text": " ready", "style": {"foreground": "#00ff00", "bold": True}}]},
-    ],
-)
-await ctx.ui.set_widget("status", ["Moved"], {"placement": "belowComposer"})
-await ctx.ui.set_widget("status", None)
+await ctx.ui.set_widget("status", ["Indexing repository…"])
 
 surface = await ctx.ui.open_surface(
     {
-        "id": "game",
+        "id": "preview",
         "initialLines": ["Loading…"],
         "width": "75%",
         "height": "80%",
         "anchor": "center",
-        "margin": {"top": 1, "right": 1, "bottom": 1, "left": 1},
     }
 )
 
 surface.on_resize(
     lambda event: surface.update([f"Surface size: {event['width']}×{event['height']}"])
 )
-
-
-def handle_input(event):
-    if event["kind"] == "key" and event.get("key") == "q":
-        asyncio.create_task(surface.close())
-
-
-surface.on_input(handle_input)
+surface.update(["Preview ready"])
+await surface.close()
+await ctx.ui.set_widget("status", None)  # Remove the widget.
 ```
 
-`surface.update(...)` is synchronous and replace-in-place. The SDK keeps at most one frame transport write in flight and one replaceable latest pending frame per surface. Input, mouse, focus, blur, and resize notifications share an ordered host-event sequence; stale events are discarded. Surface dimensions accept positive terminal-cell counts or percentage strings such as `"75%"`, anchors cover all corners, edges, and center, and `nonCapturing: True` leaves keyboard focus with the underlying TUI. A failed `await surface.close()` keeps the handle owned and retryable; the ID is released only after the host acknowledges a successful close.
+`append_transcript()` and `set_widget()` are no-ops without host support; `open_surface()` raises `RuntimeError`. Surface updates replace existing content. If `surface.close()` fails, the handle remains valid for retry.
 
-### Testing extensions
+## Runtime behavior
 
-Use `create_test_harness` to exercise registrations without spawning a subprocess:
+- Requests run concurrently. Cancellation or disconnection raises `asyncio.CancelledError` in async handlers; late request-scoped UI calls and updates are rejected.
+- Persistent widgets and surfaces can outlive the handler that opened them, but remain scoped to their conversation.
+- ACP messages are limited to 64 MiB each. Pipe failures and oversized messages fail pending requests and stop the subprocess.
+
+## Testing extensions
+
+Test handlers without a subprocess:
 
 ```python
 from kodelet_sdk import Extension, create_test_harness
@@ -401,31 +396,17 @@ async def test_tool():
     assert result == {"content": "hi"}
 ```
 
-Use `await harness.execute_shortcut({"key": "ctrl+r", "context": {...}})` to invoke a registered shortcut handler in-process.
-
 ## Examples
 
-Runnable example extensions live in `examples/`:
-
-- `examples/review/kodelet-extension-review` is a review command extension.
-- `examples/workspace/kodelet-extension-workspace` is a workspace helper/policy extension.
-
-From a checked-out SDK repository, run an example with:
+Run the inline calculator from a checkout with a configured Kodelet daemon:
 
 ```bash
-uv run -s examples/review/kodelet-extension-review
+uv run -s examples/sdk/inline-extension-session
 ```
 
-The `kodelet-extension-*` files are executable wrappers so Kodelet can discover and launch them directly.
+Other examples:
 
-## Releases
-
-Package versions are read from `VERSION.txt`. To publish a release, configure PyPI Trusted Publishing for the `Release` workflow, then update and commit `VERSION.txt` manually:
-
-```bash
-git add VERSION.txt pyproject.toml uv.lock
-git commit -m "chore: release v0.1.0"
-make release
-```
-
-Pushing the `vX.Y.Z` tag runs the GitHub Actions release workflow, builds the package, and publishes to PyPI using OIDC trusted publishing.
+- `examples/sdk/basic-agent-session` — one prompt and its final response.
+- `examples/sdk/streaming-agent-session` — live assistant and tool output.
+- `examples/review/kodelet-extension-review` — review command extension.
+- `examples/workspace/kodelet-extension-workspace` — workspace helper/policy extension.
