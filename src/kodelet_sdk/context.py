@@ -14,8 +14,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, NotRequired, Protocol, Required, TypeAlias, TypedDict, cast
 
-from .child import ChildClient
-
 CommandFlagValue: TypeAlias = str | bool | list[str]
 
 
@@ -1447,7 +1445,6 @@ class SharedContext:
         self.env = EnvContext()
         self.log = LogContext(_optional_str(extension.get("id")))
         self._host_rpc_client = _current_host_rpc_client()
-        self.children = ChildClient(self._host_rpc_client)
         self._background_tasks_enabled = _runtime_capability_supported(
             init,
             "backgroundTasks",

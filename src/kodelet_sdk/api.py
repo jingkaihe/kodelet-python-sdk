@@ -36,7 +36,6 @@ from .context import (
     create_shortcut_context,
     create_tool_context,
 )
-from .execution import ExecutionProfile
 from .schemas import SchemaAdapter, SchemaLike, infer_schema_from_callable
 
 _MISSING = object()
@@ -327,7 +326,6 @@ class Extension:
         if version is not None:
             self._metadata["version"] = version
         self._tools: dict[str, ToolRegistration] = {}
-        self._profiles: dict[str, dict[str, Any]] = {}
         self._commands_by_name: dict[str, CommandRegistration] = {}
         self._command_registrations: list[CommandRegistration] = []
         self._shortcuts: dict[str, ShortcutRegistration] = {}
@@ -650,16 +648,6 @@ class Extension:
             return decorator(cast(HandlerT, handler))
         return decorator
 
-    def register_profile(self, profile: ExecutionProfile | Mapping[str, Any]) -> None:
-        """Register an extension-scoped child preset without daemon YAML setup."""
-        snapshot = ExecutionProfile.model_validate(profile).to_wire()
-        name = str(snapshot["name"])
-        if name in self._profiles:
-            raise ValueError(f"Duplicate execution preset: {name}")
-        if len(self._profiles) >= 32:
-            raise ValueError("An extension supports at most 32 execution presets")
-        self._profiles[name] = snapshot
-
     def initialize(self, params: Mapping[str, Any]) -> dict[str, Any]:
         """Handle Kodelet's ``extension.initialize`` JSON-RPC request.
 
@@ -687,8 +675,6 @@ class Extension:
         }
         if version := self._metadata.get("version"):
             result["version"] = version
-        if self._profiles:
-            result["profiles"] = json_clone(list(self._profiles.values()))
         return result
 
     async def execute_tool(self, params: Mapping[str, Any]) -> dict[str, Any]:

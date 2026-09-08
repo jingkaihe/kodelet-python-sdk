@@ -15,6 +15,7 @@ from kodelet_sdk import (
     BridgeTransport,
     Client,
     CreateSessionOptions,
+    ExecutionOptions,
     Extension,
     HostRPCError,
     Profile,
@@ -295,6 +296,39 @@ def test_agent_package_preserves_public_reexports() -> None:
     assert client_module.Client is Client
 
 
+@pytest.mark.asyncio
+async def test_session_preserves_typed_execution_options_with_named_profile() -> None:
+    calls: list[list[str]] = []
+
+    def spawn(_command: str, args: Sequence[str], _options: SpawnOptions) -> FakeACPProcess:
+        calls.append(list(args))
+        return FakeACPProcess()
+
+    client = Client(spawn=spawn)
+    try:
+        await client.create_session(
+            profile="work",
+            options=ExecutionOptions(
+                max_turns=0,
+                no_tools=False,
+                allowed_tools=["file_read", "grep_tool", "glob_tool"],
+                allowed_commands=[],
+                enableFSSearchTools=True,
+            ),
+        )
+        assert calls == [[
+            "acp",
+            "--max-turns=0",
+            "--no-tools=false",
+            '--allowed-tools="file_read","grep_tool","glob_tool"',
+            "--allowed-commands=",
+            "--enable-fs-search-tools=true",
+            "--profile=work",
+        ]]
+    finally:
+        await client.close()
+
+
 def test_profile_maps_early_profiler_spelling_and_nested_config() -> None:
     profile = Profile(
         {
@@ -390,12 +424,12 @@ async def test_inline_options_do_not_rewrite_client_environment(
 
 
 @pytest.mark.asyncio
-async def test_session_rejects_unscoped_inherited_context_before_spawn() -> None:
+async def test_session_rejects_implicit_inherited_context_before_spawn() -> None:
     processes: list[FakeACPProcess] = []
 
     class InheritedContext:
         async def fork_conversation(self) -> str:
-            raise AssertionError("must not fork before scoped authorization")
+            raise AssertionError("must not fork implicitly")
 
     def spawn(_command: str, _args: Sequence[str], _options: SpawnOptions) -> FakeACPProcess:
         process = FakeACPProcess()
@@ -403,7 +437,7 @@ async def test_session_rejects_unscoped_inherited_context_before_spawn() -> None
         return process
 
     client = Client(spawn=spawn)
-    with pytest.raises(ValueError, match=r"ctx\.children"):
+    with pytest.raises(ValueError, match=r"ctx\.fork_conversation\(\).*resume"):
         await client.create_session(inherit_context=cast(Any, InheritedContext()))
     assert processes == []
     await client.close()
@@ -1345,7 +1379,7 @@ async def test_session_rejects_resume_with_inherited_context() -> None:
             return "forked-conversation"
 
     client = Client()
-    with pytest.raises(ValueError, match=r"ctx\.children"):
+    with pytest.raises(ValueError, match=r"ctx\.fork_conversation\(\).*resume"):
         await client.create_session(
             resume="existing-conversation",
             inherit_context=cast(Any, InheritedContext()),
@@ -1359,7 +1393,7 @@ async def test_session_rejects_profile_with_inherited_context() -> None:
             return "forked-conversation"
 
     client = Client()
-    with pytest.raises(ValueError, match=r"ctx\.children"):
+    with pytest.raises(ValueError, match=r"ctx\.fork_conversation\(\).*resume"):
         await client.create_session(
             profile="other-profile",
             inherit_context=cast(Any, InheritedContext()),

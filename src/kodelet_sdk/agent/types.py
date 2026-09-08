@@ -78,7 +78,8 @@ class CreateSessionOptions(TypedDict, total=False):
     protocol; supply them again on resume in the same order. ``ui`` services
     input, confirm, select and notify requests locally when handlers are supplied.
     ``extension_transport`` accepts legacy unix/tcp values but is now a no-op.
-    ``inherit_context`` remains unsupported; use ``ctx.children`` instead.
+    ``inherit_context`` remains unsupported; call ``ctx.fork_conversation()``
+    explicitly and pass its returned conversation ID as ``resume`` instead.
     """
 
     profile: str | Profile | ProfileInput

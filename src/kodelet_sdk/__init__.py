@@ -65,7 +65,6 @@ from .api import (
     define_extension,
     on,
 )
-from .child import ChildClient, ChildExecution, ChildSteerResult
 from .context import (
     BackgroundTaskLease,
     CommandContext,
@@ -115,7 +114,7 @@ from .context import (
     run_with_host_rpc_client,
     set_active_host_rpc_client,
 )
-from .execution import ExecutionOptions, ExecutionProfile
+from .execution import ExecutionOptions
 from .runtime import run_extension
 from .schemas import JSONSchema, ToolInputSchema
 from .task_progress import (
@@ -153,9 +152,6 @@ __all__ = [
     "BackgroundTaskLease",
     "BaseModel",
     "BridgeTransport",
-    "ChildClient",
-    "ChildExecution",
-    "ChildSteerResult",
     "Client",
     "ClientOptions",
     "CommandContext",
@@ -176,7 +172,6 @@ __all__ = [
     "EventResult",
     "ExecResult",
     "ExecutionOptions",
-    "ExecutionProfile",
     "Extension",
     "ExtensionEvent",
     "ExtensionHost",

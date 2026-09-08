@@ -1,4 +1,4 @@
-"""Credential-free execution options and runner-owned preset registrations."""
+"""Typed, credential-free ACP execution options."""
 
 from __future__ import annotations
 
@@ -62,31 +62,3 @@ def execution_args(options: ExecutionOptions) -> list[str]:
             encoded = str(value)
         args.append(f"--{flag}={encoded}")
     return args
-
-
-class ExecutionProfile(BaseModel):
-    """Extension-owned preset; prompt paths are resolved on the runner."""
-
-    model_config = ConfigDict(extra="forbid", strict=True, alias_generator=to_camel,
-                              populate_by_name=True)
-    name: str = Field(min_length=1, max_length=128, pattern=r"^[^/\\\x00]+$")
-    options: ExecutionOptions | None = None
-    system_prompt_path: str | None = Field(default=None, max_length=8192)
-    system_prompt: str | None = Field(default=None, max_length=256 * 1024)
-
-    @model_validator(mode="before")
-    @classmethod
-    def reject_null(cls, value: Any) -> Any:
-        if isinstance(value, Mapping) and any(item is None for item in value.values()):
-            raise ValueError("Omit absent preset fields instead of null")
-        return value
-
-    @model_validator(mode="after")
-    def check_prompt(self) -> ExecutionProfile:
-        if self.system_prompt and self.system_prompt_path:
-            raise ValueError("Use prompt content or a prompt path, not both")
-        return self
-
-    def to_wire(self) -> dict[str, Any]:
-        """Return the serializable registration for extension.initialize."""
-        return self.model_dump(by_alias=True, exclude_none=True)

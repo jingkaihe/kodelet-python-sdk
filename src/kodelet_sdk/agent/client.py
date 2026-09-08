@@ -79,8 +79,10 @@ class Client:
 
         merged_options: dict[str, Any] = {**dict(session_options or {}), **kwargs}
         if merged_options.get("inherit_context") is not None:
-            raise ValueError("Use ctx.children for scoped execution; live forking remains "
-                             "available separately through ctx.fork_conversation")
+            raise ValueError(
+                "inherit_context is unsupported; call ctx.fork_conversation() "
+                "and pass the returned conversation ID as resume"
+            )
         extensions = tuple(
             cast(Sequence[Entrypoint | Extension], merged_options.get("extensions") or ())
         )

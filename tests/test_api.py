@@ -54,6 +54,17 @@ class WeatherInput(BaseModel):
     location: str
 
 
+def test_empty_extension_registration_shape() -> None:
+    assert Extension(name="empty", version="1.0.0").initialize({}) == {
+        "name": "empty",
+        "version": "1.0.0",
+        "tools": [],
+        "commands": [],
+        "shortcuts": [],
+        "subscriptions": [],
+    }
+
+
 def test_reexports_pydantic_and_jinja2() -> None:
     class Model(Pydantic.BaseModel):
         name: str = Pydantic.Field(min_length=1)

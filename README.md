@@ -95,7 +95,7 @@ Session options include:
 | `cwd` | Working directory on the runner |
 | `resume` | An existing conversation ID |
 
-Inline settings cannot include provider secrets, endpoints, or local prompt paths.
+Pass an `ExecutionOptions` instance directly as `create_session(options=...)` for model settings, execution limits, and tool selection. The optional `profile="work"` selects a model profile already configured on the daemon; omit it to use the daemon's default. Inline settings cannot include provider secrets, endpoints, or local prompt paths.
 
 ### Inline extensions
 
@@ -136,7 +136,9 @@ if __name__ == "__main__":
 
 Inline extensions require ACP session-extension protocol v1; older hosts fail with a clear error. On resume, reattach extensions in the same order. Callbacks are not saved or replayed, and pending work is cancelled when the channel or session closes.
 
-Host calls such as `ctx.update()` and `ctx.children` go to the runner. File, process, and storage helpers remain local. Legacy `extension_transport="unix"` and `"tcp"` options are accepted but ignored; ACP manages the connection.
+To customize the prompt, attach an inline `agent.init` handler that returns a `systemPrompt` patch and leave extensions enabled. Prompt hooks work alongside typed session options.
+
+Host calls such as `ctx.update()` and `ctx.fork_conversation()` go to the runner. File, process, and storage helpers remain local. Legacy `extension_transport="unix"` and `"tcp"` options are accepted but ignored; ACP manages the connection.
 
 ### Steering
 
@@ -166,7 +168,6 @@ Create an `Extension(name=..., version=...)`, then register synchronous or async
 | `@ext.command(...)` | Slash command or recipe, with optional aliases |
 | `@ext.on(event, ...)` | Lifecycle handler, such as `session.start`, `tool.call`, or `agent.end` |
 | `@ext.shortcut(...)` | Native TUI keyboard shortcut |
-| `ext.register_profile(...)` | Child execution preset |
 | `ext.run_sync()` / `await ext.run()` | Serve an executable extension over stdio |
 
 ### Tool results and progress
@@ -279,54 +280,22 @@ Handlers receive `ctx` with call metadata and these helpers:
 - `ctx.process.exec(...)` and `ctx.process.spawn(...)` for async process execution.
 - `ctx.env.get(...)` for environment access.
 - `ctx.log.debug/info/warn/error(...)` for JSON logs to stderr.
-- `ctx.children.start(...)` for delegated agent work.
+- `await ctx.fork_conversation(name=...)` to snapshot the active tool's conversation for an ACP session.
 - `await ctx.acquire_background_task(...)` to keep runtime resources alive after a handler returns.
 - `ctx.ui.input/confirm/select/notify(...)` for host UI reverse-RPC calls.
 - `ctx.ui.append_transcript(...)`, `ctx.ui.set_widget(...)`, and `ctx.ui.open_surface(...)` for capability-gated persistent native-TUI content.
 
-### Child agents
+### Agent work inside tools
 
-Use `ctx.children` for agent work inside a tool, rather than creating a nested `Client`. Register a preset on the extension, then start a child with that preset:
+Use `Client.create_session(options=ExecutionOptions(...))` with normal client credentials and server/runner targeting. Attach `TaskProgress` for activity updates and await client/progress cleanup on every exit path. A cancelled response is not success, even with partial text.
 
-```python
-class TaskInput(BaseModel):
-    task: str
-
-
-ext.register_profile({
-    "name": "code_search",
-    "options": {
-        "allowed_tools": ["file_read", "grep_tool", "glob_tool"],
-        "no_extensions": True,
-        "no_skills": True,
-        "enable_fs_search_tools": True,
-        "max_turns": 3,
-    },
-})
-
-
-@ext.tool("code_search", description="Search the repository", input_schema=TaskInput)
-async def code_search(input: TaskInput, ctx: ToolContext) -> str:
-    child = await ctx.children.start(profile="code_search", message=input.task)
-    result = await child.wait(on_event=lambda event: ctx.update(event.get("text") or event["kind"]))
-    return result["output"]
-```
-
-- `read()` checks progress; `cancel()` cancels only that child. Cancelling `wait()` also cancels the child.
-- Children start with fresh context. Use `context_mode="fork"` inside the active tool handler to copy the parent's history.
-- Use `resume=child.conversation_id` for a follow-up. It creates a new run; old handles still target the old run. Resume cannot be combined with fork.
-- `child.steer(message)` queues guidance without starting a turn. Like session steering, it returns `injected` or `promptRequired`.
-- Child settings cannot expand the parent's permissions or limits. `system_prompt_path` in a preset is resolved on the runner.
-
-Start and steer calls do not retry automatically. Supply a stable `request_id` when you need to reconcile an uncertain submission; reuse it only for the same input. A disconnected start may already be running, so keep its ID and any lease until cancellation or cleanup is confirmed.
-
-For a history snapshot without execution, use `ctx.fork_conversation()`. It raises `ConversationForkUnavailableError` when unavailable. `Client.create_session(inherit_context=...)` is unsupported.
+Sessions start fresh. For inherited context, call `ctx.fork_conversation(name="worker-name")` inside the active tool, then pass the returned ID as `resume`. `inherit_context` remains unsupported. Reuse or resume the session for follow-ups; steering only affects a running turn.
 
 ### Background work
 
-Children normally end with their tool handler. To let work outlive it, acquire a lease with `await ctx.acquire_background_task(...)` and pass `lease=lease` when first starting the child inside the tool. Close the lease after the work and final updates finish.
+To let extension work outlive its handler, acquire a lease with `await ctx.acquire_background_task(...)` while the handler is active. Retain and manage the background task yourself, close any ACP client it owns, and release the lease after the work and final UI updates finish. A lease keeps extension resources alive; it does not authorize ACP sessions or keep a completed tool's `ctx.update()` channel open.
 
-Runner leases last at most one hour and end on release, cancellation, or runner/extension shutdown. They keep resources alive, not Python task state. Resuming after a restart requires a new authorized tool call; saved IDs alone are insufficient.
+Runner leases last at most one hour and end on release, cancellation, or runner/extension shutdown. They keep resources alive, not Python task state; background tasks must be recreated after a restart.
 
 ### User input
 
