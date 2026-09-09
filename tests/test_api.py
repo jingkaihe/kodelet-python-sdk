@@ -108,11 +108,11 @@ def test_remote_profile_manifest_roundtrip_and_snapshot_isolation() -> None:
             "options": {
                 "provider": "openai",
                 "model": "gpt-5.6-luna",
-                "reasoningEffort": "none",
-                "weakModel": "gpt-5.6-luna",
-                "maxTokens": 4096,
-                "weakModelMaxTokens": 1024,
-                "thinkingBudgetTokens": 0,
+                "reasoning_effort": "none",
+                "weak_model": "gpt-5.6-luna",
+                "max_tokens": 4096,
+                "weak_model_max_tokens": 1024,
+                "thinking_budget_tokens": 0,
                 "openai": {
                     "platform": "codex",
                     "api_mode": "responses",
@@ -127,7 +127,7 @@ def test_remote_profile_manifest_roundtrip_and_snapshot_isolation() -> None:
                 "provider": "anthropic",
                 "model": "claude-sonnet-4-6",
                 "anthropic": {"platform": "anthropic"},
-                "anthropicAPIAccess": "subscription",
+                "anthropic_api_access": "subscription",
             },
             "hidden": False,
         },
@@ -151,7 +151,7 @@ def test_remote_profile_manifest_roundtrip_and_snapshot_isolation() -> None:
 
 
 @pytest.mark.parametrize("provider", ["openai", "anthropic"])
-def test_remote_profiles_preserve_arbitrary_provider_dictionaries(provider: str) -> None:
+def test_remote_profiles_preserve_native_profile_json(provider: str) -> None:
     ext = Extension()
     settings: dict[str, Any] = {
         "platform": "codex" if provider == "openai" else "copilot",
@@ -161,16 +161,23 @@ def test_remote_profiles_preserve_arbitrary_provider_dictionaries(provider: str)
         "api_key": "test-key",
         "api_key_env_var": "PROVIDER_KEY",
         "account": "work",
-        "future_setting": {"values": [True, None, 1.5, "value"]},
+        "future_setting": {"values": [True, None, 1.5, "value"], "optional": None},
     }
     expected_settings = json.loads(json.dumps(settings))
     arguments: dict[str, Any] = {
         "provider": provider,
         "model": "test-model",
+        "allowed_tools": ["file_read"],
+        "enable_fs_search_tools": False,
+        "skills": {"enabled": False},
+        "retry": {"attempts": 0},
+        "compact_ratio": 0.75,
+        "future_setting": None,
         provider: settings,
     }
     if provider == "anthropic":
-        arguments["anthropicAPIAccess"] = "subscription"
+        arguments["anthropic_api_access"] = "subscription"
+        arguments["anthropic_account"] = "work"
     assert ext.register_profile("search", **arguments) == "search"
     settings["future_setting"]["values"].append("mutated-input")
     params = {"capabilities": {"profiles": {"remote": True}}}
@@ -189,74 +196,6 @@ def test_remote_profiles_preserve_arbitrary_provider_dictionaries(provider: str)
     arguments[provider] = {}
     ext.register_profile("empty", **arguments)
     assert ext.initialize(params)["profiles"][1]["options"][provider] == {}
-
-
-@pytest.mark.parametrize("camel_case", [False, True])
-def test_remote_profiles_accept_subscription_settings_and_top_level_alias(camel_case: bool) -> None:
-    ext = Extension()
-    openai = {
-        "platform": "codex",
-        "api_mode": "responses",
-        "service_tier": "fast",
-    }
-    assert ext.register_profile(
-        "search",
-        provider="openai",
-        model="gpt-5.6-luna",
-        openai=openai,
-    ) == "search"
-    access: dict[str, Any] = {
-        "anthropicAPIAccess" if camel_case else "anthropic_api_access": "subscription",
-    }
-    assert ext.register_profile(
-        "claude",
-        provider="anthropic",
-        model="claude-sonnet-4-6",
-        anthropic={"platform": "anthropic"},
-        **access,
-    ) == "claude"
-    profiles = ext.initialize({"capabilities": {"profiles": {"remote": True}}})["profiles"]
-    assert profiles[0]["options"]["openai"] == {
-        "platform": "codex",
-        "api_mode": "responses",
-        "service_tier": "fast",
-    }
-    assert profiles[1]["options"] == {
-        "provider": "anthropic",
-        "model": "claude-sonnet-4-6",
-        "anthropic": {"platform": "anthropic"},
-        "anthropicAPIAccess": "subscription",
-    }
-
-
-@pytest.mark.parametrize("options", [
-    *[{"openai": value} for value in (
-        None, [], "codex", True, 3, {"value": object()}, {1: "non-string-key"},
-    )],
-    *[{"provider": "anthropic", "anthropic": value} for value in (
-        None, [], "anthropic", True, 3, {"value": object()}, {1: "non-string-key"},
-    )],
-    {"anthropic": {}},
-    {"anthropic_api_access": "subscription"},
-    {"provider": "anthropic", "openai": {}},
-    {"provider": "anthropic", "anthropic_api_access": None},
-    {"provider": "anthropic", "anthropicAPIAccess": None},
-    {"provider": "anthropic", "anthropic_api_access": "oauth"},
-    {"provider": "anthropic", "anthropic_account": "work"},
-    {"provider": "anthropic", "anthropicAccount": "work"},
-])
-def test_remote_profiles_reject_invalid_blocks_and_provider_mismatches(
-    options: dict[str, Any],
-) -> None:
-    ext = Extension()
-    arguments: dict[str, Any] = {
-        "provider": "openai",
-        "model": "test-model",
-        **options,
-    }
-    with pytest.raises(ValueError):
-        ext.register_profile("search", **arguments)
-    assert "profiles" not in ext.initialize({})
 
 
 @pytest.mark.parametrize("name", ["", "a/b", "a b", "-search", "_search", ".search",
@@ -310,13 +249,13 @@ def test_remote_profiles_are_independent_of_extension_metadata() -> None:
 
 
 @pytest.mark.parametrize("name", ["A", "A" + "a" * 127, "0" + "._-" * 42 + "z"])
-def test_remote_profiles_accept_slug_boundaries_and_camel_case_options(name: str) -> None:
+def test_remote_profiles_accept_slug_boundaries(name: str) -> None:
     ext = Extension()
     assert ext.register_profile(
         name,
         provider="openai",
         model="gpt-5.6-luna",
-        reasoningEffort="none",
+        reasoning_effort="none",
     ) == name
     assert ext.initialize({"capabilities": {"profiles": {"remote": True}}})["profiles"] == [
         {
@@ -324,7 +263,7 @@ def test_remote_profiles_accept_slug_boundaries_and_camel_case_options(name: str
             "options": {
                 "provider": "openai",
                 "model": "gpt-5.6-luna",
-                "reasoningEffort": "none",
+                "reasoning_effort": "none",
             },
             "hidden": False,
         },
@@ -332,18 +271,13 @@ def test_remote_profiles_accept_slug_boundaries_and_camel_case_options(name: str
 
 
 @pytest.mark.parametrize("options", [
-    {"provider": "unknown"}, {"provider": None}, {"model": ""}, {"model": None},
-    {"weak_model": ""}, {"reasoning_effort": None}, {"reasoning_effort": ""},
-    {"max_tokens": 0}, {"max_tokens": True}, {"weak_model_max_tokens": -1},
-    {"thinking_budget_tokens": -1}, {"max_tokens": "100"}, {"hidden": "false"},
-    {"hidden": 0}, {"hidden": None}, {"max_turns": 0}, {"use_weak_model": False},
-    {"no_tools": False}, {"no_extensions": False}, {"no_skills": False},
-    {"allowed_tools": []}, {"allowed_commands": []}, {"enable_fs_search_tools": False},
-    {"allowedTools": []}, {"useWeakModel": False}, {"maxTurns": 0},
-    {"api_key": "secret"}, {"base_url": "https://example.invalid"},
-    {"allowed_reasoning_efforts": ["none"]},
+    {"provider": "unknown"}, {"provider": None},
+    {"model": ""}, {"model": None}, {"model": " \n"}, {"model": "a\x00b"}, {"model": 123},
+    {"hidden": "false"}, {"hidden": 0}, {"hidden": None},
+    {"future_setting": object()}, {"openai": {1: "non-string-key"}},
+    {"future_setting": {"nested": float("nan")}},
 ])
-def test_remote_profiles_reject_non_model_or_invalid_options(options: dict[str, Any]) -> None:
+def test_remote_profiles_reject_invalid_identity_or_non_json(options: dict[str, Any]) -> None:
     ext = Extension(name="code-search")
     arguments: dict[str, Any] = {
         "provider": "openai",

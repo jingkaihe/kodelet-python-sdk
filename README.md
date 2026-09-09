@@ -118,7 +118,7 @@ CLAUDE_PROFILE = ext.register_profile(
 session = await client.create_session(profile=SEARCH_PROFILE)
 ```
 
-`register_profile(name, *, provider, model, hidden=False, **options)` returns the flat name unchanged. Names are ASCII slugs (1–128 characters; `default` is reserved). `hidden=True` hides the profile from pickers.
+`register_profile(name, *, provider, model, hidden=False, **options)` accepts native profile JSON with snake_case keys (no camelCase conversion), using built-in defaults rather than inheriting daemon model/provider settings. Credentials remain daemon-resolved and host restrictions still apply. It returns the name unchanged: an ASCII slug of 1–128 characters (`default` is reserved). `hidden=True` hides the profile from pickers.
 
 ### Inline extensions
 

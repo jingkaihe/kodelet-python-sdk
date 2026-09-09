@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 import re
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import (
     Any,
@@ -366,10 +367,8 @@ class Extension:
 
         Names are 1–128-character ASCII slugs; default is reserved (case-insensitive).
         Requires host acceptance before ACP selection.
-        Optional settings: weak_model, max_tokens, weak_model_max_tokens,
-        thinking_budget_tokens, reasoning_effort, openai, anthropic, and
-        anthropic_api_access (camelCase also accepted at the top level).
-        Provider blocks use daemon config keys unchanged; the daemon validates them.
+        Options are native profile JSON (snake_case), validated by the daemon.
+        Profiles use built-in defaults, not the daemon's model/provider settings.
         """
         if not isinstance(name, str) or not re.fullmatch(
             r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", name,
@@ -729,7 +728,7 @@ class Extension:
         if version := self._metadata.get("version"):
             result["version"] = version
         if self._profiles:
-            result["profiles"] = json_clone(list(self._profiles.values()))
+            result["profiles"] = deepcopy(list(self._profiles.values()))
         return result
 
     async def execute_tool(self, params: Mapping[str, Any]) -> dict[str, Any]:
