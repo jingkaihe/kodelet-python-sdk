@@ -1430,6 +1430,7 @@ class SharedContext:
         )
         data_dir = Path(str(data_dir_value)).resolve(strict=False)
         self.session_id = _optional_str(context.get("sessionId"))
+        self.runner_id = _optional_str(extension.get("runnerId"))
         self.conversation_id = _optional_str(context.get("conversationId"))
         self.ui_scope_id = _normalize_ui_scope_id(context.get("uiScopeId")) or None
         self.cwd = str(cwd)

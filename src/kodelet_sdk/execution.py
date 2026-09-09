@@ -1,4 +1,4 @@
-"""Typed, credential-free ACP execution options."""
+"""Typed ACP execution and extension profile options."""
 
 from __future__ import annotations
 
@@ -6,9 +6,9 @@ import csv
 import io
 import re
 from collections.abc import Mapping
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 from pydantic.alias_generators import to_camel
 
 
@@ -42,6 +42,52 @@ class ExecutionOptions(BaseModel):
 
     def to_wire(self) -> dict[str, Any]:
         """Return an independent camelCase protocol snapshot."""
+        return self.model_dump(by_alias=True, exclude_none=True)
+
+
+class ExtensionProfileOptions(BaseModel):
+    """Registration-only settings; nested provider configuration is validated by the daemon."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        strict=True,
+        alias_generator=to_camel,
+        populate_by_name=True,
+    )
+
+    provider: Literal["openai", "anthropic"]
+    model: str = Field(min_length=1)
+    weak_model: str | None = Field(default=None, min_length=1)
+    max_tokens: int | None = Field(default=None, gt=0)
+    weak_model_max_tokens: int | None = Field(default=None, gt=0)
+    thinking_budget_tokens: int | None = Field(default=None, ge=0)
+    reasoning_effort: str | None = Field(default=None, min_length=1)
+    openai: dict[str, JsonValue] | None = None
+    anthropic: dict[str, JsonValue] | None = None
+    anthropic_api_access: Literal["auto", "subscription", "api-key"] | None = Field(
+        default=None,
+        alias="anthropicAPIAccess",
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_null(cls, value: Any) -> Any:
+        if isinstance(value, Mapping) and any(item is None for item in value.values()):
+            raise ValueError("Omit absent profile settings; null is not inheritance")
+        return value
+
+    @model_validator(mode="after")
+    def validate_provider_settings(self) -> Self:
+        if self.provider != "openai" and self.openai is not None:
+            raise ValueError("openai settings require the openai provider")
+        if self.provider != "anthropic" and (
+            self.anthropic is not None or self.anthropic_api_access is not None
+        ):
+            raise ValueError("anthropic settings require the anthropic provider")
+        return self
+
+    def to_wire(self) -> dict[str, Any]:
+        """Return an independent wire snapshot, preserving nested provider config keys."""
         return self.model_dump(by_alias=True, exclude_none=True)
 
 

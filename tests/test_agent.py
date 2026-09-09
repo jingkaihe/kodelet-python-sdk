@@ -329,6 +329,56 @@ async def test_session_preserves_typed_execution_options_with_named_profile() ->
         await client.close()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("registration", [
+    {
+        "name": "code-search",
+        "provider": "openai",
+        "model": "gpt-5.6-luna",
+        "reasoning_effort": "none",
+        "openai": {
+            "platform": "codex",
+            "api_mode": "responses",
+            "service_tier": "fast",
+        },
+        "hidden": True,
+    },
+    {
+        "name": "claude",
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-6",
+        "anthropic": {"platform": "anthropic"},
+        "anthropic_api_access": "subscription",
+    },
+])
+async def test_registered_profile_name_reaches_acp_without_expanding_model_options(
+    registration: dict[str, Any],
+) -> None:
+    ext = Extension()
+    profile = ext.register_profile(**registration)
+    manifest = ext.initialize({"capabilities": {"profiles": {"remote": True}}})
+    assert profile == registration["name"]
+    assert profile == manifest["profiles"][0]["name"]
+    calls: list[list[str]] = []
+    process = FakeACPProcess()
+
+    def spawn(_command: str, args: Sequence[str], _options: SpawnOptions) -> FakeACPProcess:
+        calls.append(list(args))
+        return process
+
+    client = Client(server="http://daemon", runner="runner-one", spawn=spawn)
+    try:
+        await client.create_session(profile=profile, cwd="/only/on/runner")
+        assert calls == [[
+            "acp", "--server", "http://daemon", "--runner", "runner-one",
+            f"--profile={registration['name']}",
+        ]]
+        assert process.requests[1]["method"] == "session/new"
+        assert process.requests[1]["params"] == {"cwd": "/only/on/runner"}
+    finally:
+        await client.close()
+
+
 def test_profile_maps_early_profiler_spelling_and_nested_config() -> None:
     profile = Profile(
         {
@@ -1715,6 +1765,15 @@ async def test_session_runs_kodelet_acp_json_rpc_and_emits_stream_events() -> No
             id="provider-config",
         ),
         pytest.param({"options": None}, None, id="null-options"),
+        *[
+            pytest.param({key: settings}, None, id=f"{key}-{name}")
+            for key in ("profile", "options")
+            for name, settings in (
+                ("openai", {"openai": {"platform": "codex"}}),
+                ("anthropic", {"anthropic": {"platform": "anthropic"}}),
+                ("anthropic-access", {"anthropic_api_access": "subscription"}),
+            )
+        ],
     ],
 )
 async def test_session_rejects_unsupported_options_before_spawning(

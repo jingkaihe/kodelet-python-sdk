@@ -97,6 +97,29 @@ Session options include:
 
 Pass an `ExecutionOptions` instance directly as `create_session(options=...)` for model settings, execution limits, and tool selection. The optional `profile="work"` selects a model profile already configured on the daemon; omit it to use the daemon's default. Inline settings cannot include provider secrets, endpoints, or local prompt paths.
 
+### Extension model profiles
+
+```python
+ext = Extension()
+SEARCH_PROFILE = ext.register_profile(
+    "code-search",
+    provider="openai",
+    model="gpt-5.6-luna",
+    reasoning_effort="none",
+    hidden=True,
+)
+CLAUDE_PROFILE = ext.register_profile(
+    "claude",
+    provider="anthropic",
+    model="claude-sonnet-4-6",
+    anthropic={"platform": "anthropic"},
+    anthropic_api_access="subscription",
+)
+session = await client.create_session(profile=SEARCH_PROFILE)
+```
+
+`register_profile(name, *, provider, model, hidden=False, **options)` returns the flat name unchanged. Names are ASCII slugs (1–128 characters; `default` is reserved). `hidden=True` hides the profile from pickers.
+
 ### Inline extensions
 
 Pass `extensions=[ext]` to expose local Python callbacks as agent tools. This calculator runs in your Python process; the agent runs on the selected daemon and runner.

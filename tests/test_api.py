@@ -65,6 +65,320 @@ def test_empty_extension_registration_shape() -> None:
     }
 
 
+def test_remote_profile_manifest_roundtrip_and_snapshot_isolation() -> None:
+    ext = Extension(name="code-search")
+    options: dict[str, Any] = {
+        "provider": "openai",
+        "model": "gpt-5.6-luna",
+        "reasoning_effort": "none",
+        "weak_model": "gpt-5.6-luna",
+        "max_tokens": 4096,
+        "weak_model_max_tokens": 1024,
+        "thinking_budget_tokens": 0,
+        "openai": {
+            "platform": "codex",
+            "api_mode": "responses",
+            "service_tier": "fast",
+        },
+        "hidden": True,
+    }
+    assert ext.register_profile("search", **options) == "search"
+    options["model"] = "changed"
+    options["openai"]["service_tier"] = "scale"
+    anthropic = {"platform": "anthropic"}
+    assert ext.register_profile(
+        "visible",
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        anthropic=anthropic,
+        anthropic_api_access="subscription",
+        hidden=False,
+    ) == "visible"
+    anthropic["platform"] = "copilot"
+    ext.register_profile(
+        "standard",
+        provider="openai",
+        model="gpt-5.6-luna",
+    )
+    params = {"capabilities": {"profiles": {"remote": True}}}
+    manifest = ext.initialize(params)
+    expected = [
+        {
+            "name": "search",
+            "options": {
+                "provider": "openai",
+                "model": "gpt-5.6-luna",
+                "reasoningEffort": "none",
+                "weakModel": "gpt-5.6-luna",
+                "maxTokens": 4096,
+                "weakModelMaxTokens": 1024,
+                "thinkingBudgetTokens": 0,
+                "openai": {
+                    "platform": "codex",
+                    "api_mode": "responses",
+                    "service_tier": "fast",
+                },
+            },
+            "hidden": True,
+        },
+        {
+            "name": "visible",
+            "options": {
+                "provider": "anthropic",
+                "model": "claude-sonnet-4-6",
+                "anthropic": {"platform": "anthropic"},
+                "anthropicAPIAccess": "subscription",
+            },
+            "hidden": False,
+        },
+        {
+            "name": "standard",
+            "options": {
+                "provider": "openai",
+                "model": "gpt-5.6-luna",
+            },
+            "hidden": False,
+        },
+    ]
+    assert json.loads(json.dumps(manifest))["profiles"] == expected
+    assert manifest["name"] == "code-search"
+    manifest["profiles"][0]["options"]["model"] = "mutated"
+    manifest["profiles"][0]["options"]["openai"]["platform"] = "openai"
+    manifest["profiles"][1]["options"]["anthropic"]["platform"] = "copilot"
+    manifest["profiles"][0]["hidden"] = False
+    manifest["profiles"].pop()
+    assert ext.initialize(params)["profiles"] == expected
+
+
+@pytest.mark.parametrize("provider", ["openai", "anthropic"])
+def test_remote_profiles_preserve_arbitrary_provider_dictionaries(provider: str) -> None:
+    ext = Extension()
+    settings: dict[str, Any] = {
+        "platform": "codex" if provider == "openai" else "copilot",
+        "api_mode": "chat_completions",
+        "service_tier": "custom-tier",
+        "base_url": "https://provider.invalid",
+        "api_key": "test-key",
+        "api_key_env_var": "PROVIDER_KEY",
+        "account": "work",
+        "future_setting": {"values": [True, None, 1.5, "value"]},
+    }
+    expected_settings = json.loads(json.dumps(settings))
+    arguments: dict[str, Any] = {
+        "provider": provider,
+        "model": "test-model",
+        provider: settings,
+    }
+    if provider == "anthropic":
+        arguments["anthropicAPIAccess"] = "subscription"
+    assert ext.register_profile("search", **arguments) == "search"
+    settings["future_setting"]["values"].append("mutated-input")
+    params = {"capabilities": {"profiles": {"remote": True}}}
+    manifest = ext.initialize(params)
+    expected = [{
+        "name": "search",
+        "options": {
+            **arguments,
+            provider: expected_settings,
+        },
+        "hidden": False,
+    }]
+    assert json.loads(json.dumps(manifest))["profiles"] == expected
+    manifest["profiles"][0]["options"][provider]["future_setting"]["values"].append("mutated-output")
+    assert ext.initialize(params)["profiles"] == expected
+    arguments[provider] = {}
+    ext.register_profile("empty", **arguments)
+    assert ext.initialize(params)["profiles"][1]["options"][provider] == {}
+
+
+@pytest.mark.parametrize("camel_case", [False, True])
+def test_remote_profiles_accept_subscription_settings_and_top_level_alias(camel_case: bool) -> None:
+    ext = Extension()
+    openai = {
+        "platform": "codex",
+        "api_mode": "responses",
+        "service_tier": "fast",
+    }
+    assert ext.register_profile(
+        "search",
+        provider="openai",
+        model="gpt-5.6-luna",
+        openai=openai,
+    ) == "search"
+    access: dict[str, Any] = {
+        "anthropicAPIAccess" if camel_case else "anthropic_api_access": "subscription",
+    }
+    assert ext.register_profile(
+        "claude",
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        anthropic={"platform": "anthropic"},
+        **access,
+    ) == "claude"
+    profiles = ext.initialize({"capabilities": {"profiles": {"remote": True}}})["profiles"]
+    assert profiles[0]["options"]["openai"] == {
+        "platform": "codex",
+        "api_mode": "responses",
+        "service_tier": "fast",
+    }
+    assert profiles[1]["options"] == {
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-6",
+        "anthropic": {"platform": "anthropic"},
+        "anthropicAPIAccess": "subscription",
+    }
+
+
+@pytest.mark.parametrize("options", [
+    *[{"openai": value} for value in (
+        None, [], "codex", True, 3, {"value": object()}, {1: "non-string-key"},
+    )],
+    *[{"provider": "anthropic", "anthropic": value} for value in (
+        None, [], "anthropic", True, 3, {"value": object()}, {1: "non-string-key"},
+    )],
+    {"anthropic": {}},
+    {"anthropic_api_access": "subscription"},
+    {"provider": "anthropic", "openai": {}},
+    {"provider": "anthropic", "anthropic_api_access": None},
+    {"provider": "anthropic", "anthropicAPIAccess": None},
+    {"provider": "anthropic", "anthropic_api_access": "oauth"},
+    {"provider": "anthropic", "anthropic_account": "work"},
+    {"provider": "anthropic", "anthropicAccount": "work"},
+])
+def test_remote_profiles_reject_invalid_blocks_and_provider_mismatches(
+    options: dict[str, Any],
+) -> None:
+    ext = Extension()
+    arguments: dict[str, Any] = {
+        "provider": "openai",
+        "model": "test-model",
+        **options,
+    }
+    with pytest.raises(ValueError):
+        ext.register_profile("search", **arguments)
+    assert "profiles" not in ext.initialize({})
+
+
+@pytest.mark.parametrize("name", ["", "a/b", "a b", "-search", "_search", ".search",
+                                  "écho", "search\n", "a\x00b", "a" * 129])
+def test_remote_profiles_reject_invalid_names(name: str) -> None:
+    with pytest.raises(ValueError, match="slug"):
+        Extension().register_profile(
+            name,
+            provider="openai",
+            model="gpt-5.6-luna",
+        )
+
+
+@pytest.mark.parametrize("name", ["default", "DEFAULT", "Default"])
+def test_remote_profiles_reject_reserved_names(name: str) -> None:
+    with pytest.raises(ValueError, match="reserved"):
+        Extension().register_profile(
+            name,
+            provider="openai",
+            model="gpt-5.6-luna",
+        )
+
+
+def test_remote_profiles_are_independent_of_extension_metadata() -> None:
+    ext = Extension()
+    profile = ext.register_profile(
+        "search",
+        provider="openai",
+        model="gpt-5.6-luna",
+    )
+    assert profile == "search"
+    params = {"capabilities": {"profiles": {"remote": True}}}
+    manifest = ext.initialize(params)
+    for name in ("code-search", "default", "renamed extension"):
+        ext.set_metadata(
+            name=name,
+            version="2",
+        )
+        updated = ext.initialize(params)
+        assert updated["name"] == name
+        assert updated["version"] == "2"
+        assert updated["profiles"] == manifest["profiles"]
+        assert updated["profiles"][0]["name"] == profile
+    with pytest.raises(ValueError, match="Duplicate"):
+        ext.register_profile(
+            "search",
+            provider="openai",
+            model="different",
+        )
+    assert ext.initialize(params)["profiles"] == manifest["profiles"]
+
+
+@pytest.mark.parametrize("name", ["A", "A" + "a" * 127, "0" + "._-" * 42 + "z"])
+def test_remote_profiles_accept_slug_boundaries_and_camel_case_options(name: str) -> None:
+    ext = Extension()
+    assert ext.register_profile(
+        name,
+        provider="openai",
+        model="gpt-5.6-luna",
+        reasoningEffort="none",
+    ) == name
+    assert ext.initialize({"capabilities": {"profiles": {"remote": True}}})["profiles"] == [
+        {
+            "name": name,
+            "options": {
+                "provider": "openai",
+                "model": "gpt-5.6-luna",
+                "reasoningEffort": "none",
+            },
+            "hidden": False,
+        },
+    ]
+
+
+@pytest.mark.parametrize("options", [
+    {"provider": "unknown"}, {"provider": None}, {"model": ""}, {"model": None},
+    {"weak_model": ""}, {"reasoning_effort": None}, {"reasoning_effort": ""},
+    {"max_tokens": 0}, {"max_tokens": True}, {"weak_model_max_tokens": -1},
+    {"thinking_budget_tokens": -1}, {"max_tokens": "100"}, {"hidden": "false"},
+    {"hidden": 0}, {"hidden": None}, {"max_turns": 0}, {"use_weak_model": False},
+    {"no_tools": False}, {"no_extensions": False}, {"no_skills": False},
+    {"allowed_tools": []}, {"allowed_commands": []}, {"enable_fs_search_tools": False},
+    {"allowedTools": []}, {"useWeakModel": False}, {"maxTurns": 0},
+    {"api_key": "secret"}, {"base_url": "https://example.invalid"},
+    {"allowed_reasoning_efforts": ["none"]},
+])
+def test_remote_profiles_reject_non_model_or_invalid_options(options: dict[str, Any]) -> None:
+    ext = Extension(name="code-search")
+    arguments: dict[str, Any] = {
+        "provider": "openai",
+        "model": "gpt-5.6-luna",
+        **options,
+    }
+    with pytest.raises(ValueError):
+        ext.register_profile("search", **arguments)
+    assert "profiles" not in ext.initialize({})
+
+
+@pytest.mark.parametrize("options", [{}, {"provider": "openai"}, {"model": "gpt-5.6-luna"}])
+def test_remote_profiles_require_provider_and_model(options: dict[str, Any]) -> None:
+    with pytest.raises(TypeError):
+        Extension(name="code-search").register_profile("search", **options)
+
+
+@pytest.mark.parametrize("capabilities", [
+    None, {}, {"profiles": None}, {"profiles": {}}, {"profiles": []},
+    {"profiles": {"remote": False}}, {"profiles": {"remote": "true"}},
+    {"profiles": {"remote": 1}},
+])
+def test_remote_profiles_require_explicit_host_support(capabilities: Any) -> None:
+    params = {} if capabilities is None else {"capabilities": capabilities}
+    ext = Extension(name="code-search")
+    ext.register_profile(
+        "search",
+        provider="openai",
+        model="gpt-5.6-luna",
+    )
+    with pytest.raises(RuntimeError, match="update the Kodelet daemon and runner"):
+        ext.initialize(params)
+    assert "profiles" not in Extension(name="ordinary").initialize(params)
+
+
 def test_reexports_pydantic_and_jinja2() -> None:
     class Model(Pydantic.BaseModel):
         name: str = Pydantic.Field(min_length=1)
@@ -606,6 +920,12 @@ async def test_tool_update_handler_can_replace_accumulated_snapshot() -> None:
         }
     )
     assert result == {"output": {"content": "[redacted]"}}
+
+
+def test_tool_context_runner_identity_comes_from_initialize_metadata() -> None:
+    assert ToolContext(None).runner_id is None
+    context = ToolContext({"extension": {"runnerId": "selected-runner"}})
+    assert context.runner_id == "selected-runner"
 
 
 @pytest.mark.asyncio

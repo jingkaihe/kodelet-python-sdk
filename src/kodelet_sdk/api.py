@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import re
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import (
@@ -36,6 +37,7 @@ from .context import (
     create_shortcut_context,
     create_tool_context,
 )
+from .execution import ExtensionProfileOptions
 from .schemas import SchemaAdapter, SchemaLike, infer_schema_from_callable
 
 _MISSING = object()
@@ -325,6 +327,7 @@ class Extension:
             self._metadata["name"] = name
         if version is not None:
             self._metadata["version"] = version
+        self._profiles: dict[str, dict[str, Any]] = {}
         self._tools: dict[str, ToolRegistration] = {}
         self._commands_by_name: dict[str, CommandRegistration] = {}
         self._command_registrations: list[CommandRegistration] = []
@@ -349,6 +352,49 @@ class Extension:
         for key, value in {**dict(metadata or {}), **kwargs}.items():
             if value is not None:
                 self._metadata[key] = value
+
+    def register_profile(
+        self,
+        name: str,
+        *,
+        provider: Literal["openai", "anthropic"],
+        model: str,
+        hidden: bool = False,
+        **options: Any,
+    ) -> str:
+        """Declare a model profile and return its name unchanged.
+
+        Names are 1–128-character ASCII slugs; default is reserved (case-insensitive).
+        Requires host acceptance before ACP selection.
+        Optional settings: weak_model, max_tokens, weak_model_max_tokens,
+        thinking_budget_tokens, reasoning_effort, openai, anthropic, and
+        anthropic_api_access (camelCase also accepted at the top level).
+        Provider blocks use daemon config keys unchanged; the daemon validates them.
+        """
+        if not isinstance(name, str) or not re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", name,
+        ):
+            raise ValueError(
+                "Extension profile names must be ASCII slugs "
+                "matching [A-Za-z0-9][A-Za-z0-9._-]* (1–128 characters)"
+            )
+        if name.lower() == "default":
+            raise ValueError('Extension profile name "default" is reserved')
+        if name in self._profiles:
+            raise ValueError(f"Duplicate extension profile registration: {name}")
+        if not isinstance(hidden, bool):
+            raise ValueError("Extension profile hidden must be a boolean")
+        validated = ExtensionProfileOptions.model_validate({
+            "provider": provider,
+            "model": model,
+            **options,
+        })
+        self._profiles[name] = {
+            "name": name,
+            "options": validated.to_wire(),
+            "hidden": hidden,
+        }
+        return name
 
     def register_tool(
         self,
@@ -659,6 +705,13 @@ class Extension:
             registrations, shortcut registrations, and event subscriptions.
         """
 
+        capabilities = _mapping_or_empty(params.get("capabilities"))
+        profiles_capability = _mapping_or_empty(capabilities.get("profiles"))
+        if self._profiles and profiles_capability.get("remote") is not True:
+            raise RuntimeError(
+                "Remote extension profiles are not supported by this host; update the Kodelet "
+                "daemon and runner (capabilities.profiles.remote is required)"
+            )
         self._init_params = params
         extension = params.get("extension")
         extension_id = extension.get("id") if isinstance(extension, Mapping) else None
@@ -675,6 +728,8 @@ class Extension:
         }
         if version := self._metadata.get("version"):
             result["version"] = version
+        if self._profiles:
+            result["profiles"] = json_clone(list(self._profiles.values()))
         return result
 
     async def execute_tool(self, params: Mapping[str, Any]) -> dict[str, Any]:
