@@ -27,6 +27,7 @@ from kodelet_sdk import (
     ShortcutContext,
     ShortcutResult,
     ShortcutSubmitResult,
+    ToolAttachment,
     ToolCallEvent,
     ToolContext,
     ToolExecutionResult,
@@ -320,6 +321,25 @@ def test_reexports_pydantic_and_jinja2() -> None:
     assert pydantic is Pydantic
     assert Model(name="kodelet").name == "kodelet"
     assert Jinja2.Template("Hello {{ name }}").render(name="Kodelet") == "Hello Kodelet"
+
+
+async def test_image_attachment_result_passthrough() -> None:
+    attachment: ToolAttachment = {
+        "type": "image",
+        "path": "/runner/generated.png",
+        "filename": "generated.png",
+        "mimeType": "image/png",
+        "alt": "Generated illustration",
+    }
+    ext = Extension()
+
+    @ext.tool("generate_image", description="Generate an image", input_schema={"type": "object"})
+    async def generate_image(_input: Any, _ctx: ToolContext) -> ToolExecutionResult:
+        return {"content": "Generated an illustration", "attachments": [attachment]}
+
+    harness = await create_test_harness(ext)
+    result = await harness.execute_tool({"name": "generate_image", "input": {}})
+    assert result == {"content": "Generated an illustration", "attachments": [attachment]}
 
 
 def test_public_typing_surface() -> None:

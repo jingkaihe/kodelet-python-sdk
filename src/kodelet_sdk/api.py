@@ -80,6 +80,16 @@ class ToolPresentation(TypedDict, total=False):
     format: Literal["text", "markdown"]
 
 
+class ToolAttachment(TypedDict, total=False):
+    """Runner-local image output ingested and persisted by the Kodelet host."""
+
+    type: Required[Literal["image"]]
+    path: Required[str]
+    filename: str
+    mimeType: str
+    alt: str
+
+
 class ToolExecutionResult(TypedDict, total=False):
     """Protocol-shaped result returned by extension tool handlers.
 
@@ -89,6 +99,7 @@ class ToolExecutionResult(TypedDict, total=False):
     content: Required[str]
     data: Mapping[str, Any]
     error: str
+    attachments: list[ToolAttachment]
 
 
 class CommandPassResult(TypedDict):
