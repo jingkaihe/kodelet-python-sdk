@@ -49,6 +49,7 @@ class ACPRPCClient:
         self._close_task: asyncio.Task[None] | None = None
         self._steering_supported = False
         self._extensions_supported = False
+        self._hierarchy_supported = False
         self._extension_relay = (
             SessionExtensionRelay(extensions, self.request, ui) if extensions else None
         )
@@ -84,15 +85,28 @@ class ACPRPCClient:
             and type(extensions.get("version")) is int
             and extensions["version"] == SESSION_EXTENSIONS_VERSION
         )
+        hierarchy = metadata.get("conversationHierarchy") if isinstance(metadata, Mapping) else None
+        self._hierarchy_supported = (
+            isinstance(hierarchy, Mapping)
+            and type(hierarchy.get("version")) is int
+            and hierarchy["version"] == 1
+        )
         if self._extension_relay is not None and not self._extensions_supported:
             raise RuntimeError(
                 "Inline extensions require kodelet acp sessionExtensions version 1 support; "
                 "upgrade the selected daemon/runner and ACP client"
             )
 
-    async def create_session(self, cwd: str) -> str:
+    async def create_session(self, cwd: str, *, parent_conversation_id: str | None = None) -> str:
+        if parent_conversation_id is not None and not self._hierarchy_supported:
+            raise RuntimeError(
+                "Child conversations require kodelet acp conversationHierarchy version 1 support; "
+                "update Kodelet and the daemon"
+            )
         self._session_started = True
-        result = await self.request("session/new", {"cwd": cwd, **self._extension_params()})
+        result = await self.request(
+            "session/new", {"cwd": cwd, **self._session_params(parent_conversation_id)}
+        )
         if not isinstance(result, Mapping) or not isinstance(result.get("sessionId"), str):
             raise RuntimeError("Invalid session/new response from kodelet acp")
         if self._extension_relay is not None:
@@ -104,12 +118,18 @@ class ACPRPCClient:
             self._extension_relay.bind_session(session_id)
         self._session_started = True
         await self.request(
-            "session/load", {"sessionId": session_id, "cwd": cwd, **self._extension_params()}
+            "session/load", {"sessionId": session_id, "cwd": cwd, **self._session_params()}
         )
         return session_id
 
-    def _extension_params(self) -> dict[str, Any]:
-        return {"_meta": self._extension_relay.metadata} if self._extension_relay else {}
+    def _session_params(self, parent_conversation_id: str | None = None) -> dict[str, Any]:
+        metadata = dict(self._extension_relay.metadata) if self._extension_relay else {}
+        if parent_conversation_id is not None:
+            metadata["conversationHierarchy"] = {
+                "version": 1,
+                "parentConversationId": parent_conversation_id,
+            }
+        return {"_meta": metadata} if metadata else {}
 
     async def prompt(self, session_id: str, prompt: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         result = await self.request(

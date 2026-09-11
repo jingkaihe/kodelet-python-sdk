@@ -78,6 +78,16 @@ class Client:
         """
 
         merged_options: dict[str, Any] = {**dict(session_options or {}), **kwargs}
+        parent_conversation_id = merged_options.get("parent_conversation_id")
+        if "parent_conversation_id" in merged_options:
+            if not isinstance(parent_conversation_id, str) or not parent_conversation_id.strip():
+                raise ValueError("parent_conversation_id must be a non-empty conversation ID")
+            if merged_options.get("resume"):
+                raise ValueError(
+                    "parent_conversation_id cannot be combined with resume; "
+                    "existing conversations retain their parent"
+                )
+            parent_conversation_id = parent_conversation_id.strip()
         if merged_options.get("inherit_context") is not None:
             raise ValueError(
                 "inherit_context is unsupported; call ctx.fork_conversation() "
@@ -122,7 +132,7 @@ class Client:
             session_id = (
                 await rpc.load_session(str(resume), cwd)
                 if isinstance(resume, str) and resume
-                else await rpc.create_session(cwd)
+                else await rpc.create_session(cwd, parent_conversation_id=parent_conversation_id)
             )
             session = Session(
                 self,

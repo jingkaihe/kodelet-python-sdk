@@ -1506,6 +1506,7 @@ class ToolContext(SharedContext):
         super().__init__(init, context)
         self._tool_updates_enabled = _tool_updates_supported(init)
         self._conversation_fork_enabled = _conversation_fork_supported(init)
+        self._conversation_hierarchy_enabled = _conversation_hierarchy_supported(init)
 
     async def update(
         self,
@@ -1534,7 +1535,7 @@ class ToolContext(SharedContext):
             payload["data"] = data
         await client.request("kodelet.tool.update", payload)
 
-    async def fork_conversation(self, name: str | None = None) -> str:
+    async def fork_conversation(self, name: str | None = None, *, as_child: bool = False) -> str:
         """Create an isolated persisted fork of the caller's live context.
 
         The host snapshots the active in-memory conversation before the current
@@ -1543,6 +1544,7 @@ class ToolContext(SharedContext):
 
         Args:
             name: Optional explicit user-facing name for the forked conversation.
+            as_child: Explicitly link the fork to its caller as a child.
 
         Raises:
             ConversationForkUnavailableError: If the host or active invocation
@@ -1555,14 +1557,23 @@ class ToolContext(SharedContext):
             raise ConversationForkUnavailableError(
                 "Live conversation forking is not supported by this Kodelet host"
             )
+        if not isinstance(as_child, bool):
+            raise TypeError("as_child must be a boolean")
+        if as_child and not self._conversation_hierarchy_enabled:
+            raise RuntimeError(
+                "Child conversation forks require conversation hierarchy support; "
+                "update Kodelet and the selected runner"
+            )
         client = self._host_rpc_client
         if client is None:
             raise ConversationForkUnavailableError(
                 "Live conversation forking requires an active tool request"
             )
         try:
-            params = {"name": name} if name is not None and name.strip() else None
-            response = await client.request("kodelet.conversation.fork", params)
+            params: dict[str, Any] = {"name": name} if name is not None and name.strip() else {}
+            if as_child:
+                params["asChild"] = True
+            response = await client.request("kodelet.conversation.fork", params or None)
         except HostRPCError as exc:
             if exc.code == _CONVERSATION_FORK_UNAVAILABLE_CODE:
                 raise ConversationForkUnavailableError(str(exc)) from exc
@@ -1661,6 +1672,16 @@ def _conversation_fork_supported(init: Mapping[str, Any] | None) -> bool:
         return False
     conversations = capabilities.get("conversations")
     return isinstance(conversations, Mapping) and conversations.get("fork") is True
+
+
+def _conversation_hierarchy_supported(init: Mapping[str, Any] | None) -> bool:
+    if not init:
+        return False
+    capabilities = init.get("capabilities")
+    if not isinstance(capabilities, Mapping):
+        return False
+    conversations = capabilities.get("conversations")
+    return isinstance(conversations, Mapping) and conversations.get("hierarchy") is True
 
 
 def _default_data_dir(extension_id: str) -> str:

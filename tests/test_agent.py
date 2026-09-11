@@ -39,6 +39,7 @@ class FakeACPProcess(SpawnedProcess):
         steer_result: Any = _DEFAULT_RESPONSE,
         steering_supported: bool = True,
         extension_version: Any = None,
+        hierarchy_version: Any = None,
     ) -> None:
         self.stdout = _QueueLineReader()
         self.stderr = _QueueLineReader()
@@ -53,6 +54,7 @@ class FakeACPProcess(SpawnedProcess):
         )
         self._steering_supported = steering_supported
         self._extension_version = extension_version
+        self._hierarchy_version = hierarchy_version
         self._server_id = 0
         self._server_pending: dict[int, asyncio.Future[dict[str, Any]]] = {}
         self.server_responses: list[dict[str, Any]] = []
@@ -188,6 +190,8 @@ class FakeACPProcess(SpawnedProcess):
                         **({"steering": {"supported": True}} if self._steering_supported else {}),
                         **({"sessionExtensions": {"version": self._extension_version}}
                            if self._extension_version is not None else {}),
+                        **({"conversationHierarchy": {"version": self._hierarchy_version}}
+                           if self._hierarchy_version is not None else {}),
                     },
                 },
             )
@@ -603,6 +607,78 @@ async def test_inline_extensions_require_negotiated_version_before_new_or_load(
         assert process._closed.is_set()
         assert not client._sessions
         assert not client._rpcs
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("inline", [False, True])
+@pytest.mark.parametrize("as_mapping", [False, True])
+async def test_fresh_child_metadata_preserves_inline_extensions(
+    inline: bool, as_mapping: bool
+) -> None:
+    process = FakeACPProcess(extension_version=1, hierarchy_version=1)
+    client = Client(spawn=lambda _command, _args, _options: process)
+    options: CreateSessionOptions = {
+        "cwd": "/runner/workspace",
+        "parent_conversation_id": " parent-conversation ",
+    }
+    if inline:
+        options["extensions"] = [Extension()]
+    try:
+        session = (
+            await client.create_session(options)
+            if as_mapping else await client.create_session(**options)
+        )
+        assert session.id == "conv-1"
+        assert process.requests[1]["params"] == {
+            "cwd": "/runner/workspace",
+            "_meta": {
+                "conversationHierarchy": {
+                    "version": 1,
+                    "parentConversationId": "parent-conversation",
+                },
+                **({"sessionExtensions": {"version": 1, "extensionIds": ["inline-1"]}}
+                   if inline else {}),
+            },
+        }
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("version", [None, 0, 2, "1", True])
+async def test_child_requires_hierarchy_before_sending_new_session(version: Any) -> None:
+    process = FakeACPProcess(hierarchy_version=version)
+    client = Client(spawn=lambda _command, _args, _options: process)
+    try:
+        with pytest.raises(RuntimeError, match=r"conversationHierarchy version 1.*update Kodelet"):
+            await client.create_session(parent_conversation_id="parent")
+        assert [request["method"] for request in process.requests] == ["initialize"]
+        assert process._closed.is_set()
+        assert not client._sessions
+        assert not client._rpcs
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("options", [
+    {"parent_conversation_id": None},
+    {"parent_conversation_id": ""},
+    {"parent_conversation_id": " "},
+    {"parent_conversation_id": 123},
+    {"parent_conversation_id": True},
+    {"parent_conversation_id": "parent", "resume": "child"},
+])
+async def test_invalid_parent_options_fail_before_spawning(options: Any) -> None:
+    def spawn(_command: str, _args: Sequence[str], _options: SpawnOptions) -> SpawnedProcess:
+        pytest.fail("invalid parent options must not start ACP")
+
+    client = Client(spawn=spawn)
+    try:
+        with pytest.raises(ValueError, match="parent_conversation_id"):
+            await client.create_session(options)
     finally:
         await client.close()
 

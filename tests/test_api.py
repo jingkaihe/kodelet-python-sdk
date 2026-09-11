@@ -1126,6 +1126,62 @@ async def test_tool_context_requests_named_live_conversation_fork() -> None:
 
 
 @pytest.mark.asyncio
+async def test_child_forks_are_explicit_and_ordinary_forks_unchanged() -> None:
+    requests: list[tuple[str, Any | None]] = []
+
+    class FakeRPC:
+        async def request(self, method: str, params: Any | None = None) -> Any:
+            requests.append((method, params))
+            return {"conversationId": "child"}
+
+    ext = Extension()
+
+    @ext.tool("fork", description="Fork child", input_schema={})
+    async def fork(_input: Any, ctx: ToolContext) -> str:
+        await ctx.fork_conversation(name="reviewer", as_child=True)
+        await ctx.fork_conversation(as_child=True)
+        await ctx.fork_conversation(as_child=False)
+        return "done"
+
+    harness = await create_test_harness(ext, FakeRPC())
+    harness.initialize({"capabilities": {"conversations": {"fork": True, "hierarchy": True}}})
+    assert await harness.execute_tool({"name": "fork", "input": {}}) == {"content": "done"}
+    assert requests == [
+        ("kodelet.conversation.fork", {"name": "reviewer", "asChild": True}),
+        ("kodelet.conversation.fork", {"asChild": True}),
+        ("kodelet.conversation.fork", None),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("capability", [None, False, 1, "true"])
+async def test_child_forks_require_explicit_hierarchy_capability(capability: Any) -> None:
+    ext = Extension()
+
+    class FakeRPC:
+        async def request(self, method: str, params: Any | None = None) -> Any:
+            pytest.fail("unsupported child fork must not be sent")
+
+    @ext.tool("fork", description="Fork child", input_schema={})
+    async def fork(_input: Any, ctx: ToolContext) -> str:
+        with pytest.raises(RuntimeError, match=r"hierarchy support.*update Kodelet"):
+            await ctx.fork_conversation(as_child=True)
+        return "unsupported"
+
+    harness = await create_test_harness(ext, FakeRPC())
+    harness.initialize({"capabilities": {"conversations": {"fork": True, "hierarchy": capability}}})
+    assert await harness.execute_tool({"name": "fork", "input": {}}) == {"content": "unsupported"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("as_child", [None, "true", 1])
+async def test_child_flag_must_be_boolean(as_child: Any) -> None:
+    ctx = ToolContext({"capabilities": {"conversations": {"fork": True, "hierarchy": True}}})
+    with pytest.raises(TypeError, match="as_child must be a boolean"):
+        await ctx.fork_conversation(as_child=as_child)
+
+
+@pytest.mark.asyncio
 async def test_tool_context_rejects_conversation_fork_without_host_capability() -> None:
     ext = Extension()
 

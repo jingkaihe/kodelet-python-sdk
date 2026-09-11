@@ -80,6 +80,8 @@ class CreateSessionOptions(TypedDict, total=False):
     ``extension_transport`` accepts legacy unix/tcp values but is now a no-op.
     ``inherit_context`` remains unsupported; call ``ctx.fork_conversation()``
     explicitly and pass its returned conversation ID as ``resume`` instead.
+    ``parent_conversation_id`` links a fresh child without inheriting context;
+    it cannot be combined with ``resume``.
     """
 
     profile: str | Profile | ProfileInput
@@ -89,6 +91,7 @@ class CreateSessionOptions(TypedDict, total=False):
     streaming: bool
     cwd: str
     resume: str
+    parent_conversation_id: str
     inherit_context: ToolContext
     max_turns: int
     extension_transport: BridgeTransport

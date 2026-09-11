@@ -314,6 +314,8 @@ Use `Client.create_session(options=ExecutionOptions(...))` with normal client cr
 
 Sessions start fresh. For inherited context, call `ctx.fork_conversation(name="worker-name")` inside the active tool, then pass the returned ID as `resume`. `inherit_context` remains unsupported. Reuse or resume the session for follow-ups; steering only affects a running turn.
 
+For hierarchy, use `client.create_session(parent_conversation_id=ctx.conversation_id)` for a fresh child, or `ctx.fork_conversation(name="worker", as_child=True)` for a child fork. Core stores `metadata.parent_conversation_id`, independently of fork history. Parent options cannot accompany `resume`; ordinary forks remain unrelated. Fresh children require ACP `conversationHierarchy` version 1, and child forks require `capabilities.conversations.hierarchy: true`; older hosts receive an upgrade error.
+
 ### Background work
 
 To let extension work outlive its handler, acquire a lease with `await ctx.acquire_background_task(...)` while the handler is active. Retain and manage the background task yourself, close any ACP client it owns, and release the lease after the work and final UI updates finish. A lease keeps extension resources alive; it does not authorize ACP sessions or keep a completed tool's `ctx.update()` channel open.
