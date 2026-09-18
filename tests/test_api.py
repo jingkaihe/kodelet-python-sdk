@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, assert_type
 import pytest
 
 from kodelet_sdk import (
+    AgentInitEvent,
     BackgroundTaskLease,
     BaseModel,
     CommandContext,
@@ -883,12 +884,24 @@ def test_tool_context_runner_identity_comes_from_initialize_metadata() -> None:
 
 
 @pytest.mark.asyncio
-async def test_agent_init_can_disable_tools_using_invoked_by_context() -> None:
+@pytest.mark.parametrize(
+    "tool_payload",
+    [{"allowedTools": ["bash", "subagent"]}, {"allowedTools": []}, {"allowedTools": None}, {}],
+)
+async def test_agent_init_can_disable_tools_using_invoked_by_context(
+    tool_payload: dict[str, list[str] | None],
+) -> None:
     ext = Extension()
 
     @ext.on("agent.init")
-    async def disable_recursive_tool(_event: Any, ctx: EventContext) -> EventResult:
+    async def disable_recursive_tool(event: AgentInitEvent, ctx: EventContext) -> EventResult:
         assert ctx.invoked_by == "subagent"
+        assert event.get("allowedTools") == tool_payload.get("allowedTools")
+        if tool_payload.get("allowedTools") is not None:
+            assert_type(event.allowedTools, list[str] | None)
+            assert event.allowedTools == tool_payload["allowedTools"]
+        else:
+            assert "allowedTools" not in event
         return {"tools": {"disable": ["subagent"]}}
 
     harness = await create_test_harness(ext)
@@ -896,7 +909,7 @@ async def test_agent_init_can_disable_tools_using_invoked_by_context() -> None:
         {
             "id": "evt-agent-init",
             "event": "agent.init",
-            "payload": {"systemPrompt": "base"},
+            "payload": {"systemPrompt": "base", **tool_payload},
             "context": {"invokedBy": "subagent"},
         }
     )

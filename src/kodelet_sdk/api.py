@@ -254,10 +254,16 @@ class UserMessageEvent(ExtensionEvent):
 
 
 class AgentInitEvent(ExtensionEvent):
-    """Event payload passed to ``agent.init`` handlers."""
+    """Event payload passed to ``agent.init`` handlers.
+
+    ``allowedTools`` contains the current tool allowlist, including patches from
+    earlier host-dispatched init handlers. An empty list means no tools are allowed.
+    Older hosts may omit it; use ``event.get("allowedTools")`` for compatibility.
+    """
 
     event: Literal["agent.init"]
     systemPrompt: str | None
+    allowedTools: list[str] | None
 
 
 class TurnStartEvent(ExtensionEvent):
