@@ -4,11 +4,18 @@ import asyncio
 import inspect
 import json
 from collections.abc import Callable, Coroutine, Mapping, Sequence
-from typing import TYPE_CHECKING, Any, TypeAlias, Unpack, cast
+from typing import TYPE_CHECKING, Any, Literal, TypeAlias, Unpack, cast
 
 from .._utils import AttrDict
 from .rpc import ACPRPCClient
-from .types import AgentResponse, AgentStreamEvent, RunOptions, SessionSteerResult
+from .types import (
+    AgentResponse,
+    AgentStreamEvent,
+    CompactionMarker,
+    ContextCompactedData,
+    RunOptions,
+    SessionSteerResult,
+)
 
 if TYPE_CHECKING:
     from .client import Client
@@ -38,6 +45,7 @@ class Session:
         self._running = False
         self._listeners: dict[str, list[EventListener]] = {}
         self._listener_tasks: set[asyncio.Task[Any]] = set()
+        self._seen_compactions: set[str] = set()
 
     @property
     def id(self) -> str:
@@ -186,6 +194,13 @@ class Session:
 
         session_update = update.get("sessionUpdate")
         if session_update == "agent_message_chunk":
+            compaction = _compaction_from_acp_update(update)
+            if compaction is not None:
+                marker_id = compaction["compaction"]["id"]
+                if marker_id not in self._seen_compactions:
+                    self._seen_compactions.add(marker_id)
+                    self._emit_sdk_event("context.compacted", compaction, events, update)
+                return
             content = _text_from_acp_content(update.get("content"))
             if content:
                 assistant_chunks.append(content)
@@ -300,6 +315,32 @@ class Session:
                 task = asyncio.create_task(cast(Coroutine[Any, Any, Any], result))
                 self._listener_tasks.add(task)
                 task.add_done_callback(self._listener_tasks.discard)
+
+
+def _compaction_from_acp_update(update: Mapping[str, Any]) -> ContextCompactedData | None:
+    meta = update.get("_meta")
+    if not isinstance(meta, Mapping):
+        return None
+    data = meta.get("kodelet/contextCompacted")
+    if not isinstance(data, Mapping):
+        return None
+    marker = data.get("compaction")
+    if not isinstance(marker, Mapping):
+        return None
+    marker_id = _string_field(marker, "id")
+    method = _string_field(marker, "method")
+    created_at = _string_field(marker, "createdAt")
+    if not marker_id or (method != "api" and method != "summary") or created_at is None:
+        return None
+    compaction: CompactionMarker = {
+        "id": marker_id,
+        "method": cast(Literal["api", "summary"], method),
+        "createdAt": created_at,
+    }
+    summary = _string_field(marker, "summary")
+    if summary is not None:
+        compaction["summary"] = summary
+    return {"compaction": compaction, "beforeCurrentUser": data.get("beforeCurrentUser") is True}
 
 
 def _normalize_run_options(

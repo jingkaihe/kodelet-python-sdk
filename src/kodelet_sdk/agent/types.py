@@ -150,6 +150,29 @@ class ToolResultData(TypedDict, total=False):
 ToolUpdateData: TypeAlias = ToolResultData
 
 
+class CompactionMarker(TypedDict):
+    """Context compaction marker with a nonempty ID, method, and creation timestamp.
+
+    ``summary`` is included only when the ACP metadata supplies a string.
+    """
+
+    id: str
+    method: Literal["api", "summary"]
+    summary: NotRequired[str]
+    createdAt: str
+
+
+class ContextCompactedData(TypedDict):
+    """Payload of a ``context.compacted`` session event.
+
+    ``beforeCurrentUser`` places the marker before the current submitted user
+    message during pre-turn compaction; it defaults to false unless literally true.
+    """
+
+    compaction: CompactionMarker
+    beforeCurrentUser: bool
+
+
 class SpawnOptions(TypedDict, total=False):
     cwd: str
     env: Mapping[str, str]
@@ -258,6 +281,8 @@ __all__ = [
     "BinaryWriter",
     "BridgeTransport",
     "ClientOptions",
+    "CompactionMarker",
+    "ContextCompactedData",
     "CreateSessionOptions",
     "DrainableBinaryWriter",
     "Profile",

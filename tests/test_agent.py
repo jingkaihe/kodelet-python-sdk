@@ -10,10 +10,13 @@ import pytest
 
 import kodelet_sdk
 from kodelet_sdk import (
+    AgentStreamEvent,
     AgentUIHandlers,
     BaseModel,
     BridgeTransport,
     Client,
+    CompactionMarker,
+    ContextCompactedData,
     CreateSessionOptions,
     ExecutionOptions,
     Extension,
@@ -295,8 +298,12 @@ def test_agent_package_preserves_public_reexports() -> None:
     assert agent.CreateSessionOptions is CreateSessionOptions
     assert agent.AgentUIHandlers is AgentUIHandlers
     assert agent.BridgeTransport is BridgeTransport
+    assert agent.CompactionMarker is CompactionMarker
+    assert agent.ContextCompactedData is ContextCompactedData
     assert kodelet_sdk.Client is Client
     assert kodelet_sdk.SessionSteerResult is SessionSteerResult
+    assert kodelet_sdk.CompactionMarker is CompactionMarker
+    assert kodelet_sdk.ContextCompactedData is ContextCompactedData
     assert client_module.Client is Client
 
 
@@ -554,6 +561,225 @@ async def test_acp_close_reports_incomplete_cleanup_and_allows_session_retry() -
     assert session not in client._sessions
     assert not client._rpcs
     await client.close()
+
+
+@pytest.mark.asyncio
+async def test_session_emits_compaction_events_without_adding_notices_to_output() -> None:
+    markers: list[ContextCompactedData] = [
+        {
+            "compaction": {
+                "id": "compact-1", "method": "api", "createdAt": "2026-09-20T14:00:00Z",
+            },
+            "beforeCurrentUser": True,
+        },
+        {
+            "compaction": {
+                "id": "compact-2", "method": "summary", "summary": "Earlier decisions",
+                "createdAt": "2026-09-20T15:00:00Z",
+            },
+            "beforeCurrentUser": False,
+        },
+    ]
+    updates = [
+        {
+            "sessionUpdate": "agent_message_chunk",
+            "content": {
+                "type": "text",
+                "text": f"\n\nContext compacted\n\n{data['compaction'].get('summary', '')}",
+            },
+            "_meta": {"kodelet/contextCompacted": data},
+        }
+        for data in markers
+    ]
+
+    def on_prompt(_request: Mapping[str, Any], child: FakeACPProcess) -> None:
+        for update in [*updates, *updates]:
+            child.notify("session/update", {"sessionId": "conv-1", "update": update})
+        child.notify("session/update", {
+            "sessionId": "conv-1",
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "The answer"},
+            },
+        })
+
+    client = Client(spawn=lambda *_: FakeACPProcess(on_prompt=on_prompt))
+    try:
+        session = await client.create_session()
+        received: list[ContextCompactedData] = []
+        deltas: list[str] = []
+        messages: list[str] = []
+        all_events: list[AgentStreamEvent] = []
+        session.on("context.compacted", lambda event: received.append(event.data))
+        session.on("assistant.message_delta", lambda event: deltas.append(event.data.deltaContent))
+        session.on("assistant.message", lambda event: messages.append(event.data.content))
+        session.on("event", all_events.append)
+
+        for run in range(2):
+            response = await session.run_and_wait(message="continue")
+            assert response.content == "The answer"
+            assert received == markers
+            assert deltas == ["The answer"] * (run + 1)
+            assert messages == ["The answer"] * (run + 1)
+            compactions = [event for event in response.events if event.type == "context.compacted"]
+            assert [event.data for event in compactions] == (markers if run == 0 else [])
+            assert [event.raw for event in compactions] == (updates if run == 0 else [])
+            assert all(event.conversationId == session.id for event in compactions)
+            assert all_events == response.events
+            all_events.clear()
+
+        # Marker IDs belong to a Session, not the client or process-global state.
+        other_session = await client.create_session()
+        other_response = await other_session.run_and_wait(message="continue")
+        assert [
+            event.data for event in other_response.events if event.type == "context.compacted"
+        ] == markers
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_compaction_only_output_is_empty_but_ordinary_notice_text_is_preserved() -> None:
+    prompt_count = 0
+
+    def on_prompt(_request: Mapping[str, Any], child: FakeACPProcess) -> None:
+        nonlocal prompt_count
+        prompt_count += 1
+        update: dict[str, Any] = {
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": "Context compacted"},
+        }
+        if prompt_count <= 2:
+            update["_meta"] = {
+                "kodelet/contextCompacted": {
+                    "compaction": {
+                        "id": "compact-1", "method": "api", "createdAt": "2026-09-20T14:00:00Z",
+                    },
+                },
+            }
+        child.notify("session/update", {"sessionId": "conv-1", "update": update})
+
+    process = FakeACPProcess(on_prompt=on_prompt)
+    client = Client(spawn=lambda *_: process)
+    try:
+        session = await client.create_session()
+        deltas: list[str] = []
+        messages: list[str] = []
+        session.on("assistant.message_delta", lambda event: deltas.append(event.data.deltaContent))
+        session.on("assistant.message", lambda event: messages.append(event.data.content))
+        for run in range(2):
+            response = await session.run_and_wait(message="compact")
+            assert response.content == ""
+            assert deltas == messages == []
+            assert not any(
+                event.type in {"assistant.message_delta", "assistant.message"}
+                for event in response.events
+            )
+            assert [
+                event.data.beforeCurrentUser
+                for event in response.events if event.type == "context.compacted"
+            ] == ([False] if run == 0 else [])
+
+        response = await session.run_and_wait(message="say Context compacted")
+        assert response.content == "Context compacted"
+        assert deltas == messages == ["Context compacted"]
+        assert not any(event.type == "context.compacted" for event in response.events)
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("before_current_user", "summary"), [
+    (True, ""), (False, "Earlier decisions"), (1, None), ("true", 123), (None, []), (0, {}),
+])
+async def test_session_normalizes_optional_compaction_metadata(
+    before_current_user: Any, summary: Any,
+) -> None:
+    # TS accepts any nonempty ID and string timestamp without trimming or parsing.
+    marker: CompactionMarker = {"id": " ", "method": "summary", "createdAt": ""}
+    update = {
+        "sessionUpdate": "agent_message_chunk",
+        "content": {"type": "text", "text": "Context compacted"},
+        "_meta": {
+            "kodelet/contextCompacted": {
+                "compaction": {**marker, "summary": summary, "extra": "ignored"},
+                "beforeCurrentUser": before_current_user,
+                "extra": "ignored",
+            },
+        },
+    }
+
+    def on_prompt(_request: Mapping[str, Any], child: FakeACPProcess) -> None:
+        child.notify("session/update", {"sessionId": "conv-1", "update": update})
+
+    client = Client(spawn=lambda *_: FakeACPProcess(on_prompt=on_prompt))
+    try:
+        session = await client.create_session()
+        response = await session.run_and_wait(message="compact")
+        if isinstance(summary, str):
+            marker["summary"] = summary
+        assert response.content == ""
+        assert [
+            event.data for event in response.events if event.type == "context.compacted"
+        ] == [{"compaction": marker, "beforeCurrentUser": before_current_user is True}]
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("meta", [
+    None,
+    "invalid",
+    [],
+    {},
+    {"kodelet/contextCompacted": None},
+    {"kodelet/contextCompacted": []},
+    {"kodelet/contextCompacted": {}},
+    *[
+        {"kodelet/contextCompacted": {"compaction": marker}}
+        for marker in (
+            None, [], {},
+            {"method": "api", "createdAt": "2026-09-20T14:00:00Z"},
+            {"id": "compact-1", "createdAt": "2026-09-20T14:00:00Z"},
+            {"id": "compact-1", "method": "api"},
+        )
+    ],
+    *[
+        {"kodelet/contextCompacted": {"compaction": {
+            "id": "compact-1", "method": "api", "createdAt": "2026-09-20T14:00:00Z",
+            key: value,
+        }}}
+        for key, value in (
+            ("id", ""), ("id", 1), ("id", None), ("method", "unknown"),
+            ("method", []), ("createdAt", None), ("createdAt", 1),
+        )
+    ],
+])
+async def test_session_keeps_malformed_compaction_metadata_as_answer_text(meta: Any) -> None:
+    update = {
+        "sessionUpdate": "agent_message_chunk",
+        "content": {"type": "text", "text": "Context compacted"},
+        "_meta": meta,
+    }
+
+    def on_prompt(_request: Mapping[str, Any], child: FakeACPProcess) -> None:
+        child.notify("session/update", {"sessionId": "conv-1", "update": update})
+
+    client = Client(spawn=lambda *_: FakeACPProcess(on_prompt=on_prompt))
+    try:
+        session = await client.create_session()
+        deltas: list[str] = []
+        messages: list[str] = []
+        session.on("assistant.message_delta", lambda event: deltas.append(event.data.deltaContent))
+        session.on("assistant.message", lambda event: messages.append(event.data.content))
+        response = await session.run_and_wait(message="continue")
+        assert response.content == "Context compacted"
+        assert deltas == messages == ["Context compacted"]
+        assert not any(event.type == "context.compacted" for event in response.events)
+        delta = next(event for event in response.events if event.type == "assistant.message_delta")
+        assert delta.raw == update
+    finally:
+        await client.close()
 
 
 @pytest.mark.asyncio
