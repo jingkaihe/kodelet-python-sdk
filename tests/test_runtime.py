@@ -13,6 +13,7 @@ import pytest
 from kodelet_sdk import (
     BackgroundTaskLease,
     BaseModel,
+    BrowserConnection,
     CommandContext,
     CommandResult,
     Extension,
@@ -26,6 +27,7 @@ from kodelet_sdk import (
     UIContext,
     UISurfaceInputEvent,
     UISurfaceResizeEvent,
+    run_with_host_rpc_client,
 )
 from kodelet_sdk.runtime import (
     ExtensionMessageDispatcher,
@@ -34,6 +36,13 @@ from kodelet_sdk.runtime import (
     _StdioRequestState,
     run_stdio_server,
 )
+
+BROWSER_CONNECTION_INFO = {
+    "leaseId": "browser-lease-1",
+    "sessionId": "browser-session-1",
+    "cdpUrl": "ws://127.0.0.1:9222/devtools/browser/test",
+    "pageTargetId": "page-1",
+}
 
 
 @pytest.mark.asyncio
@@ -119,8 +128,11 @@ async def test_runtime_serves_json_rpc_and_reverse_host_rpc() -> None:
         text: str = Field(min_length=1)
 
     @ext.tool("echo", description="Echo text", input_schema=EchoInput)
-    async def echo(input: EchoInput, ctx: Any) -> ToolExecutionResult:
+    async def echo(input: EchoInput, ctx: ToolContext) -> ToolExecutionResult:
         await ctx.update("Working", {"step": 1})
+        browser = await ctx.browser.acquire()
+        assert isinstance(browser, BrowserConnection)
+        await browser.release()
         answer = await ctx.ui.input({"title": "Choose"})
         presentation: ToolPresentation = {
             "summary": "Echo complete",
@@ -150,6 +162,7 @@ async def test_runtime_serves_json_rpc_and_reverse_host_rpc() -> None:
             "kodelet": {"version": "test"},
             "extension": {"id": "rpc", "cwd": os.getcwd(), "dataDir": ""},
             "capabilities": {
+                "browser": {"version": 1},
                 "toolUpdates": True,
                 "shortcuts": {"submit": True},
                 "ui": {"input": True},
@@ -185,6 +198,8 @@ async def test_runtime_serves_json_rpc_and_reverse_host_rpc() -> None:
     assert shortcut_contexts == [("conv-shortcut", "review")]
     assert [request["method"] for request in client.host_requests] == [
         "kodelet.tool.update",
+        "kodelet.browser.acquire",
+        "kodelet.browser.release",
         "kodelet.ui.input",
         "kodelet.ui.notify",
     ]
@@ -192,7 +207,9 @@ async def test_runtime_serves_json_rpc_and_reverse_host_rpc() -> None:
         "content": "Working",
         "data": {"step": 1},
     }
-    assert [request["parentId"] for request in client.host_requests] == [2, 2, 3]
+    assert client.host_requests[1]["params"] == {}
+    assert client.host_requests[2]["params"] == {"leaseId": BROWSER_CONNECTION_INFO["leaseId"]}
+    assert [request["parentId"] for request in client.host_requests] == [2, 2, 2, 2, 3]
 
     server_reader.close()
     await asyncio.wait_for(task, timeout=1)
@@ -552,6 +569,74 @@ async def test_stdio_persistent_request_is_not_replayed_after_request_ends(
             await client.request_persistent("kodelet.ui.transcript.append", {"message": "one"})
 
     assert calls == ["parented"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_state", ["completed", "cancelled"])
+async def test_browser_lease_blocks_rpc_after_originating_request_ends(
+    terminal_state: str,
+) -> None:
+    messages: asyncio.Queue[Mapping[str, Any]] = asyncio.Queue()
+    transport = StdioHostRPCClient(send_message=messages.put)
+    state = _StdioRequestState(7)
+    scoped = _RequestScopedHostRPCClient(transport, state)
+    ctx = await run_with_host_rpc_client(
+        scoped, lambda: ToolContext({"capabilities": {"browser": {"version": 1}}})
+    )
+    pending = asyncio.create_task(ctx.browser.acquire())
+    try:
+        request = await asyncio.wait_for(messages.get(), timeout=1)
+        assert request["method"] == "kodelet.browser.acquire"
+        assert request["parentId"] == 7
+        assert request["params"] == {}
+        assert transport.handle_response(
+            {"jsonrpc": "2.0", "id": request["id"], "result": BROWSER_CONNECTION_INFO}
+        )
+        connection = await asyncio.wait_for(pending, timeout=1)
+        if terminal_state == "cancelled":
+            await state.cancel()
+        await transport.finish_request(state)
+
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(ctx.browser.acquire(), timeout=1)
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(connection.release(), timeout=1)
+
+        assert messages.empty(), "browser leases must not fall back to persistent RPC"
+        assert not transport._pending
+    finally:
+        await transport.close()
+        await asyncio.gather(pending, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_browser_pending_acquisition_is_cancelled_with_originating_request() -> None:
+    messages: asyncio.Queue[Mapping[str, Any]] = asyncio.Queue()
+    transport = StdioHostRPCClient(send_message=messages.put)
+    state = _StdioRequestState(7)
+    scoped = _RequestScopedHostRPCClient(transport, state)
+    ctx = await run_with_host_rpc_client(
+        scoped, lambda: ToolContext({"capabilities": {"browser": {"version": 1}}})
+    )
+    pending = asyncio.create_task(ctx.browser.acquire())
+    try:
+        request = await asyncio.wait_for(messages.get(), timeout=1)
+        assert request["method"] == "kodelet.browser.acquire"
+        assert request["parentId"] == 7
+        assert request["params"] == {}
+
+        await state.cancel()
+        await transport.finish_request(state, asyncio.CancelledError())
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(pending, timeout=1)
+        assert not transport.handle_response(
+            {"jsonrpc": "2.0", "id": request["id"], "result": BROWSER_CONNECTION_INFO}
+        )
+        assert not transport._pending
+        assert messages.empty()
+    finally:
+        await transport.close()
+        await asyncio.gather(pending, return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -1419,6 +1504,10 @@ class RpcTestClient:
             result: Any = {"accepted": True, "latestSequence": sequence}
         elif method == "kodelet.ui.transcript.append":
             result = {"accepted": True}
+        elif method == "kodelet.browser.acquire":
+            result = BROWSER_CONNECTION_INFO
+        elif method == "kodelet.browser.release":
+            result = {"released": True}
         else:
             result = {"status": "submitted", "value": "from-host"}
         self._server_reader.feed(_frame({"jsonrpc": "2.0", "id": message["id"], "result": result}))

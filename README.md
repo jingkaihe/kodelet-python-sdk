@@ -304,6 +304,7 @@ Handlers receive `ctx` with call metadata and these helpers:
 - `ctx.env.get(...)` for environment access.
 - `ctx.log.debug/info/warn/error(...)` for JSON logs to stderr.
 - `await ctx.fork_conversation(name=...)` to snapshot the active tool's conversation for an ACP session.
+- `await ctx.browser.acquire()` for runner-local access to the conversation's shared browser from an installed tool.
 - `await ctx.acquire_background_task(...)` to keep runtime resources alive after a handler returns.
 - `ctx.ui.input/confirm/select/notify(...)` for host UI reverse-RPC calls.
 - `ctx.ui.append_transcript(...)`, `ctx.ui.set_widget(...)`, and `ctx.ui.open_surface(...)` for capability-gated persistent native-TUI content.
@@ -315,6 +316,14 @@ Use `Client.create_session(options=ExecutionOptions(...))` with normal client cr
 Sessions start fresh. For inherited context, call `ctx.fork_conversation(name="worker-name")` inside the active tool, then pass the returned ID as `resume`. `inherit_context` remains unsupported. Reuse or resume the session for follow-ups; steering only affects a running turn.
 
 For hierarchy, use `client.create_session(parent_conversation_id=ctx.conversation_id)` for a fresh child, or `ctx.fork_conversation(name="worker", as_child=True)` for a child fork. Core stores `metadata.parent_conversation_id`, independently of fork history. Parent options cannot accompany `resume`; ordinary forks remain unrelated. Fresh children require ACP `conversationHierarchy` version 1, and child forks require `capabilities.conversations.hierarchy: true`; older hosts receive an upgrade error.
+
+### Runner-local browser connections
+
+Installed extension tools can call `connection = await ctx.browser.acquire()` to obtain a `BrowserConnection` with read-only `lease_id`, `session_id`, `cdp_url`, and `page_target_id` attributes plus `await connection.release()`. This connects to the same Chrome session as the conversation's Web UI. The host must advertise `capabilities.browser: {"version": 1}`, and the daemon must authorize browser access. Inline SDK extensions cannot acquire runner-local endpoints.
+
+Connect an automation client to `connection.cdp_url` and resolve the exact `connection.page_target_id`; do not assume the first context or page is the shared page. The extension owns automation, confirmation policy, and outcome reporting. Honor asyncio cancellation, disconnect the automation client, and call `await connection.release()` in `finally`, leaving Chrome and the shared page open for the human. Concurrent release calls share one request; a failed release can be retried while the tool invocation remains active.
+
+Both acquisition and release are scoped to the originating tool request. Leases end automatically on tool completion, failure, cancellation, or extension disconnect, and cannot be retained with a background-task lease. Release does not close Chrome or revoke raw CDP access. This is broad browser access for trusted installed extensions, not a sandbox or per-action permission boundary; `page_target_id` identifies a page but does not restrict access to it. Do not expose connection details in model-facing results.
 
 ### Background work
 

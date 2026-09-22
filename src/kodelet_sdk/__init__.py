@@ -70,6 +70,8 @@ from .api import (
 )
 from .context import (
     BackgroundTaskLease,
+    BrowserConnection,
+    BrowserContext,
     CommandContext,
     CommandFlagValue,
     CommandInvocation,
@@ -155,6 +157,8 @@ __all__ = [
     "BackgroundTaskLease",
     "BaseModel",
     "BridgeTransport",
+    "BrowserConnection",
+    "BrowserContext",
     "Client",
     "ClientOptions",
     "CommandContext",

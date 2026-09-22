@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import sys
@@ -14,6 +15,8 @@ from kodelet_sdk import (
     AgentInitEvent,
     BackgroundTaskLease,
     BaseModel,
+    BrowserConnection,
+    BrowserContext,
     CommandContext,
     CommandResult,
     ConversationForkUnavailableError,
@@ -49,6 +52,7 @@ from kodelet_sdk import (
     define_extension,
     pydantic,
     render_template,
+    run_with_host_rpc_client,
 )
 
 
@@ -1227,6 +1231,234 @@ async def test_tool_context_translates_fork_unavailable_host_error() -> None:
     harness = await create_test_harness(ext, FakeRPC())
     harness.initialize({"capabilities": {"conversations": {"fork": True}}})
     assert await harness.execute_tool({"name": "fork", "input": {}}) == {"content": "unavailable"}
+
+
+BROWSER_CONNECTION_INFO = {
+    "leaseId": "browser-lease-1",
+    "sessionId": "browser-session-1",
+    "cdpUrl": "ws://127.0.0.1:9222/devtools/browser/test",
+    "pageTargetId": "page-1",
+}
+BROWSER_INIT = {"capabilities": {"browser": {"version": 1}}}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("version", [1, 1.0])
+async def test_browser_acquisition_preserves_details_and_shares_release(
+    version: int | float,
+) -> None:
+    requests: list[tuple[str, Any]] = []
+    # Validate nonblank fields without trimming or otherwise rewriting host values.
+    details = {key: f" {value} " for key, value in BROWSER_CONNECTION_INFO.items()}
+
+    class FakeRPC:
+        async def request(self, method: str, params: Any | None = None) -> Any:
+            requests.append((method, params))
+            await asyncio.sleep(0)
+            if method == "kodelet.browser.acquire":
+                return {**details, "extra": "ignored"}
+            return {"released": True}
+
+        async def request_persistent(self, method: str, params: Any | None = None) -> Any:
+            pytest.fail("browser leases must use the active tool request, not persistent RPC")
+
+    ext = Extension()
+
+    @ext.tool("browse", description="Use the shared browser", input_schema={})
+    async def browse(_input: Any, ctx: ToolContext) -> str:
+        assert_type(ctx.browser, BrowserContext)
+        connection = await ctx.browser.acquire()
+        assert_type(connection, BrowserConnection)
+        assert {
+            "leaseId": connection.lease_id,
+            "sessionId": connection.session_id,
+            "cdpUrl": connection.cdp_url,
+            "pageTargetId": connection.page_target_id,
+        } == details
+        for attribute in ("lease_id", "session_id", "cdp_url", "page_target_id"):
+            with pytest.raises(AttributeError):
+                setattr(connection, attribute, "changed")
+        await asyncio.gather(connection.release(), connection.release())
+        await connection.release()
+        return "detached"
+
+    harness = await create_test_harness(ext, FakeRPC())
+    harness.initialize({"capabilities": {"browser": {"version": version}}})
+    assert await harness.execute_tool({"name": "browse", "input": {}}) == {"content": "detached"}
+    assert requests == [
+        ("kodelet.browser.acquire", {}),
+        ("kodelet.browser.release", {"leaseId": details["leaseId"]}),
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "init",
+    [None, {}, {"capabilities": None}, {"capabilities": []}, {"capabilities": {}}]
+    + [
+        {"capabilities": {"browser": capability}}
+        for capability in (
+            None,
+            False,
+            [],
+            {},
+            {"version": 0},
+            {"version": 2},
+            {"version": "1"},
+            {"version": True},
+        )
+    ],
+)
+async def test_browser_acquisition_requires_capability_version_one(init: Any) -> None:
+    class FakeRPC:
+        async def request(self, method: str, params: Any | None = None) -> Any:
+            pytest.fail("unsupported browser must not send an RPC")
+
+    with pytest.raises(RuntimeError, match="not supported"):
+        await run_with_host_rpc_client(FakeRPC(), lambda: ToolContext(init).browser.acquire())
+
+
+@pytest.mark.asyncio
+async def test_browser_acquisition_requires_active_host_client() -> None:
+    with pytest.raises(RuntimeError, match="active tool request"):
+        await run_with_host_rpc_client(None, lambda: ToolContext(BROWSER_INIT).browser.acquire())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "response",
+    [None, True, 1, "connection", [], {}]
+    + [
+        {key: value for key, value in BROWSER_CONNECTION_INFO.items() if key != missing}
+        for missing in BROWSER_CONNECTION_INFO
+    ]
+    + [
+        {**BROWSER_CONNECTION_INFO, key: value}
+        for key in BROWSER_CONNECTION_INFO
+        for value in (None, 1, False, {}, [], "", " \n ")
+    ],
+)
+async def test_browser_acquisition_rejects_malformed_response(response: Any) -> None:
+    class FakeRPC:
+        async def request(self, method: str, params: Any | None = None) -> Any:
+            return response
+
+    with pytest.raises(RuntimeError, match="Invalid browser acquisition response"):
+        await run_with_host_rpc_client(
+            FakeRPC(), lambda: ToolContext(BROWSER_INIT).browser.acquire(),
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_before_request", [True, False])
+async def test_browser_acquisition_checks_cancellation_before_and_after_rpc(
+    cancel_before_request: bool,
+) -> None:
+    requests = 0
+    connections: list[BrowserConnection] = []
+
+    class FakeRPC:
+        async def request(self, method: str, params: Any | None = None) -> Any:
+            nonlocal requests
+            requests += 1
+            task = asyncio.current_task()
+            assert task is not None
+            task.cancel()
+            return BROWSER_CONNECTION_INFO
+
+    async def acquire() -> None:
+        if cancel_before_request:
+            task = asyncio.current_task()
+            assert task is not None
+            task.cancel()
+        connections.append(await ToolContext(BROWSER_INIT).browser.acquire())
+
+    task = asyncio.create_task(run_with_host_rpc_client(FakeRPC(), acquire))
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert requests == (0 if cancel_before_request else 1)
+    assert connections == []
+
+
+@pytest.mark.asyncio
+async def test_browser_acquisition_preserves_host_authorization_errors() -> None:
+    denied = HostRPCError({"code": -32004, "message": "browser access denied"})
+
+    class FakeRPC:
+        async def request(self, method: str, params: Any | None = None) -> Any:
+            raise denied
+
+    with pytest.raises(HostRPCError) as exc:
+        await run_with_host_rpc_client(
+            FakeRPC(), lambda: ToolContext(BROWSER_INIT).browser.acquire(),
+        )
+    assert exc.value is denied
+
+
+@pytest.mark.asyncio
+async def test_browser_release_retries_failures_without_duplicating_concurrent_attempts() -> None:
+    failure = RuntimeError("temporary release failure")
+    releases = 0
+
+    class FakeRPC:
+        async def request(self, method: str, params: Any | None = None) -> Any:
+            nonlocal releases
+            if method == "kodelet.browser.acquire":
+                return BROWSER_CONNECTION_INFO
+            assert method == "kodelet.browser.release"
+            assert params == {"leaseId": BROWSER_CONNECTION_INFO["leaseId"]}
+            releases += 1
+            await asyncio.sleep(0)
+            if releases == 1:
+                raise failure
+            return {"released": True}
+
+    async def browse() -> None:
+        connection = await ToolContext(BROWSER_INIT).browser.acquire()
+        results = await asyncio.gather(
+            connection.release(),
+            connection.release(),
+            return_exceptions=True,
+        )
+        assert results == [failure, failure]
+        await asyncio.gather(connection.release(), connection.release())
+        await connection.release()
+
+    await run_with_host_rpc_client(FakeRPC(), browse)
+    assert releases == 2
+
+
+@pytest.mark.asyncio
+async def test_browser_release_survives_waiter_cancellation() -> None:
+    started = asyncio.Event()
+    finish = asyncio.Event()
+    releases = 0
+
+    class FakeRPC:
+        async def request(self, method: str, params: Any | None = None) -> Any:
+            nonlocal releases
+            if method == "kodelet.browser.acquire":
+                return BROWSER_CONNECTION_INFO
+            releases += 1
+            started.set()
+            await finish.wait()
+            return {"released": True}
+
+    async def browse() -> None:
+        connection = await ToolContext(BROWSER_INIT).browser.acquire()
+        first = asyncio.create_task(connection.release())
+        await asyncio.wait_for(started.wait(), timeout=1)
+        second = asyncio.create_task(connection.release())
+        await asyncio.sleep(0)
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        finish.set()
+        await asyncio.wait_for(second, timeout=1)
+        await connection.release()
+
+    await run_with_host_rpc_client(FakeRPC(), browse)
+    assert releases == 1
 
 
 @pytest.mark.asyncio

@@ -249,6 +249,132 @@ class ConversationForkUnavailableError(RuntimeError):
     """The active tool invocation cannot provide a live conversation fork."""
 
 
+class BrowserConnection:
+    """Raw CDP access for a trusted runner-local extension tool invocation.
+
+    Obtain connections through ``await ctx.browser.acquire()``. The endpoint
+    grants browser-wide access; ``page_target_id`` identifies the human's shared
+    page but does not restrict access to it.
+    """
+
+    def __init__(
+        self,
+        client: HostRPCClient,
+        lease_id: str,
+        session_id: str,
+        cdp_url: str,
+        page_target_id: str,
+    ) -> None:
+        self._client = client
+        self._lease_id = lease_id
+        self._session_id = session_id
+        self._cdp_url = cdp_url
+        self._page_target_id = page_target_id
+        self._release_task: asyncio.Task[None] | None = None
+
+    @property
+    def lease_id(self) -> str:
+        """Return the host lifetime lease ID for this connection."""
+
+        return self._lease_id
+
+    @property
+    def session_id(self) -> str:
+        """Return the shared browser session ID."""
+
+        return self._session_id
+
+    @property
+    def cdp_url(self) -> str:
+        """Return the runner-local browser endpoint, not a remote or page-only URL."""
+
+        return self._cdp_url
+
+    @property
+    def page_target_id(self) -> str:
+        """Return the exact page target shared with the human."""
+
+        return self._page_target_id
+
+    async def release(self) -> None:
+        """Release the lifetime lease without closing the client or Chrome.
+
+        Concurrent calls share one request; failed releases can be retried while
+        the tool invocation is active. Cancelling a waiter does not cancel the
+        shared request. The host also releases leases when the invocation ends
+        or is cancelled. Release does not revoke raw CDP access.
+        """
+
+        if self._release_task is None:
+            self._release_task = asyncio.create_task(self._release())
+            self._release_task.add_done_callback(self._release_done)
+        await asyncio.shield(self._release_task)
+
+    async def _release(self) -> None:
+        await self._client.request("kodelet.browser.release", {"leaseId": self._lease_id})
+
+    def _release_done(self, task: asyncio.Task[None]) -> None:
+        if task.cancelled() or task.exception() is not None:
+            self._release_task = None
+
+
+class BrowserContext:
+    """Acquire the conversation's shared browser from an installed tool.
+
+    Inline extensions cannot acquire runner-local endpoints. Host capability
+    support is separate from the daemon's authorization of browser access.
+
+    Args:
+        init: Host initialization parameters, including browser capabilities.
+        client: Reverse-RPC client scoped to the originating tool invocation.
+    """
+
+    def __init__(
+        self,
+        init: Mapping[str, Any] | None,
+        client: HostRPCClient | None,
+    ) -> None:
+        self._init = init
+        self._client = client
+
+    async def acquire(self) -> BrowserConnection:
+        """Acquire a browser lifetime lease for the active tool invocation.
+
+        Returns:
+            Connection details and a retryable release handle. Disconnect your
+            automation client and release the lease in ``finally``; keep the
+            shared page open and honor asyncio cancellation.
+
+        Raises:
+            RuntimeError: If browser protocol version 1 or an active tool client
+                is unavailable, or the host returns malformed connection details.
+            HostRPCError: If the host denies access or acquisition fails.
+            asyncio.CancelledError: If the tool request is cancelled.
+        """
+
+        task = asyncio.current_task()
+        if task is not None and task.cancelling():
+            raise asyncio.CancelledError
+        capabilities = (self._init or {}).get("capabilities")
+        capability = capabilities.get("browser") if isinstance(capabilities, Mapping) else None
+        version = capability.get("version") if isinstance(capability, Mapping) else None
+        if not _is_number(version) or version != 1:
+            raise RuntimeError("Browser acquisition is not supported by this Kodelet host")
+        client = self._client
+        if client is None:
+            raise RuntimeError("Browser acquisition requires an active tool request")
+        response = await client.request("kodelet.browser.acquire", {})
+        if task is not None and task.cancelling():
+            raise asyncio.CancelledError
+        if not isinstance(response, Mapping):
+            raise RuntimeError("Invalid browser acquisition response from Kodelet host")
+        fields = [response.get(key) for key in ("leaseId", "sessionId", "cdpUrl", "pageTargetId")]
+        if any(not isinstance(value, str) or not value.strip() for value in fields):
+            raise RuntimeError("Invalid browser acquisition response from Kodelet host")
+        lease_id, session_id, cdp_url, page_target_id = cast(list[str], fields)
+        return BrowserConnection(client, lease_id, session_id, cdp_url, page_target_id)
+
+
 class BackgroundTaskLease:
     """Host-owned lifetime lease for extension work continuing after a handler returns."""
 
@@ -1496,7 +1622,7 @@ class SharedContext:
 
 
 class ToolContext(SharedContext):
-    """Context passed to tool handlers."""
+    """Context passed to tool handlers, including runner-local ``browser`` access."""
 
     def __init__(
         self,
@@ -1504,6 +1630,7 @@ class ToolContext(SharedContext):
         context: Mapping[str, Any] | None = None,
     ) -> None:
         super().__init__(init, context)
+        self.browser = BrowserContext(init, self._host_rpc_client)
         self._tool_updates_enabled = _tool_updates_supported(init)
         self._conversation_fork_enabled = _conversation_fork_supported(init)
         self._conversation_hierarchy_enabled = _conversation_hierarchy_supported(init)
