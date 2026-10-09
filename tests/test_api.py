@@ -5,6 +5,7 @@ import json
 import os
 import sys
 from collections.abc import Awaitable, Callable
+from copy import deepcopy
 from pathlib import Path
 from types import CoroutineType
 from typing import TYPE_CHECKING, Any, assert_type
@@ -328,23 +329,111 @@ def test_reexports_pydantic_and_jinja2() -> None:
     assert Jinja2.Template("Hello {{ name }}").render(name="Kodelet") == "Hello Kodelet"
 
 
-async def test_image_attachment_result_passthrough() -> None:
-    attachment: ToolAttachment = {
-        "type": "image",
-        "path": "/runner/generated.png",
-        "filename": "generated.png",
-        "mimeType": "image/png",
-        "alt": "Generated illustration",
+@pytest.mark.parametrize("inline,failed", [(False, False), (True, True)])
+async def test_image_attachment_result_passthrough(inline: bool, failed: bool) -> None:
+    attachment: ToolAttachment
+    if inline:
+        attachment = {
+            "type": "image",
+            "data": (
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0l"
+                "EQVR42mP8/x8AAwMCAO+aX1sAAAAASUVORK5CYII="
+            ),
+            "mimeType": "image/png",
+        }
+    else:
+        attachment = {
+            "type": "image",
+            "path": "/runner/generated.png",
+            "filename": "generated.png",
+            "mimeType": "image/png",
+            "alt": "Generated illustration",
+        }
+    expected: ToolExecutionResult = {
+        "content": "Generated an illustration",
+        "structuredContent": {"complete": not failed},
+        "attachments": [attachment],
     }
+    if failed:
+        expected["error"] = "Partial generation failure"
     ext = Extension()
 
     @ext.tool("generate_image", description="Generate an image", input_schema={"type": "object"})
     async def generate_image(_input: Any, _ctx: ToolContext) -> ToolExecutionResult:
-        return {"content": "Generated an illustration", "attachments": [attachment]}
+        return expected
 
     harness = await create_test_harness(ext)
     result = await harness.execute_tool({"name": "generate_image", "input": {}})
-    assert result == {"content": "Generated an illustration", "attachments": [attachment]}
+    assert result == expected
+
+
+async def test_tool_output_schema_snapshot_and_structured_result() -> None:
+    output_schema: dict[str, Any] = {
+        "type": "object",
+        "properties": {"value": {"type": ["string", "null"], "default": None}},
+        "additionalProperties": False,
+    }
+    expected_schema = deepcopy(output_schema)
+    expected: ToolExecutionResult = {
+        "content": "Human readable summary",
+        "data": {"presentation": {"summary": "Summary"}},
+        "structuredContent": {"value": None},
+    }
+    ext = Extension()
+
+    def execute(_input: Any, _ctx: ToolContext) -> ToolExecutionResult:
+        return expected
+
+    ext.register_tool(
+        name="structured", description="Structured output", input_schema={},
+        output_schema=output_schema, group="mcp/server_with_underscores",
+        short="Return a structured value.", execute=execute,
+    )
+    output_schema["properties"]["value"]["type"].append("mutated-input")
+    harness = await create_test_harness(ext)
+    tool = harness.initialize()["tools"][0]
+    assert tool["outputSchema"] == expected_schema
+    assert tool["group"] == "mcp/server_with_underscores"
+    assert tool["short"] == "Return a structured value."
+    tool["outputSchema"]["properties"]["value"] = "mutated-output"
+    assert harness.initialize()["tools"][0]["outputSchema"] == expected_schema
+    assert await harness.execute_tool({"name": "structured", "input": {}}) == expected
+
+
+@pytest.mark.parametrize("value", [False, 0, "", None, [1, False, None, {"value": None}]])
+async def test_structured_results_preserve_json_values(value: Any) -> None:
+    ext = Extension()
+
+    @ext.tool("value")
+    def execute() -> ToolExecutionResult:
+        return {"content": "summary", "structuredContent": value}
+
+    harness = await create_test_harness(ext)
+    tool = harness.initialize()["tools"][0]
+    assert not {"outputSchema", "group", "short"}.intersection(tool)
+    assert await harness.execute_tool({"name": "value", "input": {}}) == {
+        "content": "summary", "structuredContent": value,
+    }
+
+
+async def test_structured_result_preserves_nulls_in_pydantic_models() -> None:
+    class Value(BaseModel):
+        value: str | None = None
+
+    class Result(BaseModel):
+        content: str = "summary"
+        structuredContent: Value = Value()
+
+    ext = Extension()
+
+    @ext.tool("model")
+    def execute() -> Result:
+        return Result()
+
+    harness = await create_test_harness(ext)
+    assert await harness.execute_tool({"name": "model", "input": {}}) == {
+        "content": "summary", "structuredContent": {"value": None},
+    }
 
 
 def test_public_typing_surface() -> None:
@@ -879,6 +968,62 @@ async def test_tool_update_handler_can_replace_accumulated_snapshot() -> None:
         }
     )
     assert result == {"output": {"content": "[redacted]"}}
+
+
+@pytest.mark.parametrize("event_name", ["tool.result", "tool.update"])
+async def test_output_hooks_clear_machine_data_before_later_handlers(event_name: str) -> None:
+    original = {
+        "toolName": "bash", "success": True, "data": {"output": "secret"},
+        "metadata": {"output": "secret", "data": {"presentation": {"summary": "private"}}},
+    }
+    replacement = {
+        **original,
+        "metadata": {"output": "redacted", "data": {"presentation": {"summary": "safe"}}},
+    }
+    expected = {key: value for key, value in replacement.items() if key != "data"}
+    original_snapshot = deepcopy(original)
+    replacement_snapshot = deepcopy(replacement)
+    ext = Extension()
+    observed: list[Any] = []
+
+    @ext.on(event_name, priority=2)
+    def redact(event: Any, _ctx: EventContext) -> EventResult:
+        assert event.tool.output == original
+        return {"output": replacement}
+
+    @ext.on(event_name, priority=1)
+    def observe(event: Any, _ctx: EventContext) -> None:
+        observed.append(event.tool.output)
+
+    harness = await create_test_harness(ext)
+    result = await harness.handle_event({
+        "id": "redact", "event": event_name,
+        "payload": {"tool": {"name": "bash", "input": {}, "output": original}},
+    })
+    assert result == {"output": expected}
+    assert observed == [expected]
+    assert original == original_snapshot
+    assert replacement == replacement_snapshot
+
+
+@pytest.mark.parametrize("event_name", ["tool.result", "tool.update"])
+async def test_observational_output_hooks_preserve_machine_data(event_name: str) -> None:
+    output = {"toolName": "tool", "success": True, "data": {"value": False, "missing": None}}
+    ext = Extension()
+    observed: list[Any] = []
+
+    def observe(event: Any, _ctx: EventContext) -> None:
+        observed.append(event.tool.output)
+
+    ext.on(event_name, priority=2)(observe)
+    ext.on(event_name, priority=1)(observe)
+    harness = await create_test_harness(ext)
+    result = await harness.handle_event({
+        "id": "observe", "event": event_name,
+        "payload": {"tool": {"name": "tool", "input": {}, "output": output}},
+    })
+    assert result == {}
+    assert observed == [output, output]
 
 
 def test_tool_context_runner_identity_comes_from_initialize_metadata() -> None:

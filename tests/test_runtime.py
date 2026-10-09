@@ -127,7 +127,20 @@ async def test_runtime_serves_json_rpc_and_reverse_host_rpc() -> None:
     class EchoInput(BaseModel):
         text: str = Field(min_length=1)
 
-    @ext.tool("echo", description="Echo text", input_schema=EchoInput)
+    output_schema = {
+        "type": "object",
+        "properties": {"text": {"type": "string"}, "missing": {"type": "null", "const": None}},
+        "required": ["text", "missing"],
+    }
+    image_data = (
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0l"
+        "EQVR42mP8/x8AAwMCAO+aX1sAAAAASUVORK5CYII="
+    )
+
+    @ext.tool(
+        "echo", description="Echo text", input_schema=EchoInput,
+        output_schema=output_schema, group="extension/rpc", short="Echo text with an image.",
+    )
     async def echo(input: EchoInput, ctx: ToolContext) -> ToolExecutionResult:
         await ctx.update("Working", {"step": 1})
         browser = await ctx.browser.acquire()
@@ -142,6 +155,8 @@ async def test_runtime_serves_json_rpc_and_reverse_host_rpc() -> None:
         return {
             "content": f"{input.text.upper()}:{answer}",
             "data": {"presentation": presentation},
+            "structuredContent": {"text": input.text.upper(), "missing": None},
+            "attachments": [{"type": "image", "data": image_data, "mimeType": "image/png"}],
         }
 
     @ext.shortcut("ctrl+alt+r", description="Refresh project context")
@@ -171,6 +186,9 @@ async def test_runtime_serves_json_rpc_and_reverse_host_rpc() -> None:
     )
     assert init["name"] == "rpc"
     assert init["tools"][0]["name"] == "echo"
+    assert init["tools"][0]["outputSchema"] == output_schema
+    assert init["tools"][0]["group"] == "extension/rpc"
+    assert init["tools"][0]["short"] == "Echo text with an image."
     assert init["shortcuts"] == [{"key": "ctrl+alt+r", "description": "Refresh project context"}]
 
     result = await client.call(
@@ -179,6 +197,8 @@ async def test_runtime_serves_json_rpc_and_reverse_host_rpc() -> None:
     )
     assert result == {
         "content": "HELLO:from-host",
+        "structuredContent": {"text": "HELLO", "missing": None},
+        "attachments": [{"type": "image", "data": image_data, "mimeType": "image/png"}],
         "data": {
             "presentation": {
                 "summary": "Echo complete",

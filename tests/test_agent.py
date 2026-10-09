@@ -325,6 +325,7 @@ async def test_session_preserves_typed_execution_options_with_named_profile() ->
                 allowed_tools=["file_read", "grep_tool", "glob_tool"],
                 allowed_commands=[],
                 enableFSSearchTools=True,
+                code_mode="off",
             ),
         )
         assert calls == [[
@@ -334,6 +335,7 @@ async def test_session_preserves_typed_execution_options_with_named_profile() ->
             '--allowed-tools="file_read","grep_tool","glob_tool"',
             "--allowed-commands=",
             "--enable-fs-search-tools=true",
+            "--code-mode=off",
             "--profile=work",
         ]]
     finally:

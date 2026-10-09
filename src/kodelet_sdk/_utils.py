@@ -14,18 +14,22 @@ async def maybe_await(value: Any) -> Any:
     return value
 
 
-def to_plain(value: Any) -> Any:
+def to_plain(value: Any, *, exclude_none: bool = True) -> Any:
     if isinstance(value, BaseModel):
-        return value.model_dump(mode="json", exclude_none=True)
+        return value.model_dump(mode="json", exclude_none=exclude_none)
     if isinstance(value, Mapping):
-        return {str(key): to_plain(item) for key, item in value.items() if item is not None}
+        return {
+            str(key): to_plain(item, exclude_none=exclude_none)
+            for key, item in value.items()
+            if item is not None or not exclude_none
+        }
     if isinstance(value, list | tuple):
-        return [to_plain(item) for item in value]
+        return [to_plain(item, exclude_none=exclude_none) for item in value]
     return value
 
 
-def json_clone(value: Any) -> Any:
-    return json.loads(json.dumps(to_plain(value)))
+def json_clone(value: Any, *, exclude_none: bool = True) -> Any:
+    return json.loads(json.dumps(to_plain(value, exclude_none=exclude_none)))
 
 
 def normalize_command_name(name: str) -> str:

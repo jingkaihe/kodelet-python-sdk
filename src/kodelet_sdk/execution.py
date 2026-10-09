@@ -32,6 +32,10 @@ class ExecutionOptions(BaseModel):
     allowed_tools: list[Annotated[str, Field(min_length=1)]] | None = None
     allowed_commands: list[Annotated[str, Field(min_length=1)]] | None = None
     enable_fs_search_tools: bool | None = Field(default=None, alias="enableFSSearchTools")
+    code_mode: Literal["off", "on", "only"] | None = Field(
+        default=None,
+        description="Code mode for this run, instead of the runner's configured code_mode.",
+    )
 
     @model_validator(mode="before")
     @classmethod

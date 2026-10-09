@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import (
     Any,
     Literal,
+    Never,
     NotRequired,
     Required,
     TypeAlias,
@@ -17,7 +18,7 @@ from typing import (
     overload,
 )
 
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from ._utils import (
     AttrDict,
@@ -39,7 +40,7 @@ from .context import (
     create_tool_context,
 )
 from .execution import ExtensionProfileOptions
-from .schemas import SchemaAdapter, SchemaLike, infer_schema_from_callable
+from .schemas import JSONSchema, SchemaAdapter, SchemaLike, infer_schema_from_callable
 
 _MISSING = object()
 
@@ -80,24 +81,41 @@ class ToolPresentation(TypedDict, total=False):
     format: Literal["text", "markdown"]
 
 
-class ToolAttachment(TypedDict, total=False):
-    """Runner-local image output ingested and persisted by the Kodelet host."""
+class _ImageAttachment(TypedDict, total=False):
+    """Common metadata for images ingested and persisted by the Kodelet host."""
 
     type: Required[Literal["image"]]
-    path: Required[str]
     filename: str
     mimeType: str
     alt: str
+
+
+class _PathImageAttachment(_ImageAttachment):
+    path: str
+    data: NotRequired[Never]
+
+
+class _InlineImageAttachment(_ImageAttachment):
+    data: str
+    path: NotRequired[Never]
+
+
+ToolAttachment: TypeAlias = _PathImageAttachment | _InlineImageAttachment
+"""Image with exactly one source: a runner-local path or strict base64 data (not a data URL)."""
 
 
 class ToolExecutionResult(TypedDict, total=False):
     """Protocol-shaped result returned by extension tool handlers.
 
     Optional presentation metadata belongs at ``data["presentation"]``.
+    ``structuredContent`` holds the canonical JSON result for programmatic
+    callers, separate from presentation data, including explicit JSON nulls.
+    Image attachments belong on final results, not progress updates.
     """
 
     content: Required[str]
     data: Mapping[str, Any]
+    structuredContent: Any
     error: str
     attachments: list[ToolAttachment]
 
@@ -295,6 +313,9 @@ class ToolRegistration:
     input_schema: SchemaAdapter
     timeout_in_sec: float | None
     handler: ToolHandler
+    output_schema: JSONSchema | None = None
+    group: str | None = None
+    short: str | None = None
 
 
 @dataclass(frozen=True)
@@ -420,6 +441,9 @@ class Extension:
         input_schema: SchemaLike = None,
         execute: ToolHandler,
         timeout_in_sec: float | None = None,
+        output_schema: JSONSchema | None = None,
+        group: str | None = None,
+        short: str | None = None,
     ) -> None:
         """Register a tool callable explicitly.
 
@@ -433,6 +457,12 @@ class Extension:
                 sync or async and may return a string or a tool-result mapping.
             timeout_in_sec: Optional per-tool timeout hint. ``0`` asks the host
                 to run without a timeout.
+            output_schema: Optional raw JSON Schema describing ``structuredContent``,
+                not presentation data. Snapshotted at registration; no local
+                output validation is performed.
+            group: Catalog group. If omitted, the host uses the owning extension.
+            short: One-line summary for compact code-mode listings. If omitted,
+                the host uses the first sentence of ``description``.
 
         Raises:
             ValueError: If another tool with the same name is already
@@ -447,6 +477,9 @@ class Extension:
             input_schema=SchemaAdapter(input_schema),
             timeout_in_sec=timeout_in_sec,
             handler=execute,
+            output_schema=deepcopy(dict(output_schema)) if output_schema is not None else None,
+            group=group,
+            short=short,
         )
 
     def tool(
@@ -456,6 +489,9 @@ class Extension:
         description: str | None = None,
         input_schema: SchemaLike = None,
         timeout_in_sec: float | None = None,
+        output_schema: JSONSchema | None = None,
+        group: str | None = None,
+        short: str | None = None,
     ) -> Callable[[HandlerT], HandlerT]:
         """Decorate a function as a Kodelet tool.
 
@@ -468,6 +504,11 @@ class Extension:
                 ``BaseModel`` subclass, that annotation is used automatically.
             timeout_in_sec: Optional per-tool timeout hint. Use ``0`` for no
                 timeout.
+            output_schema: Optional raw JSON Schema describing ``structuredContent``.
+                Snapshotted at registration; not used for local validation.
+            group: Catalog group; defaults to the owning extension on the host.
+            short: One-line code-mode summary; defaults to the first sentence
+                of ``description`` on the host.
 
         Returns:
             A decorator that returns the original function unchanged.
@@ -483,6 +524,9 @@ class Extension:
                 input_schema=schema,
                 execute=func,
                 timeout_in_sec=timeout_in_sec,
+                output_schema=output_schema,
+                group=group,
+                short=short,
             )
             return func
 
@@ -773,7 +817,15 @@ class Extension:
         )
         if isinstance(result, str):
             return {"content": result}
-        return to_plain(result)
+        if isinstance(result, BaseModel):
+            result = result.model_dump(mode="json")
+        plain_result = to_plain(result)
+        if isinstance(result, Mapping) and "structuredContent" in result:
+            # Preserve canonical JSON nulls without changing optional presentation fields.
+            plain_result["structuredContent"] = to_plain(
+                result["structuredContent"], exclude_none=False,
+            )
+        return plain_result
 
     async def execute_command(self, params: Mapping[str, Any]) -> dict[str, Any]:
         """Handle Kodelet's ``extension.command.execute`` JSON-RPC request.
@@ -847,14 +899,18 @@ class Extension:
             Aggregated event mutations from all matching handlers. Input/output
             mutations are visible to later handlers for the same event; a
             ``block`` result stops further handler execution.
+            Replacing ``tool.result`` or ``tool.update`` output clears its
+            top-level machine ``data`` before later handlers, preventing stale
+            data from bypassing display redaction. Observers leave it intact.
         """
 
         event_name = str(params.get("event", ""))
+        tool_output_event = event_name in ("tool.result", "tool.update")
         handlers = sorted(
             (handler for handler in self._handlers if handler.event == event_name),
             key=lambda handler: (-handler.priority, handler.order),
         )
-        payload = json_clone(params.get("payload") or {})
+        payload = json_clone(params.get("payload") or {}, exclude_none=not tool_output_event)
         if not isinstance(payload, dict):
             payload = {}
         payload["id"] = params.get("id")
@@ -867,15 +923,20 @@ class Extension:
             raw_result = await maybe_await(entry.handler(event, ctx))
             if raw_result is None:
                 continue
-            result = to_plain(raw_result)
+            result = to_plain(raw_result, exclude_none=not tool_output_event)
             if not isinstance(result, Mapping):
                 continue
             if "input" in result and result["input"] is not None:
                 aggregate["input"] = result["input"]
                 _set_nested_tool_field(event, "input", result["input"])
             if "output" in result and result["output"] is not None:
-                aggregate["output"] = result["output"]
-                _set_nested_tool_field(event, "output", result["output"])
+                output = result["output"]
+                if tool_output_event and isinstance(output, Mapping):
+                    # A display-only redactor must not leave an unredacted machine copy.
+                    output = dict(output)
+                    output.pop("data", None)
+                aggregate["output"] = output
+                _set_nested_tool_field(event, "output", output)
             if "message" in result and result["message"] is not None:
                 aggregate["message"] = result["message"]
             if "systemPrompt" in result and result["systemPrompt"] is not None:
@@ -910,12 +971,19 @@ class Extension:
         asyncio.run(self.run())
 
     def _tool_to_json(self, registration: ToolRegistration) -> dict[str, Any]:
-        return {
+        result: dict[str, Any] = {
             "name": registration.name,
             "description": registration.description,
             "inputSchema": registration.input_schema.json_schema(),
             **optional_timeout(registration.timeout_in_sec),
         }
+        if registration.output_schema is not None:
+            result["outputSchema"] = deepcopy(registration.output_schema)
+        if registration.group is not None:
+            result["group"] = registration.group
+        if registration.short is not None:
+            result["short"] = registration.short
+        return result
 
     def _command_to_json(self, registration: CommandRegistration) -> dict[str, Any]:
         result: dict[str, Any] = {

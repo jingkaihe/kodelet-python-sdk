@@ -97,6 +97,8 @@ Session options include:
 
 Pass an `ExecutionOptions` instance directly as `create_session(options=...)` for model settings, execution limits, and tool selection. The optional `profile="work"` selects a model profile already configured on the daemon; omit it to use the daemon's default. Inline settings cannot include provider secrets, endpoints, or local prompt paths.
 
+Set `ExecutionOptions(code_mode="on")` to expose both direct tools and code execution, `"only"` for code execution without direct tool exposure, or `"off"` to disable code mode. This overrides the runner's configured `code_mode`; omit it to inherit. Mappings accept both `code_mode` and the wire spelling `codeMode`.
+
 ### Extension model profiles
 
 ```python
@@ -195,7 +197,7 @@ Create an `Extension(name=..., version=...)`, then register synchronous or async
 
 ### Tool results and progress
 
-Return a string or a mapping with `content` and optional `data` and `error` fields. Use `data["presentation"]` to customize the displayed result without changing what the model receives:
+Return a string or a mapping with `content` and optional `data`, `structuredContent`, `error`, and `attachments` fields. Use `data["presentation"]` to customize the displayed result without changing what the model receives:
 
 ```python
 from kodelet_sdk import ToolExecutionResult, ToolPresentation
@@ -208,10 +210,15 @@ presentation: ToolPresentation = {
 result: ToolExecutionResult = {
     "content": "Found 2 matches.",
     "data": {"presentation": presentation},
+    "structuredContent": {"matches": ["src/api.py", "tests/test_api.py"]},
 }
 ```
 
 `summary` is required; `body` is optional and supports `text` or `markdown`. Hosts may sanitize or truncate display content.
+
+`structuredContent` is the canonical JSON result for programmatic callers, separate from presentation `data`. Values such as `False`, `0`, `""`, `None` (JSON `null`), arrays, and objects are preserved, including nested nulls. Both `@ext.tool(...)` and `ext.register_tool(...)` accept an optional raw JSON `output_schema` describing this value. Output schemas are snapshotted at registration and initialization, not used for local result validation.
+
+For code-mode catalog listings, tools also accept `group` and `short`, for example `group="project/search", short="Search project files."`. Omit `group` to use the owning extension's group on the host; omit `short` to use the first sentence of `description`.
 
 For live progress, call `ctx.update()`. Updates replace earlier snapshots; only the final return value is persisted and sent to the model:
 
@@ -223,6 +230,29 @@ async def search(input, ctx: ToolContext) -> str:
 ```
 
 `ctx.update()` is a no-op on hosts without progress support. For multi-step tasks, `TaskProgress` tracks activities and can attach to session events; `await progress.finish(...)` ends tracking and detaches listeners.
+
+### Image results
+
+Return image attachments with exactly one source: `{"type": "image", "path": "chart.png"}` for a runner-local file, or inline base64 bytes:
+
+```python
+import base64
+
+
+def image_result(png_bytes: bytes) -> ToolExecutionResult:
+    return {
+        "content": "Generated a chart.",
+        "attachments": [{
+            "type": "image",
+            "data": base64.b64encode(png_bytes).decode("ascii"),
+            "mimeType": "image/png",
+        }],
+    }
+```
+
+Optional attachment metadata includes `filename`, `mimeType`, and `alt`. Inline data must be strict base64, not a data URL. The runner accepts at most eight images per final result and 32 MiB per decoded image, validates and stores them as persistent artifacts, and replaces the source with artifact references. Attachments belong on final results, not progress updates, and can accompany an `error` to preserve partial images.
+
+An image attachment is user-visible but is not automatically sent as pixels to the model. Direct `view_image` can inspect it; inside code mode, use `emit.image(reply.attachments[0])` for model-visible pixels or `emit.artifact(reply.attachments[0])` to retain it without pixels. Returning an ID alone does not select media.
 
 ### Commands and events
 
@@ -258,6 +288,8 @@ Commands return one of:
 - `{"action": "runAgent", "prompt": "..."}` — run the agent with a replacement prompt; optional `display` controls the visible user message.
 
 If you sanitize `tool.result`, apply the same policy to `tool.update` so partial output is also safe to display. Without an update handler, Kodelet suppresses partial output for result-subscribing extensions.
+
+When a handler replaces `tool.result` or `tool.update` output, the SDK removes its top-level machine `data` before passing it to later handlers, so stale machine content cannot bypass a display-only redaction. Nested presentation metadata is preserved. Observational handlers that do not return replacement output leave machine data intact.
 
 ### Keyboard shortcuts
 

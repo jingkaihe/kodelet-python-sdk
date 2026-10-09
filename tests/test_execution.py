@@ -17,11 +17,25 @@ from kodelet_sdk.execution import execution_args
         {"max_turns": -1},
         {"no_tools": "false"},
         {"allowed_tools": [""]},
+        {"code_mode": "auto"},
+        {"codeMode": None},
+        {"code_mode": True},
     ],
 )
 def test_execution_options_reject_unknown_null_and_invalid_values(options: dict[str, Any]) -> None:
     with pytest.raises(ValueError):
         ExecutionOptions.model_validate(options)
+
+
+@pytest.mark.parametrize("key,mode", [
+    ("code_mode", "off"), ("codeMode", "on"), ("code_mode", "only"),
+])
+def test_code_mode_validation_wire_and_cli_encoding(key: str, mode: str) -> None:
+    options = ExecutionOptions.model_validate({key: mode})
+    assert options.code_mode == mode
+    assert options.to_wire() == {"codeMode": mode}
+    assert execution_args(options) == [f"--code-mode={mode}"]
+    assert ExecutionOptions.model_validate(options.to_wire()) == options
 
 
 def test_execution_options_preserve_explicit_false_zero_and_empty_lists() -> None:
