@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, assert_type
 import pytest
 
 from kodelet_sdk import (
+    AgentFinishedEvent,
     AgentInitEvent,
     BackgroundTaskLease,
     BaseModel,
@@ -59,6 +60,36 @@ from kodelet_sdk import (
 
 class WeatherInput(BaseModel):
     location: str
+
+
+async def test_agent_finished_event() -> None:
+    ext = Extension()
+    event_name: EventName = "agent.finished"
+    payload = {"status": "canceled", "reason": "canceled", "error": "context canceled"}
+    received: list[dict[str, Any]] = []
+
+    @ext.on(event_name)
+    def finished(event: AgentFinishedEvent, ctx: EventContext) -> None:
+        assert event.event == event_name
+        assert event.status == payload["status"]
+        assert event.get("reason") == payload.get("reason")
+        assert event.get("error") == payload.get("error")
+        assert ctx.conversation_id == "finished-conversation"
+        received.append(dict(event))
+
+    harness = await create_test_harness(ext)
+    init = harness.initialize({"extension": {"id": "cleanup", "cwd": os.getcwd()}})
+    assert init["subscriptions"] == [{"event": event_name, "priority": 0}]
+    result = await harness.handle_event(
+        {
+            "id": "finished-1",
+            "event": event_name,
+            "payload": payload,
+            "context": {"conversationId": "finished-conversation"},
+        }
+    )
+    assert result == {}
+    assert received == [{"id": "finished-1", "event": event_name, **payload}]
 
 
 def test_empty_extension_registration_shape() -> None:

@@ -34,6 +34,7 @@ from .agent import (
 )
 from .api import (
     AgentEndEvent,
+    AgentFinishedEvent,
     AgentInitEvent,
     AgentStartEvent,
     CommandPassResult,
@@ -145,6 +146,7 @@ Jinja2 = jinja2
 
 __all__ = [
     "AgentEndEvent",
+    "AgentFinishedEvent",
     "AgentInitEvent",
     "AgentResponse",
     "AgentRunError",

@@ -195,6 +195,8 @@ Create an `Extension(name=..., version=...)`, then register synchronous or async
 | `@ext.shortcut(...)` | Native TUI keyboard shortcut |
 | `ext.run_sync()` / `await ext.run()` | Serve an executable extension over stdio |
 
+`agent.end` handlers can return follow-up messages to continue the run; `agent.finished` reports its final outcome, including cancellation. `AgentFinishedEvent` carries `status` (`succeeded`, `failed`, or `canceled`) and optional `reason` and `error`; handler results are ignored.
+
 ### Tool results and progress
 
 Return a string or a mapping with `content` and optional `data`, `structuredContent`, `error`, and `attachments` fields. Use `data["presentation"]` to customize the displayed result without changing what the model receives:

@@ -58,6 +58,7 @@ EventName: TypeAlias = Literal[
     "tool.result",
     "turn.end",
     "agent.end",
+    "agent.finished",
     "session.end",
 ]
 ToolHandler = Callable[[Any, ToolContext], Awaitable[Any] | Any]
@@ -300,10 +301,23 @@ class TurnEndEvent(ExtensionEvent):
 
 
 class AgentEndEvent(ExtensionEvent):
-    """Event payload passed to ``agent.end`` handlers."""
+    """Stop hook that may request continuation, not terminal cleanup."""
 
     event: Literal["agent.end"]
     messages: Sequence[Any] | None
+
+
+class AgentFinishedEvent(ExtensionEvent):
+    """Observational terminal event for a started run's handled exit.
+
+    Handler results cannot resume or change the run. ``reason`` and ``error``
+    are optional payload fields; use ``event.get(...)`` when reading them.
+    """
+
+    event: Literal["agent.finished"]
+    status: Literal["succeeded", "failed", "canceled"]
+    reason: str | None
+    error: str | None
 
 
 @dataclass(frozen=True)
