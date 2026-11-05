@@ -1539,6 +1539,8 @@ class SharedContext:
 
     Attributes mirror the Kodelet call context and include helper namespaces:
     ``storage``, ``path``, ``fs``, ``process``, ``env``, ``log``, and ``ui``.
+    ``config`` is the extension's initialization settings mapping (default ``{}``).
+    Treat it as read-only and validate its contents in your extension.
     """
 
     def __init__(
@@ -1548,6 +1550,8 @@ class SharedContext:
     ) -> None:
         context = context or {}
         extension = _extension_info(init)
+        config = extension.get("config")
+        self.config: Mapping[str, Any] = config if isinstance(config, Mapping) else {}
         cwd = Path(str(context.get("cwd") or extension.get("cwd") or os.getcwd())).resolve(
             strict=False
         )

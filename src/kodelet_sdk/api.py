@@ -182,6 +182,23 @@ class ToolListPatch(TypedDict, total=False):
     enable: Sequence[str]
 
 
+class FollowUp(TypedDict, total=False):
+    """Model-visible notification returned by ``turn.end`` or ``agent.end``.
+
+    Visibility defaults to ``visible``; ``hidden`` omits the notification from
+    normal transcripts, not model history. Use a stable key per logical stream
+    and increasing positive revisions to deduplicate per extension and conversation,
+    including saved resumes. The host validates and attributes notifications.
+    Repeated unkeyed follow-ups can continue indefinitely with ``max_turns=0``;
+    checkpoint save failures stop continuation.
+    """
+
+    text: Required[str]
+    visibility: Literal["hidden", "visible"]
+    key: str
+    revision: int
+
+
 class EventResult(TypedDict, total=False):
     """Protocol-shaped result returned by extension event handlers."""
 
@@ -190,6 +207,7 @@ class EventResult(TypedDict, total=False):
     block: EventBlock
     message: str
     followUpMessages: Sequence[str]
+    followUps: Sequence[FollowUp]
     systemPrompt: SystemPromptPatch
     tools: ToolListPatch
     resources: Any
@@ -293,7 +311,10 @@ class TurnStartEvent(ExtensionEvent):
 
 
 class TurnEndEvent(ExtensionEvent):
-    """Event payload passed to ``turn.end`` handlers."""
+    """Completed iteration and its tool results, even without assistant text.
+
+    Handlers may return follow-ups to continue the run.
+    """
 
     event: Literal["turn.end"]
     response: str
@@ -301,7 +322,7 @@ class TurnEndEvent(ExtensionEvent):
 
 
 class AgentEndEvent(ExtensionEvent):
-    """Stop hook that may request continuation, not terminal cleanup."""
+    """Continuation hook, not a termination notification."""
 
     event: Literal["agent.end"]
     messages: Sequence[Any] | None
@@ -961,6 +982,11 @@ class Extension:
                 aggregate["followUpMessages"] = [
                     *aggregate.get("followUpMessages", []),
                     *list(result["followUpMessages"]),
+                ]
+            if "followUps" in result and result["followUps"] is not None:
+                aggregate["followUps"] = [
+                    *aggregate.get("followUps", []),
+                    *list(result["followUps"]),
                 ]
             if "resources" in result and result["resources"] is not None:
                 aggregate["resources"] = result["resources"]

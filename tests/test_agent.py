@@ -565,6 +565,40 @@ async def test_acp_close_reports_incomplete_cleanup_and_allows_session_retry() -
     await client.close()
 
 
+async def test_session_preserves_extension_follow_up_attribution_in_generic_events() -> None:
+    update = {
+        "sessionUpdate": "user_message_chunk",
+        "content": {"type": "text", "text": "Extension: notifications\n\nnew mail"},
+        "_meta": {"kodelet/extensionId": "notifications"},
+    }
+
+    def on_prompt(_request: Mapping[str, Any], child: FakeACPProcess) -> None:
+        child.notify("session/update", {"sessionId": "conv-1", "update": update})
+        child.notify("session/update", {
+            "sessionId": "conv-1",
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "The answer"},
+            },
+        })
+
+    client = Client(spawn=lambda *_: FakeACPProcess(on_prompt=on_prompt))
+    try:
+        session = await client.create_session()
+        received: list[AgentStreamEvent] = []
+        session.on("event", received.append)
+        response = await session.run_and_wait("continue")
+        assert response.content == "The answer"
+        follow_ups = [event for event in response.events if event.type == "event"]
+        assert len(follow_ups) == 1
+        assert follow_ups[0].data == update
+        assert follow_ups[0].raw == update
+        assert follow_ups[0].conversationId == session.id
+        assert follow_ups[0] in received
+    finally:
+        await client.close()
+
+
 @pytest.mark.asyncio
 async def test_session_emits_compaction_events_without_adding_notices_to_output() -> None:
     markers: list[ContextCompactedData] = [

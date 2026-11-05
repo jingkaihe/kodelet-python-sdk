@@ -195,7 +195,20 @@ Create an `Extension(name=..., version=...)`, then register synchronous or async
 | `@ext.shortcut(...)` | Native TUI keyboard shortcut |
 | `ext.run_sync()` / `await ext.run()` | Serve an executable extension over stdio |
 
-`agent.end` handlers can return follow-up messages to continue the run; `agent.finished` reports its final outcome, including cancellation. `AgentFinishedEvent` carries `status` (`succeeded`, `failed`, or `canceled`) and optional `reason` and `error`; handler results are ignored.
+`turn.end` runs after every completed model iteration and its tool results, including tool-only iterations with an empty `response`. Both `turn.end` and `agent.end` can return follow-ups to continue the run; neither is a termination notification. `agent.finished` reports the final outcome, including cancellation. `AgentFinishedEvent` carries `status` (`succeeded`, `failed`, or `canceled`) and optional `reason` and `error`; handler results are ignored.
+
+### Extension configuration
+
+Configure installed extensions by discovered ID in Kodelet YAML (requires `v0.8.21-beta` or newer):
+
+```yaml
+extensions:
+  config:
+    org@repo/weather:
+      units: celsius
+```
+
+All handlers receive these settings as `ctx.config` (default `{}`). Read or validate them in `session.start`, for example `Settings.model_validate(ctx.config)`, not during module-level registration. Treat the mapping as read-only. Resource reload restarts installed extensions with fresh settings; see [reload behavior](https://github.com/jingkaihe/kodelet/blob/main/docs/MANUAL.md#reloading-extensions).
 
 ### Tool results and progress
 
@@ -293,6 +306,19 @@ If you sanitize `tool.result`, apply the same policy to `tool.update` so partial
 
 When a handler replaces `tool.result` or `tool.update` output, the SDK removes its top-level machine `data` before passing it to later handlers, so stale machine content cannot bypass a display-only redaction. Nested presentation metadata is preserved. Observational handlers that do not return replacement output leave machine data intact.
 
+### Follow-up notifications
+
+With Kodelet `v0.8.21-beta` or newer, `turn.end` and `agent.end` handlers can return `EventResult.followUps` using the exported `FollowUp` type:
+
+```python
+return {"followUps": [{
+    "text": "New mail is available.", "visibility": "hidden",
+    "key": "mailbox", "revision": 42,
+}]}
+```
+
+Only `text` is required; visibility defaults to `visible`. Hidden notifications reach the model but not normal transcripts. Stable keys and increasing positive revisions deduplicate per extension/conversation across resumes. Legacy `followUpMessages` remains supported; both lists merge by handler priority. Unkeyed follow-ups can loop indefinitely with `max_turns=0`. See [follow-up semantics](https://github.com/jingkaihe/kodelet/blob/main/docs/MANUAL.md#extension-events) for validation and persistence details.
+
 ### Keyboard shortcuts
 
 Shortcuts run in local native `kodelet chat` sessions:
@@ -331,6 +357,7 @@ Pydantic schemas validate inputs before handlers run and generate JSON Schema fo
 
 Handlers receive `ctx` with call metadata and these helpers:
 
+- `ctx.config` for extension-specific initialization settings (default `{}`; treat as read-only).
 - `ctx.storage.read_text/write_text/read_json/write_json(...)` for extension data files.
 - `ctx.path.resolve_workspace_path(...)` and `ctx.path.relative_to_workspace(...)`.
 - `ctx.fs.exists/read_text/write_text/list(...)` for workspace file access.

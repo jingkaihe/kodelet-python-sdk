@@ -16,6 +16,8 @@ from kodelet_sdk import (
     BrowserConnection,
     CommandContext,
     CommandResult,
+    EventContext,
+    EventResult,
     Extension,
     Field,
     HostRPCError,
@@ -233,6 +235,58 @@ async def test_runtime_serves_json_rpc_and_reverse_host_rpc() -> None:
 
     server_reader.close()
     await asyncio.wait_for(task, timeout=1)
+
+
+@pytest.mark.parametrize("event_name", ["turn.end", "agent.end"])
+async def test_runtime_serializes_follow_ups_and_refreshes_extension_config(
+    event_name: str,
+) -> None:
+    ext = Extension(name="notifications")
+    configured: list[Mapping[str, Any]] = []
+
+    @ext.on("session.start")
+    def configure(_event: Any, ctx: EventContext) -> None:
+        configured.append(ctx.config)
+
+    @ext.on(event_name)
+    def notify(_event: Any, ctx: EventContext) -> EventResult:
+        return {
+            "followUps": [{
+                "text": ctx.config["text"],
+                "visibility": "hidden",
+                "key": "mailbox",
+                "revision": ctx.config["revision"],
+            }],
+            "followUpMessages": ["legacy notification"],
+        }
+
+    reader = MemoryReader()
+    writer = MemoryWriter()
+    task = asyncio.create_task(run_stdio_server(ext, reader, writer))
+    client = RpcTestClient(reader, writer)
+    try:
+        for revision, text in [(41, "new mail"), (42, "updated mail")]:
+            await client.call("extension.initialize", {
+                "extension": {
+                    "id": "notifications", "config": {"text": text, "revision": revision},
+                },
+            })
+            await client.call("extension.event.handle", {
+                "id": "configure", "event": "session.start",
+            })
+            assert configured[-1] == {"text": text, "revision": revision}
+            result = await client.call("extension.event.handle", {
+                "id": "notification", "event": event_name, "payload": {"response": ""},
+            })
+            assert result == {
+                "followUps": [{
+                    "text": text, "visibility": "hidden", "key": "mailbox", "revision": revision,
+                }],
+                "followUpMessages": ["legacy notification"],
+            }
+    finally:
+        reader.close()
+        await asyncio.wait_for(task, timeout=1)
 
 
 @pytest.mark.asyncio

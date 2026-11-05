@@ -26,6 +26,7 @@ from kodelet_sdk import (
     EventName,
     EventResult,
     Extension,
+    FollowUp,
     HostRPCError,
     Jinja2,
     JSONSchema,
@@ -733,6 +734,59 @@ async def test_registers_tools_commands_events_and_executes_handlers() -> None:
 
 
 @pytest.mark.parametrize(
+    ("event_name", "payload"),
+    [
+        ("turn.end", {"response": "", "turnNumber": 1}),
+        ("turn.end", {"response": "Done", "turnNumber": 2}),
+        ("agent.end", {"messages": []}),
+    ],
+)
+async def test_follow_ups_aggregate_by_priority_and_registration_order(
+    event_name: str, payload: dict[str, Any],
+) -> None:
+    ext = Extension()
+    high: FollowUp = {
+        "text": "new mail", "visibility": "hidden",
+        "key": "mailbox:owner:contact", "revision": 42,
+    }
+    low: FollowUp = {"text": "visible notification"}
+    last: FollowUp = {"text": "another notification", "visibility": "visible"}
+
+    @ext.on(event_name)
+    def low_priority(_event: Any, _ctx: EventContext) -> EventResult:
+        return {"followUps": [low], "followUpMessages": ["legacy low"]}
+
+    @ext.on(event_name, priority=10)
+    async def high_priority(event: Any, _ctx: EventContext) -> EventResult:
+        assert event.event == event_name
+        for key, value in payload.items():
+            assert event[key] == value
+        return {"followUps": (high,), "followUpMessages": ("legacy high",)}
+
+    @ext.on(event_name)
+    def same_priority(_event: Any, _ctx: EventContext) -> EventResult:
+        return {"followUps": [last]}
+
+    @ext.on(event_name)
+    def observer(_event: Any, _ctx: EventContext) -> None:
+        return None
+
+    @ext.on(event_name)
+    def empty_follow_ups(_event: Any, _ctx: EventContext) -> EventResult:
+        return {"followUps": [], "followUpMessages": []}
+
+    harness = await create_test_harness(ext)
+    result = await harness.handle_event({
+        "id": "follow-up", "event": event_name, "payload": payload,
+    })
+    assert result == {
+        "followUps": [high, low, last],
+        "followUpMessages": ["legacy high", "legacy low"],
+    }
+    assert low == {"text": "visible notification"}
+
+
+@pytest.mark.parametrize(
     ("shortcut", "expected"),
     [
         ("Control+R", "ctrl+r"),
@@ -1061,6 +1115,30 @@ def test_tool_context_runner_identity_comes_from_initialize_metadata() -> None:
     assert ToolContext(None).runner_id is None
     context = ToolContext({"extension": {"runnerId": "selected-runner"}})
     assert context.runner_id == "selected-runner"
+
+
+@pytest.mark.parametrize(
+    "init",
+    [
+        None,
+        {},
+        {"extension": {"id": "weather"}},
+        {"extension": {"config": {}}},
+        {"extension": {"config": {
+            "units": "celsius", "enabled": False, "limit": 5, "threshold": 0.5,
+            "locations": ["London", "Paris"], "nested": {"optional": None},
+        }}},
+    ],
+)
+def test_handler_contexts_expose_extension_config(init: dict[str, Any] | None) -> None:
+    expected = (init or {}).get("extension", {}).get("config", {})
+    for ctx in (
+        ToolContext(init),
+        CommandContext(init, None, {}),
+        EventContext(init),
+        ShortcutContext(init),
+    ):
+        assert ctx.config == expected
 
 
 @pytest.mark.asyncio

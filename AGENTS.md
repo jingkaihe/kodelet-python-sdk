@@ -44,6 +44,8 @@ uv run -- ruff check && uv run -- ty check && uv run -- pytest -q && uv build
 
 Generated build artifacts under `dist/`, virtualenvs, caches, and `__pycache__` should not be committed.
 
+Run the real-host configuration/follow-up gate with `KODELET_TEST_BINARY=/absolute/path/to/kodelet uv run -- pytest -q -s tests/test_host_integration.py`. It requires Kodelet `v0.8.22-beta` or newer and local `rg`/`fd` binaries, uses isolated state and a deterministic local model endpoint (no provider credentials), and stops its daemon on exit. Without the binary variable, this test is skipped.
+
 ## Releases
 
 Package versions are sourced from `VERSION.txt` via Hatchling dynamic version metadata. Edit `VERSION.txt` manually, commit it, then use the Makefile helper:
