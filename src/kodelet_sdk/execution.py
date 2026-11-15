@@ -30,7 +30,6 @@ class ExecutionOptions(BaseModel):
     no_extensions: bool | None = None
     no_skills: bool | None = None
     allowed_tools: list[Annotated[str, Field(min_length=1)]] | None = None
-    allowed_commands: list[Annotated[str, Field(min_length=1)]] | None = None
     enable_fs_search_tools: bool | None = Field(default=None, alias="enableFSSearchTools")
     code_mode: Literal["off", "on", "only"] | None = Field(
         default=None,

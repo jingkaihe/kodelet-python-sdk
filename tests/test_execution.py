@@ -17,6 +17,7 @@ from kodelet_sdk.execution import execution_args
         {"max_turns": -1},
         {"no_tools": "false"},
         {"allowed_tools": [""]},
+        {"allowed_commands": []},
         {"code_mode": "auto"},
         {"codeMode": None},
         {"code_mode": True},
@@ -43,21 +44,18 @@ def test_execution_options_preserve_explicit_false_zero_and_empty_lists() -> Non
         max_turns=0,
         no_tools=False,
         allowed_tools=[],
-        allowed_commands=[],
         enableFSSearchTools=True,
     )
     assert options.to_wire() == {
         "maxTurns": 0,
         "noTools": False,
         "allowedTools": [],
-        "allowedCommands": [],
         "enableFSSearchTools": True,
     }
     assert execution_args(options) == [
         "--max-turns=0",
         "--no-tools=false",
         "--allowed-tools=",
-        "--allowed-commands=",
         "--enable-fs-search-tools=true",
     ]
     assert ExecutionOptions.model_validate(options.to_wire()) == options
@@ -76,5 +74,5 @@ def test_execution_options_return_independent_snapshots() -> None:
 
 
 def test_execution_args_escape_csv_values() -> None:
-    options = ExecutionOptions(allowed_commands=['rg "a,b"', "git status"])
-    assert execution_args(options) == ['--allowed-commands="rg ""a,b""","git status"']
+    options = ExecutionOptions(allowed_tools=['say "a,b"', "file_read"])
+    assert execution_args(options) == ['--allowed-tools="say ""a,b""","file_read"']
